@@ -4,7 +4,7 @@ Thank you for contributing to `zarrow`.
 
 ## Development Setup
 
-1. Install Zig `0.15.x` (minimum `0.15.1`).
+1. Install Zig `0.17.x` (minimum `0.17.0`).
 2. Clone the repository.
 3. Run:
 

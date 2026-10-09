@@ -21,6 +21,7 @@ pub const WriterOptions = stream_writer.WriterOptions;
 pub const FileError = stream_writer.StreamError || fbs_lite_builder.PackError || error{
     OutOfMemory,
     AlreadyFinished,
+    InvalidState,
     InvalidFile,
     InvalidMessage,
     MissingSchema,
@@ -39,259 +40,229 @@ const fbs = struct {
     const SchemaT = arrow_fbs.org_apache_arrow_flatbuf_Schema.SchemaT;
 };
 
-const CollectWriter = struct {
+pub const FileWriter = struct {
     allocator: std.mem.Allocator,
-    bytes: *std.ArrayList(u8),
+    writer: *std.Io.Writer,
+    // Heap-allocated so `&pending.writer` stays valid after init returns by value.
+    pending: *std.Io.Writer.Allocating,
+    stream: stream_writer.StreamWriter,
+    schema_msg: ?*fbs.MessageT = null,
+    schema_metadata_bytes: ?[]u8 = null,
+    dictionary_blocks: std.ArrayList(fbs.BlockT),
+    record_batch_blocks: std.ArrayList(fbs.BlockT),
+    tensor_blocks: std.ArrayList(fbs.BlockT),
+    sparse_tensor_blocks: std.ArrayList(fbs.BlockT),
+    stream_offset: usize = 0,
+    header_written: bool = false,
+    saw_stream_end: bool = false,
+    finished: bool = false,
+    // Set after any failed write; later writes fail with InvalidState because
+    // pending bytes and StreamWriter dictionary state may no longer match the sink.
+    failed: bool = false,
 
-    pub const Error = error{OutOfMemory};
+    const Self = @This();
 
-    pub fn writeAll(self: @This(), data: []const u8) Error!void {
-        try self.bytes.appendSlice(self.allocator, data);
+    pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) FileError!Self {
+        return initWithOptions(allocator, writer, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, writer: *std.Io.Writer, options: WriterOptions) FileError!Self {
+        const pending = try allocator.create(std.Io.Writer.Allocating);
+        errdefer allocator.destroy(pending);
+        pending.* = std.Io.Writer.Allocating.init(allocator);
+        errdefer pending.deinit();
+
+        return .{
+            .allocator = allocator,
+            .writer = writer,
+            .pending = pending,
+            .stream = stream_writer.StreamWriter.initWithOptions(allocator, &pending.writer, options),
+            .dictionary_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
+            .record_batch_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
+            .tensor_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
+            .sparse_tensor_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.stream.deinit();
+        if (self.schema_msg) |msg| {
+            msg.deinit(self.allocator);
+            self.allocator.destroy(msg);
+        }
+        if (self.schema_metadata_bytes) |bytes| self.allocator.free(bytes);
+        self.dictionary_blocks.deinit(self.allocator);
+        self.record_batch_blocks.deinit(self.allocator);
+        self.tensor_blocks.deinit(self.allocator);
+        self.sparse_tensor_blocks.deinit(self.allocator);
+        self.pending.deinit();
+        self.allocator.destroy(self.pending);
+    }
+
+    pub fn writeSchema(self: *Self, schema: Schema) (FileError || std.Io.Writer.Error)!void {
+        if (self.finished) return FileError.AlreadyFinished;
+        if (self.failed) return FileError.InvalidState;
+        errdefer self.failed = true;
+        self.stream.writeSchema(schema) catch |e| return if (e == error.WriteFailed) error.OutOfMemory else e;
+        try self.flushPendingMessages(false);
+    }
+
+    pub fn writeRecordBatch(self: *Self, batch: RecordBatch) (FileError || std.Io.Writer.Error)!void {
+        if (self.finished) return FileError.AlreadyFinished;
+        if (self.failed) return FileError.InvalidState;
+        errdefer self.failed = true;
+        self.stream.writeRecordBatch(batch) catch |e| return if (e == error.WriteFailed) error.OutOfMemory else e;
+        try self.flushPendingMessages(false);
+    }
+
+    pub fn writeTensorLikeMessage(self: *Self, metadata: TensorLikeMetadata, body: []const u8) (FileError || std.Io.Writer.Error)!void {
+        if (self.finished) return FileError.AlreadyFinished;
+        if (self.failed) return FileError.InvalidState;
+        errdefer self.failed = true;
+        self.stream.writeTensorLikeMessage(metadata, body) catch |e| return if (e == error.WriteFailed) error.OutOfMemory else e;
+        try self.flushPendingMessages(false);
+    }
+
+    pub fn writeEnd(self: *Self) (FileError || std.Io.Writer.Error)!void {
+        if (self.finished) return FileError.AlreadyFinished;
+        if (self.failed) return FileError.InvalidState;
+        errdefer self.failed = true;
+        self.stream.writeEnd() catch |e| return if (e == error.WriteFailed) error.OutOfMemory else e;
+        try self.flushPendingMessages(true);
+        if (!self.saw_stream_end) return error.InvalidMessage;
+        if (self.schema_msg == null) return error.MissingSchema;
+
+        const footer_bytes = try buildFooterBytes(
+            self.allocator,
+            self.schema_msg.?.header.Schema.?,
+            self.dictionary_blocks,
+            self.record_batch_blocks,
+            self.tensor_blocks,
+            self.sparse_tensor_blocks,
+            self.stream.flatbufMetadataVersion(),
+        );
+        defer self.allocator.free(footer_bytes);
+
+        // Align footer to 8-byte boundary relative to file start (header is 8 bytes)
+        const footer_pad = format.padLen(self.stream_offset);
+        try format.writePadding(self.writer, footer_pad);
+        try self.writer.writeAll(footer_bytes);
+        const footer_len = std.math.cast(u32, footer_bytes.len) orelse return FileError.InvalidMessage;
+        try format.writeInt(self.writer, u32, footer_len);
+        try self.writer.writeAll(FileMagic);
+        try self.writer.flush();
+
+        self.finished = true;
+    }
+
+    fn ensureHeaderWritten(self: *Self) (std.Io.Writer.Error || FileError)!void {
+        if (self.header_written) return;
+        try self.writer.writeAll(FileMagic);
+        try self.writer.writeAll("\x00\x00");
+        self.header_written = true;
+    }
+
+    fn flushPendingMessages(self: *Self, final: bool) (FileError || std.Io.Writer.Error)!void {
+        // Parse complete messages out of `pending` by offset; drop the consumed prefix once at exit.
+        const bytes = self.pending.written();
+        var pos: usize = 0;
+        defer self.pending.clearRetainingCapacity();
+
+        while (pos < bytes.len) {
+            const rest = bytes[pos..];
+            if (rest.len < 4) return error.InvalidMessage;
+
+            const first = readU32Le(rest[0..4]);
+            var prefix_len: usize = 4;
+            var metadata_len_u32 = first;
+            if (first == format.ContinuationMarker) {
+                if (rest.len < 8) return error.InvalidMessage;
+                metadata_len_u32 = readU32Le(rest[4..8]);
+                prefix_len = 8;
+                if (metadata_len_u32 == 0) {
+                    if (!final) return error.InvalidMessage;
+                    self.saw_stream_end = true;
+                    pos += 8;
+                    continue;
+                }
+            } else if (first == 0) {
+                if (!final) return error.InvalidMessage;
+                self.saw_stream_end = true;
+                pos += 4;
+                continue;
+            }
+
+            const metadata_len = std.math.cast(usize, metadata_len_u32) orelse return error.InvalidMessage;
+            const needed_metadata = std.math.add(usize, prefix_len, metadata_len) catch return error.InvalidMessage;
+            if (rest.len < needed_metadata) return error.InvalidMessage;
+
+            const metadata = rest[prefix_len..needed_metadata];
+            const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata) catch return error.InvalidMessage;
+            if (envelope.body_length < 0) return error.InvalidMessage;
+            const body_len = std.math.cast(usize, envelope.body_length) orelse return error.InvalidMessage;
+            var msg_t = try fbs_lite_builder.unpackMessage(self.allocator, metadata);
+            defer msg_t.deinit(self.allocator);
+
+            if (msg_t.bodyLength != envelope.body_length) return error.InvalidMessage;
+            const body_pad = format.padLen(body_len);
+            const body_total = std.math.add(usize, body_len, body_pad) catch return error.InvalidMessage;
+            const message_total = std.math.add(usize, needed_metadata, body_total) catch return error.InvalidMessage;
+            if (rest.len < message_total) return error.InvalidMessage;
+
+            switch (msg_t.header) {
+                .Schema => {
+                    if (self.schema_msg != null) return error.InvalidMessage;
+                    const metadata_copy = try self.allocator.dupe(u8, metadata);
+                    errdefer self.allocator.free(metadata_copy);
+                    var schema_msg_t = try fbs_lite_builder.unpackMessage(self.allocator, metadata_copy);
+                    errdefer schema_msg_t.deinit(self.allocator);
+                    if (schema_msg_t.header != .Schema) return error.InvalidMessage;
+                    const owned_msg = try self.allocator.create(fbs.MessageT);
+                    owned_msg.* = schema_msg_t;
+                    self.schema_msg = owned_msg;
+                    self.schema_metadata_bytes = metadata_copy;
+                },
+                .DictionaryBatch, .RecordBatch => {
+                    const file_offset = std.math.cast(i64, FileMagic.len + 2 + self.stream_offset) orelse return error.InvalidMessage;
+                    const meta_data_length = std.math.cast(i32, prefix_len + format.paddedLen(metadata_len)) orelse return error.InvalidMessage;
+                    const block = fbs.BlockT{
+                        .offset = file_offset,
+                        .metaDataLength = meta_data_length,
+                        .bodyLength = envelope.body_length,
+                    };
+                    if (msg_t.header == .DictionaryBatch) {
+                        try self.dictionary_blocks.append(self.allocator, block);
+                    } else {
+                        try self.record_batch_blocks.append(self.allocator, block);
+                    }
+                },
+                .Tensor, .SparseTensor => {
+                    const file_offset = std.math.cast(i64, FileMagic.len + 2 + self.stream_offset) orelse return error.InvalidMessage;
+                    const meta_data_length = std.math.cast(i32, prefix_len + format.paddedLen(metadata_len)) orelse return error.InvalidMessage;
+                    const block = fbs.BlockT{
+                        .offset = file_offset,
+                        .metaDataLength = meta_data_length,
+                        .bodyLength = envelope.body_length,
+                    };
+                    if (msg_t.header == .Tensor) {
+                        try self.tensor_blocks.append(self.allocator, block);
+                    } else {
+                        try self.sparse_tensor_blocks.append(self.allocator, block);
+                    }
+                },
+                else => return error.UnsupportedMessage,
+            }
+
+            try self.ensureHeaderWritten();
+            try self.writer.writeAll(rest[0..message_total]);
+            self.stream_offset = std.math.add(usize, self.stream_offset, message_total) catch return error.InvalidMessage;
+            pos += message_total;
+        }
     }
 };
 
-pub fn FileWriter(comptime WriterType: type) type {
-    return struct {
-        allocator: std.mem.Allocator,
-        writer: WriterType,
-        stream_bytes: *std.ArrayList(u8),
-        stream: stream_writer.StreamWriter(CollectWriter),
-        schema_msg: ?*fbs.MessageT = null,
-        schema_metadata_bytes: ?[]u8 = null,
-        dictionary_blocks: std.ArrayList(fbs.BlockT),
-        record_batch_blocks: std.ArrayList(fbs.BlockT),
-        tensor_blocks: std.ArrayList(fbs.BlockT),
-        sparse_tensor_blocks: std.ArrayList(fbs.BlockT),
-        stream_offset: usize = 0,
-        header_written: bool = false,
-        saw_stream_end: bool = false,
-        finished: bool = false,
-
-        const Self = @This();
-
-        pub fn init(allocator: std.mem.Allocator, writer: WriterType) FileError!Self {
-            return initWithOptions(allocator, writer, .{});
-        }
-
-        pub fn initWithOptions(allocator: std.mem.Allocator, writer: WriterType, options: WriterOptions) FileError!Self {
-            const stream_bytes = try allocator.create(std.ArrayList(u8));
-            stream_bytes.* = std.ArrayList(u8){};
-
-            const collect_writer = CollectWriter{
-                .allocator = allocator,
-                .bytes = stream_bytes,
-            };
-            return .{
-                .allocator = allocator,
-                .writer = writer,
-                .stream_bytes = stream_bytes,
-                .stream = stream_writer.StreamWriter(CollectWriter).initWithOptions(allocator, collect_writer, options),
-                .dictionary_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
-                .record_batch_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
-                .tensor_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
-                .sparse_tensor_blocks = try std.ArrayList(fbs.BlockT).initCapacity(allocator, 0),
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.stream.deinit();
-            if (self.schema_msg) |msg| {
-                msg.deinit(self.allocator);
-                self.allocator.destroy(msg);
-            }
-            if (self.schema_metadata_bytes) |bytes| self.allocator.free(bytes);
-            self.dictionary_blocks.deinit(self.allocator);
-            self.record_batch_blocks.deinit(self.allocator);
-            self.tensor_blocks.deinit(self.allocator);
-            self.sparse_tensor_blocks.deinit(self.allocator);
-            self.stream_bytes.deinit(self.allocator);
-            self.allocator.destroy(self.stream_bytes);
-        }
-
-        pub fn writeSchema(self: *Self, schema: Schema) (FileError || @TypeOf(self.writer).Error)!void {
-            if (self.finished) return FileError.AlreadyFinished;
-            try self.stream.writeSchema(schema);
-            try self.flushPendingMessages(false);
-        }
-
-        pub fn writeRecordBatch(self: *Self, batch: RecordBatch) (FileError || @TypeOf(self.writer).Error)!void {
-            if (self.finished) return FileError.AlreadyFinished;
-            try self.stream.writeRecordBatch(batch);
-            try self.flushPendingMessages(false);
-        }
-
-        pub fn writeTensorLikeMessage(self: *Self, metadata: TensorLikeMetadata, body: []const u8) (FileError || @TypeOf(self.writer).Error)!void {
-            if (self.finished) return FileError.AlreadyFinished;
-            try self.stream.writeTensorLikeMessage(metadata, body);
-            try self.flushPendingMessages(false);
-        }
-
-        pub fn writeEnd(self: *Self) (FileError || @TypeOf(self.writer).Error)!void {
-            if (self.finished) return FileError.AlreadyFinished;
-            try self.stream.writeEnd();
-            try self.flushPendingMessages(true);
-            if (!self.saw_stream_end) return error.InvalidMessage;
-            if (self.schema_msg == null) return error.MissingSchema;
-
-            const footer_bytes = try buildFooterBytes(
-                self.allocator,
-                self.schema_msg.?.header.Schema.?,
-                self.dictionary_blocks,
-                self.record_batch_blocks,
-                self.tensor_blocks,
-                self.sparse_tensor_blocks,
-                self.stream.flatbufMetadataVersion(),
-            );
-            defer self.allocator.free(footer_bytes);
-
-            // Align footer to 8-byte boundary relative to file start (header is 8 bytes)
-            const footer_pad = format.padLen(self.stream_offset);
-            try format.writePadding(self.writer, footer_pad);
-            try self.writer.writeAll(footer_bytes);
-            const footer_len = std.math.cast(u32, footer_bytes.len) orelse return FileError.InvalidMessage;
-            try writeU32Le(self.writer, footer_len);
-            try self.writer.writeAll(FileMagic);
-
-            self.finished = true;
-        }
-
-        fn ensureHeaderWritten(self: *Self) (@TypeOf(self.writer).Error || FileError)!void {
-            if (self.header_written) return;
-            try self.writer.writeAll(FileMagic);
-            try self.writer.writeAll("\x00\x00");
-            self.header_written = true;
-        }
-
-        fn consumeStreamPrefix(self: *Self, n: usize) void {
-            if (n >= self.stream_bytes.items.len) {
-                self.stream_bytes.clearRetainingCapacity();
-                return;
-            }
-            const remain = self.stream_bytes.items.len - n;
-            std.mem.copyForwards(u8, self.stream_bytes.items[0..remain], self.stream_bytes.items[n..]);
-            self.stream_bytes.items.len = remain;
-        }
-
-        fn flushPendingMessages(self: *Self, final: bool) (FileError || @TypeOf(self.writer).Error)!void {
-            while (self.stream_bytes.items.len > 0) {
-                if (self.stream_bytes.items.len < 4) {
-                    if (final) return error.InvalidMessage;
-                    return error.InvalidMessage;
-                }
-
-                const first = readU32Le(self.stream_bytes.items[0..4]);
-                var prefix_len: usize = 4;
-                var metadata_len_u32 = first;
-                if (first == format.ContinuationMarker) {
-                    if (self.stream_bytes.items.len < 8) {
-                        if (final) return error.InvalidMessage;
-                        return error.InvalidMessage;
-                    }
-                    metadata_len_u32 = readU32Le(self.stream_bytes.items[4..8]);
-                    prefix_len = 8;
-                    if (metadata_len_u32 == 0) {
-                        if (!final) return error.InvalidMessage;
-                        self.saw_stream_end = true;
-                        self.consumeStreamPrefix(8);
-                        continue;
-                    }
-                } else if (first == 0) {
-                    if (!final) return error.InvalidMessage;
-                    self.saw_stream_end = true;
-                    self.consumeStreamPrefix(4);
-                    continue;
-                }
-
-                const metadata_len = std.math.cast(usize, metadata_len_u32) orelse return error.InvalidMessage;
-                const needed_metadata = std.math.add(usize, prefix_len, metadata_len) catch return error.InvalidMessage;
-                if (self.stream_bytes.items.len < needed_metadata) {
-                    if (final) return error.InvalidMessage;
-                    return error.InvalidMessage;
-                }
-
-                const metadata = self.stream_bytes.items[prefix_len..needed_metadata];
-                const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata) catch return error.InvalidMessage;
-                if (envelope.body_length < 0) return error.InvalidMessage;
-                const body_len = std.math.cast(usize, envelope.body_length) orelse return error.InvalidMessage;
-                var msg_t = try fbs_lite_builder.unpackMessage(self.allocator, metadata);
-                errdefer msg_t.deinit(self.allocator);
-
-                if (msg_t.bodyLength != envelope.body_length) return error.InvalidMessage;
-                const body_pad = format.padLen(body_len);
-                const body_total = std.math.add(usize, body_len, body_pad) catch return error.InvalidMessage;
-                const message_total = std.math.add(usize, needed_metadata, body_total) catch return error.InvalidMessage;
-                if (self.stream_bytes.items.len < message_total) {
-                    if (final) return error.InvalidMessage;
-                    return error.InvalidMessage;
-                }
-
-                switch (msg_t.header) {
-                    .Schema => {
-                        if (self.schema_msg != null) return error.InvalidMessage;
-                        const metadata_copy = try self.allocator.dupe(u8, metadata);
-                        errdefer self.allocator.free(metadata_copy);
-                        var schema_msg_t = try fbs_lite_builder.unpackMessage(self.allocator, metadata_copy);
-                        errdefer schema_msg_t.deinit(self.allocator);
-                        if (schema_msg_t.header != .Schema) return error.InvalidMessage;
-                        const owned_msg = try self.allocator.create(fbs.MessageT);
-                        owned_msg.* = schema_msg_t;
-                        self.schema_msg = owned_msg;
-                        self.schema_metadata_bytes = metadata_copy;
-                        msg_t.deinit(self.allocator);
-                    },
-                    .DictionaryBatch, .RecordBatch => {
-                        const file_offset = std.math.cast(i64, FileMagic.len + 2 + self.stream_offset) orelse return error.InvalidMessage;
-                        const meta_data_length = std.math.cast(i32, prefix_len + format.paddedLen(metadata_len)) orelse return error.InvalidMessage;
-                        const block = fbs.BlockT{
-                            .offset = file_offset,
-                            .metaDataLength = meta_data_length,
-                            .bodyLength = envelope.body_length,
-                        };
-                        if (msg_t.header == .DictionaryBatch) {
-                            try self.dictionary_blocks.append(self.allocator, block);
-                        } else {
-                            try self.record_batch_blocks.append(self.allocator, block);
-                        }
-                        msg_t.deinit(self.allocator);
-                    },
-                    .Tensor, .SparseTensor => {
-                        const file_offset = std.math.cast(i64, FileMagic.len + 2 + self.stream_offset) orelse return error.InvalidMessage;
-                        const meta_data_length = std.math.cast(i32, prefix_len + format.paddedLen(metadata_len)) orelse return error.InvalidMessage;
-                        const block = fbs.BlockT{
-                            .offset = file_offset,
-                            .metaDataLength = meta_data_length,
-                            .bodyLength = envelope.body_length,
-                        };
-                        if (msg_t.header == .Tensor) {
-                            try self.tensor_blocks.append(self.allocator, block);
-                        } else {
-                            try self.sparse_tensor_blocks.append(self.allocator, block);
-                        }
-                        msg_t.deinit(self.allocator);
-                    },
-                    else => {
-                        msg_t.deinit(self.allocator);
-                        return error.UnsupportedMessage;
-                    },
-                }
-
-                try self.ensureHeaderWritten();
-                try self.writer.writeAll(self.stream_bytes.items[0..message_total]);
-                self.stream_offset = std.math.add(usize, self.stream_offset, message_total) catch return error.InvalidMessage;
-                self.consumeStreamPrefix(message_total);
-            }
-        }
-    };
-}
-
-fn writeU32Le(writer: anytype, value: u32) !void {
-    var bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, bytes[0..4], value, .little);
-    try writer.writeAll(bytes[0..4]);
-}
-
 fn encodeBlocksToString(allocator: std.mem.Allocator, blocks: []const fbs.BlockT) error{OutOfMemory}![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     for (blocks, 0..) |blk, i| {
         if (i > 0) try buf.append(allocator, ',');
@@ -315,7 +286,7 @@ fn buildFooterBytes(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var custom_metadata = std.ArrayList(fbs.KeyValueT){};
+    var custom_metadata = std.ArrayList(fbs.KeyValueT).empty;
 
     if (tensor_blocks.items.len > 0) {
         const encoded = try encodeBlocksToString(aa, tensor_blocks.items);
@@ -380,29 +351,21 @@ test "ipc file writer emits arrow file magic and footer" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]@import("../array/array_ref.zig").ArrayRef{id_ref});
     defer batch.deinit();
 
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-    const Sink = struct {
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        pub const Error = error{OutOfMemory};
-        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-            try self.out.appendSlice(self.allocator, bytes);
-        }
-    };
-    var writer = try FileWriter(Sink).init(allocator, .{ .allocator = allocator, .out = &out });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = try FileWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    try std.testing.expect(out.items.len > (FileMagic.len * 2 + 4));
-    try std.testing.expectEqualSlices(u8, FileMagic, out.items[0..FileMagic.len]);
+    try std.testing.expect(out.written().len > (FileMagic.len * 2 + 4));
+    try std.testing.expectEqualSlices(u8, FileMagic, out.written()[0..FileMagic.len]);
     try std.testing.expectEqualSlices(
         u8,
         FileMagic,
-        out.items[out.items.len - FileMagic.len .. out.items.len],
+        out.written()[out.written().len - FileMagic.len .. out.written().len],
     );
 }
 
@@ -415,17 +378,9 @@ test "ipc file writer can emit footer metadata version V4" {
     };
     const schema = Schema{ .fields = fields[0..] };
 
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-    const Sink = struct {
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        pub const Error = error{OutOfMemory};
-        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-            try self.out.appendSlice(self.allocator, bytes);
-        }
-    };
-    var writer = try FileWriter(Sink).initWithOptions(allocator, .{ .allocator = allocator, .out = &out }, .{
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = try FileWriter.initWithOptions(allocator, &out.writer, .{
         .metadata_version = .v4,
     });
     defer writer.deinit();
@@ -434,14 +389,14 @@ test "ipc file writer can emit footer metadata version V4" {
     try writer.writeEnd();
 
     const trailer_len = 4 + FileMagic.len;
-    try std.testing.expect(out.items.len > trailer_len + FileMagic.len);
-    const trailer = out.items[out.items.len - trailer_len .. out.items.len];
+    try std.testing.expect(out.written().len > trailer_len + FileMagic.len);
+    const trailer = out.written()[out.written().len - trailer_len .. out.written().len];
     try std.testing.expectEqualSlices(u8, FileMagic, trailer[4..]);
 
     const footer_len_u32 = readU32Le(trailer[0..4]);
     const footer_len = std.math.cast(usize, footer_len_u32) orelse return error.InvalidMessage;
-    const footer_start = out.items.len - trailer_len - footer_len;
-    const footer_bytes = out.items[footer_start .. out.items.len - trailer_len];
+    const footer_start = out.written().len - trailer_len - footer_len;
+    const footer_bytes = out.written()[footer_start .. out.written().len - trailer_len];
 
     var footer_t = try fbs_lite_builder.unpackFooter(allocator, footer_bytes);
     defer footer_t.deinit(allocator);
@@ -490,30 +445,21 @@ test "ipc file writer streams incrementally and accepts tensor-like messages" {
         },
     };
 
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-    const Sink = struct {
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        pub const Error = error{OutOfMemory};
-        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-            try self.out.appendSlice(self.allocator, bytes);
-        }
-    };
-    var writer = try FileWriter(Sink).init(allocator, .{ .allocator = allocator, .out = &out });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = try FileWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try writer.writeSchema(schema);
-    try std.testing.expectEqual(@as(usize, 0), writer.stream_bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writer.pending.written().len);
     try writer.writeTensorLikeMessage(tensor_meta, tensor_body[0..]);
-    try std.testing.expectEqual(@as(usize, 0), writer.stream_bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writer.pending.written().len);
     try writer.writeRecordBatch(batch);
-    try std.testing.expectEqual(@as(usize, 0), writer.stream_bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writer.pending.written().len);
     try writer.writeEnd();
-    try std.testing.expectEqual(@as(usize, 0), writer.stream_bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writer.pending.written().len);
 
-    var file_stream = std.io.fixedBufferStream(out.items);
-    var reader = @import("file_reader.zig").FileReader(@TypeOf(file_stream.reader())).init(allocator, file_stream.reader());
+    var reader = @import("file_reader.zig").FileReader.init(allocator, out.written());
     defer reader.deinit();
 
     const out_schema = try reader.readSchema();
@@ -536,22 +482,14 @@ test "ipc file writer rejects damaged metadata root offset" {
     };
     const schema = Schema{ .fields = fields[0..] };
 
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-    const Sink = struct {
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        pub const Error = error{OutOfMemory};
-        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-            try self.out.appendSlice(self.allocator, bytes);
-        }
-    };
-    var writer = try FileWriter(Sink).init(allocator, .{ .allocator = allocator, .out = &out });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = try FileWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     // Bypass file_writer flush and corrupt the pending stream metadata in place.
     try writer.stream.writeSchema(schema);
-    const metadata = try firstMessageMetadataForTest(writer.stream_bytes.items);
+    const metadata = try firstMessageMetadataForTest(writer.pending.written());
     @memset(metadata[0..@sizeOf(u32)], 0xFF); // root offset now out of range
 
     try std.testing.expectError(error.InvalidMessage, writer.flushPendingMessages(true));
@@ -566,25 +504,37 @@ test "ipc file writer rejects damaged metadata header type" {
     };
     const schema = Schema{ .fields = fields[0..] };
 
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-    const Sink = struct {
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(u8),
-        pub const Error = error{OutOfMemory};
-        pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-            try self.out.appendSlice(self.allocator, bytes);
-        }
-    };
-    var writer = try FileWriter(Sink).init(allocator, .{ .allocator = allocator, .out = &out });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = try FileWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     // Corrupt Message.header_type to NONE(0); parseArrowMessageEnvelope must reject.
     try writer.stream.writeSchema(schema);
-    const metadata = try firstMessageMetadataForTest(writer.stream_bytes.items);
+    const metadata = try firstMessageMetadataForTest(writer.pending.written());
     const table = try fbs_lite_reader.rootTable(metadata);
     const header_type_abs = table.fieldAbsOffset(1) orelse return error.InvalidFixture;
     metadata[header_type_abs] = 0;
 
     try std.testing.expectError(error.InvalidMessage, writer.flushPendingMessages(true));
+}
+
+test "ipc file writer does not double free after sink failure and rejects later writes" {
+    const allocator = std.testing.allocator;
+
+    const id_type = DataType{ .int32 = {} };
+    const fields = [_]Field{
+        .{ .name = "id", .data_type = &id_type, .nullable = false },
+    };
+    const schema = Schema{ .fields = fields[0..] };
+
+    var buf: [4]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buf);
+    var writer = try FileWriter.init(allocator, &sink);
+    defer writer.deinit();
+
+    // The 6-byte magic does not fit the 4-byte sink, so the header write fails after the schema is parsed.
+    try std.testing.expectError(error.WriteFailed, writer.writeSchema(schema));
+    // The failed write poisons the writer instead of silently dropping pending bytes.
+    try std.testing.expectError(FileError.InvalidState, writer.writeEnd());
 }

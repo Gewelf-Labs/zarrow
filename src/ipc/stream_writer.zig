@@ -128,205 +128,204 @@ pub const WriterOptions = struct {
     metadata_version: MetadataVersion = .v5,
 };
 
-pub fn StreamWriter(comptime WriterType: type) type {
-    return struct {
-        allocator: std.mem.Allocator,
-        writer: WriterType,
-        dictionary_values: std.AutoHashMap(i64, ArrayRef),
-        body_compression: ?BodyCompressionCodec = null,
-        endianness_mode: EndiannessMode = .strict,
-        metadata_version: MetadataVersion = .v5,
+pub const StreamWriter = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    dictionary_values: std.AutoHashMap(i64, ArrayRef),
+    body_compression: ?BodyCompressionCodec = null,
+    endianness_mode: EndiannessMode = .strict,
+    metadata_version: MetadataVersion = .v5,
 
-        const Self = @This();
+    const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator, writer: WriterType) Self {
-            return initWithOptions(allocator, writer, .{});
+    pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) Self {
+        return initWithOptions(allocator, writer, .{});
+    }
+
+    pub fn initWithBodyCompression(allocator: std.mem.Allocator, writer: *std.Io.Writer, codec: BodyCompressionCodec) Self {
+        return initWithOptions(allocator, writer, .{ .body_compression = codec });
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, writer: *std.Io.Writer, options: WriterOptions) Self {
+        return .{
+            .allocator = allocator,
+            .writer = writer,
+            .dictionary_values = std.AutoHashMap(i64, ArrayRef).init(allocator),
+            .body_compression = options.body_compression,
+            .endianness_mode = options.endianness_mode,
+            .metadata_version = options.metadata_version,
+        };
+    }
+
+    pub fn setBodyCompression(self: *Self, codec: ?BodyCompressionCodec) void {
+        self.body_compression = codec;
+    }
+
+    pub fn metadataVersion(self: *const Self) MetadataVersion {
+        return self.metadata_version;
+    }
+
+    pub fn flatbufMetadataVersion(self: *const Self) fbs.MetadataVersion {
+        return toFbsMetadataVersion(self.metadata_version);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.clearDictionaryValues();
+        self.dictionary_values.deinit();
+    }
+
+    fn clearDictionaryValues(self: *Self) void {
+        var it = self.dictionary_values.iterator();
+        while (it.next()) |entry| {
+            var dict = entry.value_ptr.*;
+            dict.release();
+        }
+        self.dictionary_values.clearRetainingCapacity();
+    }
+
+    pub fn writeSchema(self: *Self, schema: Schema) (WriterError || std.Io.Writer.Error)!void {
+        self.clearDictionaryValues();
+        const schema_ptr = try self.allocator.create(fbs.SchemaT);
+        errdefer self.allocator.destroy(schema_ptr);
+        var next_dictionary_id: i64 = 0;
+        schema_ptr.* = try buildSchemaT(
+            self.allocator,
+            schema,
+            &next_dictionary_id,
+            self.endianness_mode,
+            self.metadata_version,
+        );
+
+        var msg = fbs.MessageT{
+            .version = toFbsMetadataVersion(self.metadata_version),
+            .header = .{ .Schema = schema_ptr },
+            .bodyLength = 0,
+            .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(self.allocator, 0),
+        };
+        defer msg.deinit(self.allocator);
+
+        try writeMessage(self.allocator, self.writer, msg, &.{});
+    }
+
+    pub fn writeTensorLikeMessage(self: *Self, metadata: TensorLikeMetadata, body: []const u8) (WriterError || std.Io.Writer.Error)!void {
+        var msg = try buildTensorLikeMessage(self.allocator, metadata, body, self.metadata_version);
+        defer msg.deinit(self.allocator);
+        try writeMessage(self.allocator, self.writer, msg, &.{array_data.SharedBuffer.fromSlice(body)});
+    }
+
+    pub fn writeRecordBatch(self: *Self, batch: RecordBatch) (WriterError || std.Io.Writer.Error)!void {
+        var dictionary_ids = try std.ArrayList(i64).initCapacity(self.allocator, 0);
+        defer dictionary_ids.deinit(self.allocator);
+        var next_dictionary_id: i64 = 0;
+        for (batch.schema().fields) |field| {
+            try collectDictionaryIdsFromField(self.allocator, field, &next_dictionary_id, &dictionary_ids);
         }
 
-        pub fn initWithBodyCompression(allocator: std.mem.Allocator, writer: WriterType, codec: BodyCompressionCodec) Self {
-            return initWithOptions(allocator, writer, .{ .body_compression = codec });
-        }
-
-        pub fn initWithOptions(allocator: std.mem.Allocator, writer: WriterType, options: WriterOptions) Self {
-            return .{
-                .allocator = allocator,
-                .writer = writer,
-                .dictionary_values = std.AutoHashMap(i64, ArrayRef).init(allocator),
-                .body_compression = options.body_compression,
-                .endianness_mode = options.endianness_mode,
-                .metadata_version = options.metadata_version,
-            };
-        }
-
-        pub fn setBodyCompression(self: *Self, codec: ?BodyCompressionCodec) void {
-            self.body_compression = codec;
-        }
-
-        pub fn metadataVersion(self: *const Self) MetadataVersion {
-            return self.metadata_version;
-        }
-
-        pub fn flatbufMetadataVersion(self: *const Self) fbs.MetadataVersion {
-            return toFbsMetadataVersion(self.metadata_version);
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.clearDictionaryValues();
-            self.dictionary_values.deinit();
-        }
-
-        fn clearDictionaryValues(self: *Self) void {
-            var it = self.dictionary_values.iterator();
-            while (it.next()) |entry| {
-                var dict = entry.value_ptr.*;
-                dict.release();
+        var dictionary_arrays = try std.ArrayList(ArrayRef).initCapacity(self.allocator, 0);
+        defer {
+            for (dictionary_arrays.items) |dict_ref| {
+                var owned = dict_ref;
+                owned.release();
             }
-            self.dictionary_values.clearRetainingCapacity();
+            dictionary_arrays.deinit(self.allocator);
         }
-
-        pub fn writeSchema(self: *Self, schema: Schema) (WriterError || @TypeOf(self.writer).Error)!void {
-            self.clearDictionaryValues();
-            const schema_ptr = try self.allocator.create(fbs.SchemaT);
-            errdefer self.allocator.destroy(schema_ptr);
-            var next_dictionary_id: i64 = 0;
-            schema_ptr.* = try buildSchemaT(
-                self.allocator,
-                schema,
-                &next_dictionary_id,
-                self.endianness_mode,
-                self.metadata_version,
-            );
-
-            var msg = fbs.MessageT{
-                .version = toFbsMetadataVersion(self.metadata_version),
-                .header = .{ .Schema = schema_ptr },
-                .bodyLength = 0,
-                .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(self.allocator, 0),
-            };
-            defer msg.deinit(self.allocator);
-
-            try writeMessage(self.allocator, self.writer, msg, &.{});
+        for (batch.columns) |col| {
+            try collectDictionaryArraysFromData(self.allocator, col.data(), &dictionary_arrays);
         }
+        if (dictionary_ids.items.len != dictionary_arrays.items.len) return StreamError.InvalidMetadata;
 
-        pub fn writeTensorLikeMessage(self: *Self, metadata: TensorLikeMetadata, body: []const u8) (WriterError || @TypeOf(self.writer).Error)!void {
-            var msg = try buildTensorLikeMessage(self.allocator, metadata, body, self.metadata_version);
-            defer msg.deinit(self.allocator);
-            try writeMessage(self.allocator, self.writer, msg, &.{array_data.SharedBuffer.fromSlice(body)});
-        }
-
-        pub fn writeRecordBatch(self: *Self, batch: RecordBatch) (WriterError || @TypeOf(self.writer).Error)!void {
-            var dictionary_ids = try std.ArrayList(i64).initCapacity(self.allocator, 0);
-            defer dictionary_ids.deinit(self.allocator);
-            var next_dictionary_id: i64 = 0;
-            for (batch.schema().fields) |field| {
-                try collectDictionaryIdsFromField(self.allocator, field, &next_dictionary_id, &dictionary_ids);
-            }
-
-            var dictionary_arrays = try std.ArrayList(ArrayRef).initCapacity(self.allocator, 0);
-            defer {
-                for (dictionary_arrays.items) |dict_ref| {
-                    var owned = dict_ref;
-                    owned.release();
-                }
-                dictionary_arrays.deinit(self.allocator);
-            }
-            for (batch.columns) |col| {
-                try collectDictionaryArraysFromData(self.allocator, col.data(), &dictionary_arrays);
-            }
-            if (dictionary_ids.items.len != dictionary_arrays.items.len) return StreamError.InvalidMetadata;
-
-            for (dictionary_ids.items, dictionary_arrays.items) |dictionary_id, dict_ref| {
-                const emission = try planDictionaryEmission(self.dictionary_values.get(dictionary_id), dict_ref);
-                if (emission.mode != .skip) {
-                    try writeDictionaryBatch(
-                        self.allocator,
-                        self.writer,
-                        dictionary_id,
-                        emission.array.data(),
-                        emission.mode == .delta,
-                        self.metadata_version,
-                    );
-                }
-                if (emission.owned_slice) |slice| {
-                    var owned = slice;
-                    owned.release();
-                }
-
-                const previous = try self.dictionary_values.fetchPut(dictionary_id, dict_ref.retain());
-                if (previous) |entry| {
-                    var old = entry.value;
-                    old.release();
-                }
-            }
-
-            var nodes = try std.ArrayList(fbs.FieldNodeT).initCapacity(self.allocator, 0);
-            var buffers = try std.ArrayList(fbs.BufferT).initCapacity(self.allocator, 0);
-            var variadic_buffer_counts = try std.ArrayList(i64).initCapacity(self.allocator, 0);
-            var body_buffers = try std.ArrayList(array_data.SharedBuffer).initCapacity(self.allocator, 0);
-            var owns_body_buffers = false;
-            defer body_buffers.deinit(self.allocator);
-            defer if (owns_body_buffers) {
-                for (body_buffers.items) |buf| {
-                    var owned = buf;
-                    owned.release();
-                }
-            };
-
-            var body_offset: u64 = 0;
-            for (batch.columns) |col| {
-                try appendArrayMeta(
+        for (dictionary_ids.items, dictionary_arrays.items) |dictionary_id, dict_ref| {
+            const emission = try planDictionaryEmission(self.dictionary_values.get(dictionary_id), dict_ref);
+            if (emission.mode != .skip) {
+                try writeDictionaryBatch(
                     self.allocator,
-                    col.data(),
-                    &nodes,
-                    &buffers,
-                    &variadic_buffer_counts,
-                    &body_buffers,
-                    &body_offset,
+                    self.writer,
+                    dictionary_id,
+                    emission.array.data(),
+                    emission.mode == .delta,
                     self.metadata_version,
                 );
             }
-
-            var compression_ptr: ?*fbs.BodyCompressionT = null;
-            if (self.body_compression) |codec| {
-                compression_ptr = try applyBodyCompression(
-                    self.allocator,
-                    codec,
-                    &buffers,
-                    &body_buffers,
-                    &body_offset,
-                );
-                owns_body_buffers = true;
+            if (emission.owned_slice) |slice| {
+                var owned = slice;
+                owned.release();
             }
 
-            const record_batch_ptr = try self.allocator.create(fbs.RecordBatchT);
-            errdefer self.allocator.destroy(record_batch_ptr);
-            record_batch_ptr.* = .{
-                .length = try castI64Metadata(batch.numRows()),
-                .nodes = nodes,
-                .buffers = buffers,
-                .compression = compression_ptr,
-                .variadicBufferCounts = variadic_buffer_counts,
-            };
-
-            var msg = fbs.MessageT{
-                .version = toFbsMetadataVersion(self.metadata_version),
-                .header = .{ .RecordBatch = record_batch_ptr },
-                .bodyLength = try castI64Metadata(body_offset),
-                .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(self.allocator, 0),
-            };
-            defer msg.deinit(self.allocator);
-
-            try writeMessage(self.allocator, self.writer, msg, body_buffers.items);
+            const previous = try self.dictionary_values.fetchPut(dictionary_id, dict_ref.retain());
+            if (previous) |entry| {
+                var old = entry.value;
+                old.release();
+            }
         }
 
-        pub fn writeEnd(self: *Self) !void {
-            // Emit EOS as continuation marker + 0-length metadata (8 bytes).
-            try format.writeMessageLength(self.writer, 0);
-        }
-    };
-}
+        var nodes = try std.ArrayList(fbs.FieldNodeT).initCapacity(self.allocator, 0);
+        var buffers = try std.ArrayList(fbs.BufferT).initCapacity(self.allocator, 0);
+        var variadic_buffer_counts = try std.ArrayList(i64).initCapacity(self.allocator, 0);
+        var body_buffers = try std.ArrayList(array_data.SharedBuffer).initCapacity(self.allocator, 0);
+        var owns_body_buffers = false;
+        defer body_buffers.deinit(self.allocator);
+        defer if (owns_body_buffers) {
+            for (body_buffers.items) |buf| {
+                var owned = buf;
+                owned.release();
+            }
+        };
 
-fn writeMessage(allocator: std.mem.Allocator, writer: anytype, msg: fbs.MessageT, body_buffers: []const array_data.SharedBuffer) (WriterError || @TypeOf(writer).Error)!void {
+        var body_offset: u64 = 0;
+        for (batch.columns) |col| {
+            try appendArrayMeta(
+                self.allocator,
+                col.data(),
+                &nodes,
+                &buffers,
+                &variadic_buffer_counts,
+                &body_buffers,
+                &body_offset,
+                self.metadata_version,
+            );
+        }
+
+        var compression_ptr: ?*fbs.BodyCompressionT = null;
+        if (self.body_compression) |codec| {
+            compression_ptr = try applyBodyCompression(
+                self.allocator,
+                codec,
+                &buffers,
+                &body_buffers,
+                &body_offset,
+            );
+            owns_body_buffers = true;
+        }
+
+        const record_batch_ptr = try self.allocator.create(fbs.RecordBatchT);
+        errdefer self.allocator.destroy(record_batch_ptr);
+        record_batch_ptr.* = .{
+            .length = try castI64Metadata(batch.numRows()),
+            .nodes = nodes,
+            .buffers = buffers,
+            .compression = compression_ptr,
+            .variadicBufferCounts = variadic_buffer_counts,
+        };
+
+        var msg = fbs.MessageT{
+            .version = toFbsMetadataVersion(self.metadata_version),
+            .header = .{ .RecordBatch = record_batch_ptr },
+            .bodyLength = try castI64Metadata(body_offset),
+            .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(self.allocator, 0),
+        };
+        defer msg.deinit(self.allocator);
+
+        try writeMessage(self.allocator, self.writer, msg, body_buffers.items);
+    }
+
+    pub fn writeEnd(self: *Self) std.Io.Writer.Error!void {
+        // Emit EOS as continuation marker + 0-length metadata (8 bytes).
+        try format.writeMessageLength(self.writer, 0);
+        try self.writer.flush();
+    }
+};
+
+fn writeMessage(allocator: std.mem.Allocator, writer: *std.Io.Writer, msg: fbs.MessageT, body_buffers: []const array_data.SharedBuffer) (WriterError || std.Io.Writer.Error)!void {
     const metadata = try fbs_lite_builder.packMessageBytes(allocator, msg);
     defer allocator.free(metadata);
 
@@ -336,7 +335,7 @@ fn writeMessage(allocator: std.mem.Allocator, writer: anytype, msg: fbs.MessageT
     try writer.writeAll(metadata);
     try format.writePadding(writer, format.padLen(metadata.len));
 
-    var pad_bytes: [format.Alignment]u8 = [_]u8{0} ** format.Alignment;
+    var pad_bytes: [format.Alignment]u8 = @splat(0);
     for (body_buffers) |buf| {
         if (buf.len() > 0) try writer.writeAll(buf.data);
         const pad_len = format.padLen(buf.len());
@@ -900,12 +899,12 @@ fn collectDictionaryArraysFromData(
 
 fn writeDictionaryBatch(
     allocator: std.mem.Allocator,
-    writer: anytype,
+    writer: *std.Io.Writer,
     dictionary_id: i64,
     dictionary_data: *const ArrayData,
     is_delta: bool,
     metadata_version: MetadataVersion,
-) (WriterError || @TypeOf(writer).Error)!void {
+) (WriterError || std.Io.Writer.Error)!void {
     var nodes = try std.ArrayList(fbs.FieldNodeT).initCapacity(allocator, 0);
     var buffers = try std.ArrayList(fbs.BufferT).initCapacity(allocator, 0);
     var variadic_buffer_counts = try std.ArrayList(i64).initCapacity(allocator, 0);
@@ -1328,7 +1327,7 @@ fn computeNullCount(data: *const ArrayData) usize {
 }
 
 fn parseGoldenHexCsv(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = std.ArrayList(u8){};
+    var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
     var it = std.mem.tokenizeAny(u8, text, ", \n\r\t");
@@ -1342,14 +1341,14 @@ fn parseGoldenHexCsv(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn readNextMessageForTest(allocator: std.mem.Allocator, reader: anytype) anyerror!?fbs.MessageT {
+fn readNextMessageForTest(allocator: std.mem.Allocator, reader: *std.Io.Reader) anyerror!?fbs.MessageT {
     const meta_len_opt = try format.readMessageLength(reader);
     if (meta_len_opt == null) return null;
     const meta_len = meta_len_opt.?;
 
     const metadata = try allocator.alloc(u8, meta_len);
     defer allocator.free(metadata);
-    if (meta_len > 0) try reader.readNoEof(metadata);
+    if (meta_len > 0) try reader.readSliceAll(metadata);
     try format.skipPadding(reader, format.padLen(meta_len));
 
     const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata) catch return StreamError.InvalidMetadata;
@@ -1362,7 +1361,7 @@ fn readNextMessageForTest(allocator: std.mem.Allocator, reader: anytype) anyerro
     if (body_len > 0) {
         const body = try allocator.alloc(u8, body_len);
         defer allocator.free(body);
-        try reader.readNoEof(body);
+        try reader.readSliceAll(body);
     }
     try format.skipPadding(reader, format.padLen(body_len));
 
@@ -1388,10 +1387,10 @@ test "ipc writer stream output matches golden fixture" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{col_ref});
     defer batch.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
 
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch);
@@ -1401,7 +1400,7 @@ test "ipc writer stream output matches golden fixture" {
     const expected = try parseGoldenHexCsv(allocator, golden_text);
     defer allocator.free(expected);
 
-    try std.testing.expectEqualSlices(u8, expected, out.items);
+    try std.testing.expectEqualSlices(u8, expected, out.written());
 }
 
 test "ipc writer roundtrip supports view types and variadicBufferCounts" {
@@ -1436,16 +1435,16 @@ test "ipc writer roundtrip supports view types and variadicBufferCounts" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{ sv_ref, bv_ref });
     defer batch.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    var reader = @import("stream_reader.zig").StreamReader(@TypeOf(stream.reader())).init(allocator, stream.reader());
+    var in: std.Io.Reader = .fixed(out.written());
+    var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
     defer reader.deinit();
     const out_schema = try reader.readSchema();
     try std.testing.expect(out_schema.fields[0].data_type.* == .string_view);
@@ -1504,16 +1503,16 @@ test "ipc writer and reader roundtrip extension field metadata and values" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{ext_ref});
     defer batch.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    var reader = @import("stream_reader.zig").StreamReader(@TypeOf(stream.reader())).init(allocator, stream.reader());
+    var in: std.Io.Reader = .fixed(out.written());
+    var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
     defer reader.deinit();
 
     const read_schema = try reader.readSchema();
@@ -1597,20 +1596,20 @@ test "ipc writer emits dictionary delta on append-only dictionary growth" {
     var batch_2 = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{dict_col_2});
     defer batch_2.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
 
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch_1);
     try writer.writeRecordBatch(batch_2);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    const reader = stream.reader();
+    var in: std.Io.Reader = .fixed(out.written());
+    const reader = &in;
 
-    var dict_flags = std.ArrayList(bool){};
+    var dict_flags = std.ArrayList(bool).empty;
     defer dict_flags.deinit(allocator);
 
     while (true) {
@@ -1646,24 +1645,24 @@ test "ipc writer emits body compression metadata and framing" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{col});
     defer batch.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
 
-    var writer = StreamWriter(@TypeOf(out.writer())).initWithBodyCompression(allocator, out.writer(), .zstd);
+    var writer = StreamWriter.initWithBodyCompression(allocator, &out.writer, .zstd);
     defer writer.deinit();
     try writer.writeSchema(schema);
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    const schema_msg = (try readNextMessageForTest(allocator, stream.reader())).?;
+    var in: std.Io.Reader = .fixed(out.written());
+    const schema_msg = (try readNextMessageForTest(allocator, &in)).?;
     defer {
         var msg = schema_msg;
         msg.deinit(allocator);
     }
     try std.testing.expect(schema_msg.header == .Schema);
 
-    const rb_msg_opt = try readNextMessageForTest(allocator, stream.reader());
+    const rb_msg_opt = try readNextMessageForTest(allocator, &in);
     try std.testing.expect(rb_msg_opt != null);
     var rb_msg = rb_msg_opt.?;
     defer rb_msg.deinit(allocator);
@@ -1705,10 +1704,10 @@ test "ipc writer can switch body compression codec between record batches" {
     var rb2 = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{c2});
     defer rb2.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
 
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try writer.writeSchema(schema);
@@ -1718,8 +1717,8 @@ test "ipc writer can switch body compression codec between record batches" {
     try writer.writeRecordBatch(rb2);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    const reader = stream.reader();
+    var in: std.Io.Reader = .fixed(out.written());
+    const reader = &in;
 
     var seen_rb: usize = 0;
     while (true) {
@@ -1758,9 +1757,9 @@ test "ipc writer rejects dictionary with unsigned index type" {
     };
     const schema = Schema{ .fields = fields[0..] };
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try std.testing.expectError(StreamError.InvalidMetadata, writer.writeSchema(schema));
@@ -1797,9 +1796,9 @@ test "ipc writer rejects decimal precision outside allowed range" {
         };
         const schema = Schema{ .fields = fields[0..] };
 
-        var out = std.array_list.Managed(u8).init(allocator);
+        var out = std.Io.Writer.Allocating.init(allocator);
         defer out.deinit();
-        var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+        var writer = StreamWriter.init(allocator, &out.writer);
         defer writer.deinit();
 
         try std.testing.expectError(StreamError.InvalidMetadata, writer.writeSchema(schema));
@@ -1815,9 +1814,9 @@ test "ipc writer rejects big-endian schema" {
     };
     const schema = Schema{ .fields = fields[0..], .endianness = .big };
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try std.testing.expectError(StreamError.UnsupportedType, writer.writeSchema(schema));
@@ -1832,9 +1831,9 @@ test "ipc writer normalizes big-endian schema when configured" {
     };
     const schema = Schema{ .fields = fields[0..], .endianness = .big };
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).initWithOptions(allocator, out.writer(), .{
+    var writer = StreamWriter.initWithOptions(allocator, &out.writer, .{
         .endianness_mode = .normalize_to_little,
     });
     defer writer.deinit();
@@ -1842,8 +1841,8 @@ test "ipc writer normalizes big-endian schema when configured" {
     try writer.writeSchema(schema);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    var reader = @import("stream_reader.zig").StreamReader(@TypeOf(stream.reader())).init(allocator, stream.reader());
+    var in: std.Io.Reader = .fixed(out.written());
+    var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
     defer reader.deinit();
     const out_schema = try reader.readSchema();
     try std.testing.expectEqual(datatype.Endianness.little, out_schema.endianness);
@@ -1868,9 +1867,9 @@ test "ipc writer can emit metadata version V4 for schema and record batch" {
     var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{id_ref});
     defer batch.deinit();
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).initWithOptions(allocator, out.writer(), .{
+    var writer = StreamWriter.initWithOptions(allocator, &out.writer, .{
         .metadata_version = .v4,
     });
     defer writer.deinit();
@@ -1879,8 +1878,8 @@ test "ipc writer can emit metadata version V4 for schema and record batch" {
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    const reader = stream.reader();
+    var in: std.Io.Reader = .fixed(out.written());
+    const reader = &in;
 
     const schema_msg_opt = try readNextMessageForTest(allocator, reader);
     try std.testing.expect(schema_msg_opt != null);
@@ -1918,9 +1917,9 @@ test "ipc writer emits V4-compatible sparse union buffers" {
     };
     const schema = Schema{ .fields = schema_fields[0..] };
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).initWithOptions(allocator, out.writer(), .{
+    var writer = StreamWriter.initWithOptions(allocator, &out.writer, .{
         .metadata_version = .v4,
     });
     defer writer.deinit();
@@ -1953,8 +1952,8 @@ test "ipc writer emits V4-compatible sparse union buffers" {
     try writer.writeRecordBatch(batch);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    const reader = stream.reader();
+    var in: std.Io.Reader = .fixed(out.written());
+    const reader = &in;
     const schema_msg_opt = try readNextMessageForTest(allocator, reader);
     try std.testing.expect(schema_msg_opt != null);
     var schema_msg = schema_msg_opt.?;
@@ -1968,8 +1967,8 @@ test "ipc writer emits V4-compatible sparse union buffers" {
     try std.testing.expect(rb.buffers.items.len >= 2);
     try std.testing.expectEqual(@as(i64, 0), rb.buffers.items[0].length);
 
-    var out_stream = std.io.fixedBufferStream(out.items);
-    var out_reader = @import("stream_reader.zig").StreamReader(@TypeOf(out_stream.reader())).init(allocator, out_stream.reader());
+    var out_in: std.Io.Reader = .fixed(out.written());
+    var out_reader = @import("stream_reader.zig").StreamReader.init(allocator, &out_in);
     defer out_reader.deinit();
     _ = try out_reader.readSchema();
     const out_batch_opt = try out_reader.nextRecordBatch();
@@ -2007,16 +2006,16 @@ test "ipc writer emits tensor message via public tensor-like api" {
         },
     };
 
-    var out = std.array_list.Managed(u8).init(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
-    var writer = StreamWriter(@TypeOf(out.writer())).init(allocator, out.writer());
+    var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
     try writer.writeTensorLikeMessage(metadata, body[0..]);
     try writer.writeEnd();
 
-    var stream = std.io.fixedBufferStream(out.items);
-    var reader = @import("stream_reader.zig").StreamReader(@TypeOf(stream.reader())).init(allocator, stream.reader());
+    var in: std.Io.Reader = .fixed(out.written());
+    var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
     defer reader.deinit();
 
     const maybe_msg = try reader.nextTensorLikeMessage();

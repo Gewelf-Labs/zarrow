@@ -74,22 +74,23 @@ Zig 在这个领域有天然优势：显式内存管理、可预测性能、清�
 
 ## 版本要求
 
-`master` 分支当前目标 Zig 版本为 `0.15.x`。
+`master` 分支当前目标 Zig 版本为 `0.17.x`。
 
 由于 Zig 编译器版本间存在较多 breaking changes，`zarrow` 使用带编译器后缀的标签来维护多版本兼容：
 
 - `v<zarrow-version>` 表示 zarrow 的版本
-- `zig0.15` 表示目标 Zig 语言（编译器）版本
+- `zig0.17` 表示目标 Zig 语言（编译器）版本
 
-例如：`v0.0.2-zig0.15` 表示：
+例如：`v0.0.2-zig0.17` 表示：
 
 - zarrow 发布版本是 `0.0.2`
-- 兼容的 Zig 版本目标是 `0.15.x`
+- 兼容的 Zig 版本目标是 `0.17.x`
 
 推荐对应关系：
 
 | Zig 版本 | 使用标签 |
 | --- | --- |
+| `0.17.x` | `v<zarrow-version>-zig0.17` |
 | `0.15.x` | `v<zarrow-version>-zig0.15` |
 | `0.14.x` | `v<zarrow-version>-zig0.14` |
 | `0.13.x` | `v<zarrow-version>-zig0.13` |
@@ -109,7 +110,7 @@ zig fetch --save "git+https://github.com/tylitianrui/zarrow#master"
 如果你希望固定版本，建议使用 release tag：
 
 ```sh
-zig fetch --save "git+https://github.com/tylitianrui/zarrow#v<zarrow-version>-zig0.15"
+zig fetch --save "git+https://github.com/tylitianrui/zarrow#v<zarrow-version>-zig0.17"
 ```
 
 然后在 `build.zig` 中接入模块：
