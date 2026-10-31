@@ -314,11 +314,12 @@ zig build benchmark-full
 zig build fuzz-corpus
 ```
 
-手动运行 IPC fuzz harness：
+运行 fuzz 目标（IPC stream / file 读取、数组校验、compute、C ABI 导入），详见
+[fuzzing.md](fuzzing.md)：
 
 ```sh
-zig build fuzz-array-layout
-zig build fuzz-ipc-reader
+zig build fuzz -- ipc-stream replay fuzz/corpus/ipc-stream
+python tools/fuzz.py --out .fuzz-out run --targets all --seconds 300
 ```
 
 ---

@@ -25,7 +25,11 @@ zig build test
 
 Format with Zig 0.16's `zig fmt`: Zig 0.17's formatter rewrites `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt`, which does not compile on 0.16.
 
-4. If the change is performance-sensitive, also run:
+4. If the change touches a reader, validation or the C ABI, replay the fuzz corpus
+   (`zig build fuzz-corpus`) and, for new parsing code, run a short campaign. Fuzz findings are
+   fixed at the root cause with a regression seed: see [docs/fuzzing.md](docs/fuzzing.md).
+
+5. If the change is performance-sensitive, also run:
 
 ```sh
 zig build benchmark-smoke

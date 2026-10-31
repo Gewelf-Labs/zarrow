@@ -1,0 +1,12 @@
+Files named at-* in this directory are copied unmodified from apache/arrow-testing
+(https://github.com/apache/arrow-testing, revision 5a26d35785ff8761e56d79eebff971f6f737e18c), directories
+data/arrow-ipc-stream, data/arrow-ipc-file and data/arrow-ipc-tensor-stream.
+They are licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0); see LICENSE.txt in that repository.
+
+at-stream-*, at-file-*, at-tensor-*: ClusterFuzz reproducers that once crashed or misled the
+Arrow C++ IPC readers (mostly invalid input). at-<arrow version>-*: valid integration fixtures
+written by that Arrow version (incl. compression, shared dictionaries, big-endian).
+
+Regenerate with: python -I tools/fuzz_import_seeds.py <arrow-testing checkout>
+Other files: gen-* come from `zig build fuzz-gen-seeds`, regress-* are fixed zarrow findings.
