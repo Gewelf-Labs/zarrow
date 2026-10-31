@@ -16,6 +16,9 @@ EXPECTED_HEADER = [
 ]
 
 EXPECTED_BENCHES = {
+    "concat",
+    "filter",
+    "ipc_compressed",
     "ipc_roundtrip",
     "primitive_builder",
     "record_batch_builder",

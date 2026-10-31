@@ -978,3 +978,97 @@ test "compute datumFilter emits fixed_size_list null rows when predicate nulls a
     try std.testing.expect(child.isNull(2));
     try std.testing.expect(child.isNull(3));
 }
+
+test "compute datumTake direct gather for string and list on sliced input with null indices" {
+    const allocator = std.testing.allocator;
+
+    const words = [_]?[]const u8{ "skip", "a", null, "ccc", "", "eeeee", null, "g" };
+    var sb = try array_mod.StringBuilder.init(allocator, 0, 0);
+    defer sb.deinit();
+    for (words) |w| if (w) |v| try sb.append(v) else try sb.appendNull();
+    var full_strs = try sb.finish();
+    defer full_strs.release();
+    var strs = try full_strs.slice(1, words.len - 1);
+    defer strs.release();
+
+    const indices = [_]?usize{ 6, 0, null, 1, 3, 3, 5, 2, 4 };
+    var taken = try datumTakeNullable(Datum.fromArray(strs), indices[0..]);
+    defer taken.release();
+    try taken.array.data().validateLayout();
+    const out = array_mod.StringArray{ .data = taken.array.data() };
+    try std.testing.expectEqual(indices.len, out.len());
+    for (indices, 0..) |maybe, i| {
+        const expected: ?[]const u8 = if (maybe) |idx| words[idx + 1] else null;
+        try std.testing.expectEqual(expected == null, out.isNull(i));
+        if (expected) |e| try std.testing.expectEqualStrings(e, try out.value(i));
+    }
+    try std.testing.expectError(error.InvalidInput, datumTakeNullable(Datum.fromArray(strs), &[_]?usize{7}));
+
+    // list<int32>: rows [9], null, [], [2, null, 4], [5]; sliced to drop row 0.
+    const rows = [_]?[]const ?i32{ &.{9}, null, &.{}, &.{ 2, null, 4 }, &.{5} };
+    const item_type = DataType{ .int32 = {} };
+    const item_field = datatype.Field{ .name = "item", .data_type = &item_type, .nullable = true };
+    var lb = try array_mod.ListBuilder.init(allocator, 0, item_field);
+    defer lb.deinit();
+    var vb = try array_mod.Int32Builder.init(allocator, 0);
+    defer vb.deinit();
+    for (rows) |row| {
+        const items = row orelse {
+            try lb.appendNull();
+            continue;
+        };
+        for (items) |item| if (item) |v| try vb.append(v) else try vb.appendNull();
+        try lb.appendLen(items.len);
+    }
+    var child = try vb.finish();
+    defer child.release();
+    var full_list = try lb.finish(child);
+    defer full_list.release();
+    var lists = try full_list.slice(1, rows.len - 1);
+    defer lists.release();
+
+    const list_indices = [_]?usize{ 2, 1, null, 0, 3, 2 };
+    var taken_list = try datumTakeNullable(Datum.fromArray(lists), list_indices[0..]);
+    defer taken_list.release();
+    try taken_list.array.data().validateLayout();
+    const out_list = array_mod.ListArray{ .data = taken_list.array.data() };
+    for (list_indices, 0..) |maybe, i| {
+        const expected: ?[]const ?i32 = if (maybe) |idx| rows[idx + 1] else null;
+        try std.testing.expectEqual(expected == null, out_list.isNull(i));
+        const items = expected orelse continue;
+        var value = try out_list.value(i);
+        defer value.release();
+        const ints = array_mod.Int32Array{ .data = value.data() };
+        try std.testing.expectEqual(items.len, ints.len());
+        for (items, 0..) |item, k| {
+            try std.testing.expectEqual(item == null, ints.isNull(k));
+            if (item) |v| try std.testing.expectEqual(v, try ints.value(k));
+        }
+    }
+}
+
+test "compute datumFilterSelectionIndices word path matches per-row decisions on sliced predicate" {
+    const allocator = std.testing.allocator;
+
+    var vals: [29]?bool = undefined;
+    for (&vals, 0..) |*v, i| v.* = if (i % 5 == 3) null else (i * 7) % 3 != 0;
+    var full = try makeBoolArray(allocator, &vals);
+    defer full.release();
+    var pred = try full.slice(3, 23);
+    defer pred.release();
+
+    inline for (.{ true, false }) |drop| {
+        // logical_len 21 < predicate length 23: only the first 21 rows are read.
+        const got = try datumFilterSelectionIndices(allocator, Datum.fromArray(pred), 21, .{ .drop_nulls = drop });
+        defer allocator.free(got);
+        var expected: std.ArrayList(?usize) = .empty;
+        defer expected.deinit(allocator);
+        for (0..21) |i| {
+            if (vals[i + 3]) |keep| {
+                if (keep) try expected.append(allocator, i);
+            } else if (!drop) try expected.append(allocator, null);
+        }
+        try std.testing.expectEqualSlices(?usize, expected.items, got);
+    }
+    try std.testing.expectError(error.InvalidInput, datumFilterSelectionIndices(allocator, Datum.fromArray(pred), 24, .{}));
+}

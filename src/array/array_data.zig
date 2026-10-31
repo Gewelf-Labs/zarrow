@@ -215,12 +215,12 @@ pub const ArrayData = struct {
         };
     }
 
-    fn validateOffsetsI32(offsets: []const i32, total_len: usize, data_len: usize) ValidationError!void {
+    fn validateOffsetsI32(offsets: []const i32, start: usize, total_len: usize, data_len: usize) ValidationError!void {
         const needed_len = std.math.add(usize, total_len, 1) catch return error.InvalidOffsets;
         if (offsets.len < needed_len) return error.BufferTooSmall;
-        var prev: i32 = offsets[0];
+        var prev: i32 = offsets[start];
         if (prev < 0) return error.InvalidOffsets;
-        var i: usize = 1;
+        var i: usize = start + 1;
         while (i < needed_len) : (i += 1) {
             const cur = offsets[i];
             if (cur < prev or cur < 0) return error.InvalidOffsets;
@@ -231,10 +231,10 @@ pub const ArrayData = struct {
     }
 
     // ListView offsets/sizes are per-element views into the child array.
-    fn validateOffsetsSizesI32(offsets: []const i32, sizes: []const i32, total_len: usize, child_len: usize) ValidationError!void {
+    fn validateOffsetsSizesI32(offsets: []const i32, sizes: []const i32, start: usize, total_len: usize, child_len: usize) ValidationError!void {
         if (offsets.len < total_len) return error.BufferTooSmall;
         if (sizes.len < total_len) return error.BufferTooSmall;
-        var i: usize = 0;
+        var i: usize = start;
         while (i < total_len) : (i += 1) {
             const off = offsets[i];
             const size = sizes[i];
@@ -246,12 +246,12 @@ pub const ArrayData = struct {
         }
     }
 
-    fn validateOffsetsI64(offsets: []const i64, total_len: usize, data_len: usize) ValidationError!void {
+    fn validateOffsetsI64(offsets: []const i64, start: usize, total_len: usize, data_len: usize) ValidationError!void {
         const needed_len = std.math.add(usize, total_len, 1) catch return error.InvalidOffsets;
         if (offsets.len < needed_len) return error.BufferTooSmall;
-        var prev: i64 = offsets[0];
+        var prev: i64 = offsets[start];
         if (prev < 0) return error.InvalidOffsets;
-        var i: usize = 1;
+        var i: usize = start + 1;
         while (i < needed_len) : (i += 1) {
             const cur = offsets[i];
             if (cur < prev or cur < 0) return error.InvalidOffsets;
@@ -269,12 +269,12 @@ pub const ArrayData = struct {
             (@as(u32, bytes[3]) << 24);
     }
 
-    fn validateByteViews(view_bytes: []const u8, total_len: usize, variadic: []const SharedBuffer) ValidationError!void {
+    fn validateByteViews(view_bytes: []const u8, start_index: usize, total_len: usize, variadic: []const SharedBuffer) ValidationError!void {
         if (view_bytes.len % 16 != 0) return error.InvalidOffsetBuffer;
         const view_count = view_bytes.len / 16;
         if (view_count < total_len) return error.BufferTooSmall;
 
-        var i: usize = 0;
+        var i: usize = start_index;
         while (i < total_len) : (i += 1) {
             const start = i * 16;
             const view = view_bytes[start .. start + 16];
@@ -469,10 +469,10 @@ pub const ArrayData = struct {
     }
 
     // LargeListView offsets/sizes use 64-bit indices.
-    fn validateOffsetsSizesI64(offsets: []const i64, sizes: []const i64, total_len: usize, child_len: usize) ValidationError!void {
+    fn validateOffsetsSizesI64(offsets: []const i64, sizes: []const i64, start: usize, total_len: usize, child_len: usize) ValidationError!void {
         if (offsets.len < total_len) return error.BufferTooSmall;
         if (sizes.len < total_len) return error.BufferTooSmall;
-        var i: usize = 0;
+        var i: usize = start;
         while (i < total_len) : (i += 1) {
             const off = offsets[i];
             const size = sizes[i];
@@ -513,7 +513,7 @@ pub const ArrayData = struct {
             .string_view, .binary_view => {
                 if (self.buffers.len < 2) return error.InvalidBufferCount;
                 const variadic = if (self.buffers.len > 2) self.buffers[2..] else &[_]SharedBuffer{};
-                try validateByteViews(self.buffers[1].data, total_len, variadic);
+                try validateByteViews(self.buffers[1].data, self.offset, total_len, variadic);
             },
             .bool => {
                 if (self.buffers.len < 2) return error.InvalidBufferCount;
@@ -534,11 +534,11 @@ pub const ArrayData = struct {
                 if (offset_width == 4) {
                     const offsets = self.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer;
                     const sizes = self.buffers[2].typedSlice(i32) catch return error.InvalidOffsetBuffer;
-                    try validateOffsetsSizesI32(offsets, sizes, total_len, child_len);
+                    try validateOffsetsSizesI32(offsets, sizes, self.offset, total_len, child_len);
                 } else {
                     const offsets = self.buffers[1].typedSlice(i64) catch return error.InvalidOffsetBuffer;
                     const sizes = self.buffers[2].typedSlice(i64) catch return error.InvalidOffsetBuffer;
-                    try validateOffsetsSizesI64(offsets, sizes, total_len, child_len);
+                    try validateOffsetsSizesI64(offsets, sizes, self.offset, total_len, child_len);
                 }
             },
             .string, .binary, .list, .map, .large_string, .large_binary, .large_list => {
@@ -560,10 +560,10 @@ pub const ArrayData = struct {
 
                 if (offset_width == 4) {
                     const offsets = self.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer;
-                    try validateOffsetsI32(offsets, total_len, data_len);
+                    try validateOffsetsI32(offsets, self.offset, total_len, data_len);
                 } else {
                     const offsets = self.buffers[1].typedSlice(i64) catch return error.InvalidOffsetBuffer;
-                    try validateOffsetsI64(offsets, total_len, data_len);
+                    try validateOffsetsI64(offsets, self.offset, total_len, data_len);
                 }
             },
             .fixed_size_list, .struct_ => {

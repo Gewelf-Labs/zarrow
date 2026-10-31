@@ -1795,117 +1795,109 @@ fn decodeRecordBatchBody(
     const buffers_len = record_batch_t.buffers.items.len;
     const decoded_meta = try allocator.alloc(fbs.BufferT, buffers_len);
     errdefer allocator.free(decoded_meta);
-    const decoded_parts = try allocator.alloc(array_data.SharedBuffer, buffers_len);
-    var part_count: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < part_count) : (i += 1) {
-            var p = decoded_parts[i];
-            p.release();
-        }
-        allocator.free(decoded_parts);
-    }
 
-    var cursor: usize = 0;
-    for (record_batch_t.buffers.items, 0..) |meta, i| {
-        const start = std.math.cast(usize, meta.offset) orelse return StreamError.InvalidBody;
-        const len = std.math.cast(usize, meta.length) orelse return StreamError.InvalidBody;
-        const end = std.math.add(usize, start, len) catch return StreamError.InvalidBody;
-        if (end > body.len()) return StreamError.InvalidBody;
+    // Pass 1: lay out the decoded body from the 8-byte uncompressed-length prefixes.
+    const cursor = try layoutDecodedBody(record_batch_t.buffers.items, body, decoded_meta);
 
-        if (len == 0) {
-            decoded_parts[i] = array_data.SharedBuffer.empty;
-            decoded_meta[i] = .{
-                .offset = std.math.cast(i64, cursor) orelse return StreamError.InvalidBody,
-                .length = 0,
-            };
-            part_count += 1;
-            continue;
-        }
-        if (len < 8) return StreamError.InvalidBody;
-
-        const chunk = body.data[start..end];
-        var ulen_bytes: [8]u8 = undefined;
-        @memcpy(ulen_bytes[0..], chunk[0..8]);
-        const uncompressed_len_i64 = std.mem.readInt(i64, &ulen_bytes, .little);
+    // Pass 2: decompress each buffer straight into its slot (no staging buffers or copies).
+    var owned = try buffer.OwnedBuffer.initUninit(allocator, cursor);
+    errdefer owned.deinit();
+    for (record_batch_t.buffers.items, decoded_meta) |meta, out| {
+        const dst_len: usize = @intCast(out.length);
+        const slot = owned.data[@intCast(out.offset)..][0..format.paddedLen(dst_len)];
+        @memset(slot[dst_len..], 0);
+        if (dst_len == 0) continue;
+        const chunk = try compressedChunk(body, meta);
+        const dst = slot[0..dst_len];
         const payload = chunk[8..];
-
-        const part = if (uncompressed_len_i64 == -1)
-            body.slice(start + 8, end) catch return StreamError.InvalidBody
-        else blk: {
-            if (uncompressed_len_i64 < 0) return StreamError.InvalidBody;
-            const expected_len = std.math.cast(usize, uncompressed_len_i64) orelse return StreamError.InvalidBody;
-            break :blk switch (compression.codec) {
-                .ZSTD => try decompressZstdPayload(allocator, payload, expected_len),
-                .LZ4_FRAME => try decompressLz4FramePayload(allocator, payload, expected_len),
-            };
-        };
-
-        decoded_parts[i] = part;
-        decoded_meta[i] = .{
-            .offset = std.math.cast(i64, cursor) orelse return StreamError.InvalidBody,
-            .length = std.math.cast(i64, part.len()) orelse return StreamError.InvalidBody,
-        };
-        part_count += 1;
-        cursor = std.math.add(usize, cursor, format.paddedLen(part.len())) catch return StreamError.InvalidBody;
-    }
-
-    const decoded_body = if (cursor == 0)
-        array_data.SharedBuffer.empty
-    else blk: {
-        var owned = try buffer.OwnedBuffer.init(allocator, cursor);
-        var out = owned.data[0..cursor];
-        @memset(out, 0);
-        for (decoded_meta, 0..) |meta, i| {
-            const start = std.math.cast(usize, meta.offset) orelse return StreamError.InvalidBody;
-            const len = std.math.cast(usize, meta.length) orelse return StreamError.InvalidBody;
-            if (len == 0) continue;
-            @memcpy(out[start .. start + len], decoded_parts[i].data[0..len]);
+        if (std.mem.readInt(i64, chunk[0..8], .little) == -1) {
+            @memcpy(dst, payload);
+        } else switch (compression.codec) {
+            .ZSTD => try decompressZstdInto(payload, dst),
+            .LZ4_FRAME => try decompressLz4FrameInto(payload, dst),
         }
-        break :blk try owned.toShared(cursor);
-    };
-
-    var i: usize = 0;
-    while (i < decoded_parts.len) : (i += 1) {
-        var p = decoded_parts[i];
-        p.release();
     }
-    allocator.free(decoded_parts);
 
     return .{
-        .body = decoded_body,
+        .body = try owned.toShared(cursor),
         .buffers_meta = decoded_meta,
         .owned_body = true,
         .owned_meta = true,
     };
 }
 
-fn decompressZstdPayload(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-    expected_len: usize,
-) (StreamError || error{OutOfMemory})!array_data.SharedBuffer {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
+/// Upper bound on the decoded size of one compressed record batch body. The sizes come from
+/// attacker-controlled 8-byte prefixes, so they are capped before anything is allocated.
+/// ponytail: fixed cap; make it a StreamReader option if someone needs bigger batches.
+pub const max_decompressed_body_bytes: usize = 1 << 31;
 
-    var in: std.Io.Reader = .fixed(payload);
-    var zstd_stream: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
-    _ = zstd_stream.reader.streamRemaining(&out.writer) catch return StreamError.InvalidBody;
-
-    const decoded = try out.toOwnedSlice();
-    defer allocator.free(decoded);
-    if (decoded.len != expected_len) return StreamError.InvalidBody;
-
-    var owned = try buffer.OwnedBuffer.init(allocator, decoded.len);
-    @memcpy(owned.data[0..decoded.len], decoded);
-    return try owned.toShared(decoded.len);
+/// Fills `decoded_meta` with the decoded offset/length of every buffer and returns the total
+/// padded body size, rejecting declared sizes that overflow or exceed the cap.
+fn layoutDecodedBody(buffers: []const fbs.BufferT, body: array_data.SharedBuffer, decoded_meta: []fbs.BufferT) StreamError!usize {
+    var cursor: usize = 0;
+    for (buffers, decoded_meta) |meta, *out| {
+        const chunk = try compressedChunk(body, meta);
+        const len = if (chunk.len == 0) 0 else try decodedChunkLen(chunk);
+        if (len > max_decompressed_body_bytes) return StreamError.InvalidBody;
+        out.* = .{ .offset = @intCast(cursor), .length = @intCast(len) };
+        cursor += format.paddedLen(len);
+        if (cursor > max_decompressed_body_bytes) return StreamError.InvalidBody;
+    }
+    return cursor;
 }
 
-fn decompressLz4FramePayload(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-    expected_len: usize,
-) (StreamError || error{OutOfMemory})!array_data.SharedBuffer {
+test "layoutDecodedBody rejects hostile uncompressed-length prefixes" {
+    // Two tiny chunks each declaring ~2^63 decoded bytes: must be rejected, not summed/allocated.
+    var bytes: [32]u8 = undefined;
+    std.mem.writeInt(i64, bytes[0..8], std.math.maxInt(i64), .little);
+    @memset(bytes[8..16], 0);
+    std.mem.writeInt(i64, bytes[16..24], std.math.maxInt(i64) - 8, .little);
+    @memset(bytes[24..32], 0);
+    const metas = [_]fbs.BufferT{ .{ .offset = 0, .length = 16 }, .{ .offset = 16, .length = 16 } };
+    var decoded: [2]fbs.BufferT = undefined;
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..]));
+
+    // A single declared size just over the cap is rejected too.
+    std.mem.writeInt(i64, bytes[0..8], @intCast(max_decompressed_body_bytes + 1), .little);
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..1], array_data.SharedBuffer.fromSlice(bytes[0..16]), decoded[0..1]));
+
+    // Sane sizes lay out with 8-byte padding.
+    std.mem.writeInt(i64, bytes[0..8], 5, .little);
+    std.mem.writeInt(i64, bytes[16..24], 3, .little);
+    try std.testing.expectEqual(@as(usize, 16), try layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..]));
+    try std.testing.expectEqual(@as(i64, 8), decoded[1].offset);
+    try std.testing.expectEqual(@as(i64, 3), decoded[1].length);
+}
+
+/// The compressed bytes of one buffer (8-byte length prefix + payload), bounds-checked.
+fn compressedChunk(body: array_data.SharedBuffer, meta: fbs.BufferT) StreamError![]const u8 {
+    const start = std.math.cast(usize, meta.offset) orelse return StreamError.InvalidBody;
+    const len = std.math.cast(usize, meta.length) orelse return StreamError.InvalidBody;
+    const end = std.math.add(usize, start, len) catch return StreamError.InvalidBody;
+    if (end > body.len()) return StreamError.InvalidBody;
+    if (len != 0 and len < 8) return StreamError.InvalidBody;
+    return body.data[start..end];
+}
+
+/// Uncompressed length from the prefix; -1 means the payload is stored uncompressed.
+fn decodedChunkLen(chunk: []const u8) StreamError!usize {
+    const prefix = std.mem.readInt(i64, chunk[0..8], .little);
+    if (prefix == -1) return chunk.len - 8;
+    return std.math.cast(usize, prefix) orelse StreamError.InvalidBody;
+}
+
+fn decompressZstdInto(payload: []const u8, dst: []u8) StreamError!void {
+    const syms = compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType;
+    const written = syms.*.decompress(
+        @ptrCast(dst.ptr),
+        dst.len,
+        if (payload.len == 0) null else @ptrCast(payload.ptr),
+        payload.len,
+    );
+    if (syms.*.is_error(written) != 0 or written != dst.len) return StreamError.InvalidBody;
+}
+
+fn decompressLz4FrameInto(payload: []const u8, out: []u8) StreamError!void {
     const syms = compression_dynlib.loadLz4Symbols() catch return StreamError.UnsupportedType;
 
     var dctx: ?*anyopaque = null;
@@ -1913,10 +1905,7 @@ fn decompressLz4FramePayload(
     if (syms.*.is_error(create_rc) != 0 or dctx == null) return StreamError.InvalidBody;
     defer _ = syms.*.free_decompression_context(dctx);
 
-    var out_owned = try buffer.OwnedBuffer.init(allocator, expected_len);
-    errdefer out_owned.deinit();
-    const out = out_owned.data[0..expected_len];
-
+    const expected_len = out.len;
     var src_pos: usize = 0;
     var dst_pos: usize = 0;
     while (true) {
@@ -1942,7 +1931,6 @@ fn decompressLz4FramePayload(
 
     if (dst_pos != expected_len) return StreamError.InvalidBody;
     if (src_pos != payload.len) return StreamError.InvalidBody;
-    return try out_owned.toShared(expected_len);
 }
 
 fn compressLz4FrameForTest(allocator: std.mem.Allocator, input: []const u8) ![]u8 {

@@ -268,6 +268,188 @@ fn takeFixedWidthArray(
     }) catch return error.OutOfMemory;
 }
 
+fn validAt(src_validity: ?bitmap.ValidityBitmap, j: usize) bool {
+    const v = src_validity orelse return true;
+    return bitmap.bitIsSet(v.data, j);
+}
+
+/// Value range of row `j` (physical index) in an offsets buffer; `limit` bounds the end.
+fn offsetRange(comptime T: type, offsets: []const T, j: usize, limit: usize) KernelError![2]usize {
+    const lo = std.math.cast(usize, offsets[j]) orelse return error.InvalidInput;
+    const hi = std.math.cast(usize, offsets[j + 1]) orelse return error.InvalidInput;
+    if (hi < lo or hi > limit) return error.InvalidInput;
+    return .{ lo, hi };
+}
+
+/// Direct gather for string/binary (i32 or i64 offsets): one pass sizes the value buffer,
+/// a second copies offsets, bytes and validity. Returns null for other layouts.
+fn takeBinaryArray(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    src: *const array_mod.ArrayData,
+    indices: []const ?usize,
+) KernelError!?ArrayRef {
+    if (src.buffers.len != 3) return null;
+    const offsets = src.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const bytes = src.buffers[2].data;
+    const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    if (offsets.len <= src_end) return error.InvalidInput;
+    const src_validity = src.validity();
+
+    var total: usize = 0;
+    var null_count: usize = 0;
+    for (indices) |maybe| {
+        const idx = maybe orelse {
+            null_count += 1;
+            continue;
+        };
+        if (idx >= src.length) return error.InvalidInput;
+        const j = src.offset + idx;
+        if (!validAt(src_validity, j)) {
+            null_count += 1;
+            continue;
+        }
+        const r = try offsetRange(T, offsets, j, bytes.len);
+        total = std.math.add(usize, total, r[1] - r[0]) catch return error.Overflow;
+    }
+    if (total > std.math.maxInt(T)) return error.Overflow;
+
+    const out_len = indices.len;
+    var out_offsets = buffer.OwnedBuffer.initUninit(allocator, (out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
+    errdefer out_offsets.deinit();
+    var out_bytes = buffer.OwnedBuffer.initUninit(allocator, total) catch return error.OutOfMemory;
+    errdefer out_bytes.deinit();
+    var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer validity.deinit();
+
+    const o = out_offsets.typedSlice(T);
+    o[0] = 0;
+    var pos: usize = 0;
+    for (indices, 0..) |maybe, i| {
+        if (maybe) |idx| {
+            const j = src.offset + idx;
+            if (validAt(src_validity, j)) {
+                const lo: usize = @intCast(offsets[j]);
+                const n: usize = @intCast(offsets[j + 1] - offsets[j]);
+                @memcpy(out_bytes.data[pos..][0..n], bytes[lo..][0..n]);
+                pos += n;
+                bitmap.setBit(validity.data, i);
+            }
+        }
+        o[i + 1] = @intCast(pos);
+    }
+
+    var buffers: [3]buffer.SharedBuffer = undefined;
+    buffers[0] = if (null_count == 0) blk: {
+        validity.deinit();
+        break :blk buffer.SharedBuffer.empty;
+    } else validity.toShared(bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer buffers[0].release();
+    buffers[1] = out_offsets.toShared((out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+    buffers[2] = out_bytes.toShared(total) catch return error.OutOfMemory;
+    errdefer buffers[2].release();
+
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = null_count,
+        .buffers = buffers[0..],
+    }) catch return error.OutOfMemory;
+}
+
+/// Direct gather for list/large_list: rebuilds offsets + validity and takes the child once
+/// with the expanded child indices (recursing into the fast kernels). Returns null for other layouts.
+fn takeListArray(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    src: *const array_mod.ArrayData,
+    indices: []const ?usize,
+) KernelError!?ArrayRef {
+    if (src.buffers.len != 2 or src.children.len != 1) return null;
+    const offsets = src.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const child = src.children[0];
+    const child_len = child.data().length;
+    const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    if (offsets.len <= src_end) return error.InvalidInput;
+    const src_validity = src.validity();
+
+    var total: usize = 0;
+    var null_count: usize = 0;
+    for (indices) |maybe| {
+        const idx = maybe orelse {
+            null_count += 1;
+            continue;
+        };
+        if (idx >= src.length) return error.InvalidInput;
+        const j = src.offset + idx;
+        if (!validAt(src_validity, j)) {
+            null_count += 1;
+            continue;
+        }
+        const r = try offsetRange(T, offsets, j, child_len);
+        total = std.math.add(usize, total, r[1] - r[0]) catch return error.Overflow;
+    }
+    if (total > std.math.maxInt(T)) return error.Overflow;
+
+    const child_indices = allocator.alloc(?usize, total) catch return error.OutOfMemory;
+    defer allocator.free(child_indices);
+    const out_len = indices.len;
+    var out_offsets = buffer.OwnedBuffer.initUninit(allocator, (out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
+    errdefer out_offsets.deinit();
+    var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer validity.deinit();
+
+    const o = out_offsets.typedSlice(T);
+    o[0] = 0;
+    var pos: usize = 0;
+    for (indices, 0..) |maybe, i| {
+        if (maybe) |idx| {
+            const j = src.offset + idx;
+            if (validAt(src_validity, j)) {
+                const lo: usize = @intCast(offsets[j]);
+                const hi: usize = @intCast(offsets[j + 1]);
+                for (child_indices[pos..][0 .. hi - lo], lo..) |*ci, k| ci.* = k;
+                pos += hi - lo;
+                bitmap.setBit(validity.data, i);
+            }
+        }
+        o[i + 1] = @intCast(pos);
+    }
+
+    var taken = try datumTakeArrayLikeNullable(allocator, Datum.fromArray(child), child.data().data_type, child_indices);
+    if (taken != .array) {
+        taken.release();
+        return error.InvalidInput;
+    }
+    const children = allocator.alloc(ArrayRef, 1) catch {
+        taken.release();
+        return error.OutOfMemory;
+    };
+    children[0] = taken.array;
+    errdefer {
+        children[0].release();
+        allocator.free(children);
+    }
+
+    var buffers: [2]buffer.SharedBuffer = undefined;
+    buffers[0] = if (null_count == 0) blk: {
+        validity.deinit();
+        break :blk buffer.SharedBuffer.empty;
+    } else validity.toShared(bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer buffers[0].release();
+    buffers[1] = out_offsets.toShared((out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = null_count,
+        .buffers = buffers[0..],
+        .children = children,
+    }) catch return error.OutOfMemory;
+}
+
 fn datumTakeArrayLikeNullable(
     allocator: std.mem.Allocator,
     datum: Datum,
@@ -276,7 +458,15 @@ fn datumTakeArrayLikeNullable(
 ) KernelError!Datum {
     if (indices.len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
     if (datum == .array) {
-        if (try takeFixedWidthArray(allocator, datum.array.data(), indices)) |out| return Datum.fromArray(out);
+        const src = datum.array.data();
+        const fast = switch (src.data_type) {
+            .string, .binary => try takeBinaryArray(i32, allocator, src, indices),
+            .large_string, .large_binary => try takeBinaryArray(i64, allocator, src, indices),
+            .list => try takeListArray(i32, allocator, src, indices),
+            .large_list => try takeListArray(i64, allocator, src, indices),
+            else => try takeFixedWidthArray(allocator, src, indices),
+        };
+        if (fast) |out| return Datum.fromArray(out);
     }
 
     var pieces: std.ArrayList(ArrayRef) = .empty;
@@ -324,6 +514,62 @@ fn predicateDecisionAt(predicate: Datum, logical_index: usize, options: FilterOp
     };
 }
 
+/// 8 bits of `bytes` starting at bit `bit` (bits past the end of `bytes` read as 0).
+fn byteAtBit(bytes: []const u8, bit: usize) u8 {
+    const i = bit >> 3;
+    const sh: u3 = @intCast(bit & 7);
+    const lo = bytes[i] >> sh;
+    if (sh == 0 or i + 1 >= bytes.len) return lo;
+    return lo | (bytes[i + 1] << @intCast(8 - @as(u4, sh)));
+}
+
+const SelectionByte = struct { emit: u8, valid: u8 };
+
+/// Rows `row .. row+8` of a bool predicate: which rows emit an entry and which of those are valid.
+fn selectionByte(values: []const u8, validity: []const u8, bit: usize, rows_left: usize, drop_nulls: bool) SelectionByte {
+    const tail_mask: u8 = if (rows_left >= 8) 0xFF else (@as(u8, 1) << @intCast(rows_left)) - 1;
+    const valid = if (validity.len > 0) byteAtBit(validity, bit) else 0xFF;
+    var emit = byteAtBit(values, bit) & valid;
+    if (!drop_nulls) emit |= ~valid;
+    return .{ .emit = emit & tail_mask, .valid = valid };
+}
+
+/// Appends selections for rows [0, len) of a bool predicate array, 8 rows per step.
+/// `base` is the logical index of the predicate's row 0.
+fn appendBoolSelections(
+    allocator: std.mem.Allocator,
+    selections: *std.ArrayList(?usize),
+    pred: *const array_mod.ArrayData,
+    len: usize,
+    base: usize,
+    options: FilterOptions,
+) KernelError!void {
+    if (pred.buffers.len < 2) return error.InvalidInput;
+    const values = pred.buffers[1].data;
+    const end = std.math.add(usize, pred.offset, len) catch return error.Overflow;
+    if (bitmap.byteLength(end) > values.len) return error.InvalidInput;
+    const validity: []const u8 = if (pred.validity()) |v| v.data else &.{};
+    if (validity.len > 0 and bitmap.byteLength(end) > validity.len) return error.InvalidInput;
+
+    var count: usize = 0;
+    var row: usize = 0;
+    while (row < len) : (row += 8) {
+        count += @popCount(selectionByte(values, validity, pred.offset + row, len - row, options.drop_nulls).emit);
+    }
+    try selections.ensureUnusedCapacity(allocator, count);
+
+    row = 0;
+    while (row < len) : (row += 8) {
+        const sb = selectionByte(values, validity, pred.offset + row, len - row, options.drop_nulls);
+        var emit = sb.emit;
+        while (emit != 0) : (emit &= emit - 1) {
+            const bit: u3 = @intCast(@ctz(emit));
+            const is_valid = (sb.valid >> bit) & 1 != 0;
+            selections.appendAssumeCapacity(if (is_valid) base + row + bit else null);
+        }
+    }
+}
+
 /// Build nullable selection indices from a boolean predicate.
 ///
 /// `keep` emits the logical input index, `drop` emits nothing, and `emit_null`
@@ -338,39 +584,23 @@ pub fn datumFilterSelectionIndices(
     defer selections.deinit(allocator);
 
     switch (predicate) {
-        // Chunked predicate: use an incremental cursor so each element is O(1)
-        // amortized rather than O(n) via the lookupChunkAt linear scan.
+        .array => |arr| {
+            if (arr.data().data_type != .bool) return error.InvalidInput;
+            if (logical_len > arr.data().length) return error.InvalidInput;
+            try appendBoolSelections(allocator, &selections, arr.data(), logical_len, 0, options);
+        },
         .chunked => |chunks| {
             if (chunks.dataType() != .bool) return error.InvalidInput;
-            var chunk_idx: usize = 0;
-            var local_idx: usize = 0;
-            var i: usize = 0;
-            while (i < logical_len) : (i += 1) {
-                // Advance past empty chunks.
-                while (chunk_idx < chunks.numChunks() and
-                    local_idx >= chunks.chunk(chunk_idx).data().length)
-                {
-                    chunk_idx += 1;
-                    local_idx = 0;
-                }
-                if (chunk_idx >= chunks.numChunks()) return error.InvalidInput;
-                const chunk = chunks.chunk(chunk_idx);
-                const decision: PredicateDecision = if (chunk.data().isNull(local_idx))
-                    (if (options.drop_nulls) .drop else .emit_null)
-                else blk: {
-                    const bool_array = array_mod.BooleanArray{ .data = chunk.data() };
-                    const keep = bool_array.value(local_idx) catch |err| return mapArrayReadError(err);
-                    break :blk if (keep) .keep else .drop;
-                };
-                local_idx += 1;
-                switch (decision) {
-                    .drop => {},
-                    .keep => try selections.append(allocator, i),
-                    .emit_null => try selections.append(allocator, null),
-                }
+            var done: usize = 0;
+            for (chunks.chunks()) |chunk| {
+                if (done == logical_len) break;
+                const take = @min(chunk.data().length, logical_len - done);
+                try appendBoolSelections(allocator, &selections, chunk.data(), take, done, options);
+                done += take;
             }
+            if (done != logical_len) return error.InvalidInput;
         },
-        else => {
+        .scalar => {
             var i: usize = 0;
             while (i < logical_len) : (i += 1) {
                 switch (try predicateDecisionAt(predicate, i, options)) {

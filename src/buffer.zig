@@ -18,6 +18,12 @@ pub inline fn alignedSize(size: usize) usize {
     return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 
+/// Rejects capacities whose aligned allocation (`ALIGNMENT` header + padding) would overflow.
+fn checkedCapacity(capacity: usize) error{OutOfMemory}!usize {
+    if (capacity > std.math.maxInt(usize) - 2 * ALIGNMENT) return error.OutOfMemory;
+    return if (capacity == 0) ALIGNMENT else capacity;
+}
+
 // Internal ref-counted storage backing shared buffers.
 // Lives in the first `ALIGNMENT` bytes of the allocation it describes, so
 // `OwnedBuffer.toShared` costs no extra allocation.
@@ -159,7 +165,7 @@ pub const OwnedBuffer = struct {
     /// is always valid and correctly aligned.
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
         // Ensure a minimum of ALIGNMENT bytes so the pointer is never null.
-        const actualCapacity = alignedSize(if (capacity == 0) ALIGNMENT else capacity);
+        const actualCapacity = alignedSize(try checkedCapacity(capacity));
 
         const raw_data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, ALIGNMENT + actualCapacity);
         const data: []align(ALIGNMENT) u8 = @alignCast(raw_data[ALIGNMENT..]);
@@ -176,7 +182,7 @@ pub const OwnedBuffer = struct {
     /// Like `init`, but leaves `[0, capacity)` undefined; only the alignment padding is zeroed.
     /// For callers that immediately overwrite the bytes (e.g. `readSliceAll`).
     pub fn initUninit(allocator: std.mem.Allocator, capacity: usize) !Self {
-        const actualCapacity = alignedSize(if (capacity == 0) ALIGNMENT else capacity);
+        const actualCapacity = alignedSize(try checkedCapacity(capacity));
         const raw_data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, ALIGNMENT + actualCapacity);
         const data: []align(ALIGNMENT) u8 = @alignCast(raw_data[ALIGNMENT..]);
         @memset(data[capacity..], 0);
