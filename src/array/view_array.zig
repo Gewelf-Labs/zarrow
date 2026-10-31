@@ -386,7 +386,7 @@ fn ViewBuilder(comptime view_type: DataType) type {
         pub fn finish(self: *Self) !ArrayRef {
             if (self.state == .finished) return BuilderError.AlreadyFinished;
 
-            self.buffers[0] = if (self.validity) |*valid| try valid.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+            self.buffers[0] = try array_utils.takeValidity(&self.validity, self.len);
             self.buffers[1] = try self.views.toShared(self.len * VIEW_RECORD_SIZE);
             const has_variadic = self.data_len > 0;
             if (has_variadic) self.buffers[2] = try self.data.toShared(self.data_len);

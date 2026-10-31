@@ -131,8 +131,22 @@ pub const StreamReader = struct {
     options: ReaderOptions,
     schema_ref: ?SchemaRef = null,
     dictionary_values: std.AutoHashMap(i64, ArrayRef),
+    /// Set by `initZeroCopy`: `reader` is `std.Io.Reader.fixed(source.data)`, so message
+    /// bodies are retained slices of `source` instead of copies.
+    source: ?array_data.SharedBuffer = null,
 
     const Self = @This();
+
+    /// Zero-copy reader over in-memory IPC bytes (e.g. a file read or mmap'd once).
+    /// `reader` must be `std.Io.Reader.fixed(source.data)` and outlive the StreamReader.
+    /// Batches keep `source` alive through its ref count; `source` must be owning
+    /// (`storage != null`) for column buffers to be zero-copy.
+    pub fn initZeroCopy(allocator: std.mem.Allocator, reader: *std.Io.Reader, source: array_data.SharedBuffer) Self {
+        std.debug.assert(reader.buffer.ptr == source.data.ptr and reader.seek == 0);
+        var self = init(allocator, reader);
+        self.source = source.retain();
+        return self;
+    }
 
     pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader) Self {
         return .{
@@ -161,6 +175,8 @@ pub const StreamReader = struct {
         self.dictionary_values.deinit();
         if (self.schema_ref) |*ref| ref.release();
         self.schema_ref = null;
+        if (self.source) |*src| src.release();
+        self.source = null;
     }
 
     fn clearDictionaryValues(self: *Self) void {
@@ -283,7 +299,7 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
     if (meta_len_opt == null) return null;
     const meta_len = meta_len_opt.?;
 
-    var meta_buf_owned = try OwnedBuffer.init(self.allocator, meta_len);
+    var meta_buf_owned = try OwnedBuffer.initUninit(self.allocator, meta_len);
     errdefer meta_buf_owned.deinit();
     if (meta_len > 0) try self.reader.readSliceAll(meta_buf_owned.data[0..meta_len]);
     var metadata = try meta_buf_owned.toShared(meta_len);
@@ -301,8 +317,12 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
 
     var body_shared: ?array_data.SharedBuffer = null;
     const body_len = std.math.cast(usize, envelope.body_length) orelse return StreamError.InvalidBody;
-    if (body_len > 0) {
-        var body_buf = try OwnedBuffer.init(self.allocator, body_len);
+    if (body_len > 0 and self.source != null) {
+        const start = self.reader.seek;
+        try self.reader.discardAll(body_len);
+        body_shared = self.source.?.slice(start, start + body_len) catch return StreamError.InvalidBody;
+    } else if (body_len > 0) {
+        var body_buf = try OwnedBuffer.initUninit(self.allocator, body_len);
         errdefer body_buf.deinit();
         try self.reader.readSliceAll(body_buf.data[0..body_len]);
         body_shared = try body_buf.toShared(body_len);
@@ -362,6 +382,62 @@ test "stream reader reads schema and batch through an unbuffered reader" {
     var out_batch = maybe_batch.?;
     defer out_batch.deinit();
     try std.testing.expectEqual(@as(usize, 3), out_batch.numRows());
+}
+
+test "stream reader initZeroCopy slices column buffers out of the source" {
+    const allocator = std.testing.allocator;
+
+    const id_type = DataType{ .int32 = {} };
+    const fields = [_]Field{
+        .{ .name = "id", .data_type = &id_type, .nullable = false },
+    };
+    const schema = Schema{ .fields = fields[0..] };
+
+    var id_builder = try @import("../array/primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 3);
+    defer id_builder.deinit();
+    try id_builder.append(1);
+    try id_builder.append(2);
+    try id_builder.append(3);
+    var id_ref = try id_builder.finish();
+    defer id_ref.release();
+
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{id_ref});
+    defer batch.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    try writer.writeSchema(schema);
+    try writer.writeRecordBatch(batch);
+    try writer.writeEnd();
+
+    var owned = try OwnedBuffer.initUninit(allocator, out.written().len);
+    @memcpy(owned.data[0..out.written().len], out.written());
+    var source = try owned.toShared(out.written().len);
+    const source_storage = source.storage;
+    const source_lo = @intFromPtr(source.data.ptr);
+    const source_hi = source_lo + source.data.len;
+
+    var out_batch = blk: {
+        var fixed: std.Io.Reader = .fixed(source.data);
+        var reader = StreamReader.initZeroCopy(allocator, &fixed, source);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        const first = (try reader.nextRecordBatch()).?;
+        try std.testing.expect((try reader.nextRecordBatch()) == null);
+        break :blk first;
+    };
+    defer out_batch.deinit();
+    // Drop our handle: the batch alone must keep the source bytes alive.
+    source.release();
+
+    const values = out_batch.columns[0].data().buffers[1];
+    try std.testing.expect(values.storage == source_storage);
+    const values_lo = @intFromPtr(values.data.ptr);
+    try std.testing.expect(values_lo >= source_lo and values_lo + values.data.len <= source_hi);
+    const view = @import("../array/primitive_array.zig").PrimitiveArray(i32){ .data = out_batch.columns[0].data() };
+    try std.testing.expectEqual(@as(i32, 3), try view.value(2));
 }
 
 fn readMessage(self: *StreamReader) (StreamError || fbs_lite_builder.PackError || std.Io.Reader.Error || error{ EndOfStream, OutOfMemory })!MessageWithBody {
@@ -1177,7 +1253,7 @@ fn buildRecordBatchFromFlatbuf(
     }
     if (variadic_index != record_batch_t.variadicBufferCounts.items.len) return StreamError.InvalidMetadata;
 
-    const batch = try RecordBatch.init(allocator, mut_ref, columns);
+    const batch = try RecordBatch.initPrevalidated(allocator, mut_ref, columns);
     // RecordBatch.init succeeded and owns mut_ref now; cancel the schema errdefer.
     schema_taken = true;
     // Release the temporary column refs — batch has its own retains.

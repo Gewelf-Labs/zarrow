@@ -81,7 +81,8 @@ pub const StructArray = struct {
     pub fn field(self: StructArray, index: usize) AccessorError!ArrayRef {
         const child = (try self.fieldRef(index)).*;
         const child_data = child.data();
-        if (child_data.length == self.data.length and child_data.offset == self.data.offset) {
+        // Same rule as ArrayRef.slice: a child with the parent's length is already row-aligned.
+        if (child_data.length == self.data.length) {
             return child.retain();
         }
         const end = std.math.add(usize, self.data.offset, self.data.length) catch return error.InvalidChildren;
@@ -279,7 +280,7 @@ pub const StructBuilder = struct {
             if (!std.meta.eql(child_data.data_type, self.fields[i].data_type.*)) return BuilderError.InvalidChildType;
         }
 
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
 
         const buffers = try self.allocator.alloc(SharedBuffer, 1);
@@ -1107,10 +1108,10 @@ test "struct builder clear child failure leaves parent unchanged" {
     var struct_ref = try builder.finishFromChildren();
     defer struct_ref.release();
 
-    try std.testing.expect(builder.validity != null);
+    try std.testing.expect(builder.validity == null);
     try std.testing.expectError(ChildBuilderError.ClearFailed, builder.clear());
     try std.testing.expectEqual(@as(usize, 1), builder.len);
-    try std.testing.expect(builder.validity != null);
+    try std.testing.expect(builder.validity == null);
     try std.testing.expectEqual(BuilderState.finished, builder.state);
 }
 
@@ -1217,6 +1218,44 @@ test "struct builder finishFromChildrenClear does not partially recycle on child
 
     try std.testing.expectError(ChildBuilderError.ClearFailed, builder.finishFromChildrenClear());
     try std.testing.expectEqual(@as(usize, 1), builder.len);
-    try std.testing.expect(builder.validity != null);
+    try std.testing.expect(builder.validity == null);
     try std.testing.expectEqual(BuilderState.finished, builder.state);
+}
+
+test "struct slice of a slice keeps child rows aligned" {
+    const allocator = std.testing.allocator;
+    var ib = try @import("primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 10);
+    defer ib.deinit();
+    for (0..10) |i| try ib.append(@intCast(i));
+    var child = try ib.finish();
+    defer child.release();
+    const value_type = DataType{ .int32 = {} };
+    const fields = [_]datatype.Field{.{ .name = "a", .data_type = &value_type, .nullable = true }};
+    var sb = StructBuilder.init(allocator, fields[0..]);
+    defer sb.deinit();
+    for (0..10) |_| try sb.appendValid();
+    var s = try sb.finish(&[_]ArrayRef{child});
+    defer s.release();
+    var s1 = try s.slice(4, 6);
+    defer s1.release();
+    var s2 = try s1.slice(2, 3);
+    defer s2.release();
+    const sa = StructArray{ .data = s2.data() };
+    var f = try sa.field(0);
+    defer f.release();
+    const pa = @import("primitive_array.zig").PrimitiveArray(i32){ .data = f.data() };
+    try std.testing.expectEqual(@as(i32, 6), try pa.value(0));
+}
+
+test "builder drops validity after finishReset" {
+    const allocator = std.testing.allocator;
+    var b = try @import("primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 4);
+    defer b.deinit();
+    try b.appendNull();
+    var a1 = try b.finishReset();
+    a1.release();
+    try b.append(1);
+    var a2 = try b.finishReset();
+    defer a2.release();
+    try std.testing.expectEqual(@as(usize, 0), a2.data().buffers[0].len());
 }

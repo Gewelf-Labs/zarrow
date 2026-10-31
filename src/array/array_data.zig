@@ -572,6 +572,8 @@ pub const ArrayData = struct {
                     else => 0,
                 };
                 if (self.children.len != expected) return error.InvalidChildren;
+                // Struct children must cover the parent window (types are checked by validateFull).
+                if (dt == .struct_) for (self.children) |child| try childCoversRange(child.data(), total_len);
                 if (dt == .fixed_size_list) {
                     const list_size = std.math.cast(usize, dt.fixed_size_list.list_size) orelse return error.InvalidChildren;
                     const required = std.math.mul(usize, total_len, list_size) catch return error.InvalidChildren;

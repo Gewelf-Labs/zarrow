@@ -143,7 +143,7 @@ pub const BooleanBuilder = struct {
     /// Finalize builder state and return an immutable array reference.
     pub fn finish(self: *Self) !ArrayRef {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.values.toShared(bitmap.byteLength(self.len));
 

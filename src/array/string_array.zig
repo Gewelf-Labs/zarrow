@@ -182,7 +182,7 @@ pub const StringBuilder = struct {
     /// Finalize builder state and return an immutable array reference.
     pub fn finish(self: *StringBuilder) !ArrayRef {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(i32));
         self.buffers[2] = try self.data.toShared(self.data_len);
@@ -323,7 +323,7 @@ pub const LargeStringBuilder = struct {
     /// Finalize builder state and return an immutable array reference.
     pub fn finish(self: *LargeStringBuilder) !ArrayRef {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(i64));
         self.buffers[2] = try self.data.toShared(self.data_len);

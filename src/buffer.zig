@@ -159,6 +159,15 @@ pub const OwnedBuffer = struct {
         return .{ .data = data, .allocator = allocator };
     }
 
+    /// Like `init`, but leaves `[0, capacity)` undefined; only the alignment padding is zeroed.
+    /// For callers that immediately overwrite the bytes (e.g. `readSliceAll`).
+    pub fn initUninit(allocator: std.mem.Allocator, capacity: usize) !Self {
+        const actualCapacity = alignedSize(if (capacity == 0) ALIGNMENT else capacity);
+        const data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, actualCapacity);
+        @memset(data[capacity..], 0);
+        return .{ .data = data, .allocator = allocator };
+    }
+
     /// Release resources owned by this instance.
     pub fn deinit(self: *Self) void {
         if (self.data.len == 0) return;
@@ -211,16 +220,11 @@ pub const OwnedBuffer = struct {
     /// - `newSize` is rounded up to the next `ALIGNMENT` boundary before
     ///   allocating, so `self.data.len` may exceed `newSize` after the call.
     pub fn resize(self: *Self, newSize: usize) !void {
-        const actualSize = alignedSize(newSize);
-        const newData = try self.allocator.alignedAlloc(u8, ALIGNMENT_VALUE, actualSize);
-        const copySize = @min(self.data.len, actualSize);
-        @memcpy(newData[0..copySize], self.data[0..copySize]);
-        if (actualSize > copySize) @memset(newData[copySize..], 0);
-
-        if (self.data.len > 0) {
-            self.allocator.free(self.data);
-        }
-        self.data = newData;
+        const old_len = self.data.len;
+        // Grow geometrically so repeated appends are amortized O(1) for every builder.
+        const actualSize = if (newSize > old_len) @max(alignedSize(newSize), old_len * 2) else alignedSize(newSize);
+        self.data = try self.allocator.realloc(self.data, actualSize);
+        if (actualSize > old_len) @memset(self.data[old_len..], 0);
     }
 };
 

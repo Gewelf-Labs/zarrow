@@ -160,7 +160,7 @@ pub const FixedSizeBinaryBuilder = struct {
     /// Finalize builder state and return an immutable array reference.
     pub fn finish(self: *FixedSizeBinaryBuilder) !ArrayRef {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.data.toShared(self.data_len);
 
@@ -328,7 +328,7 @@ pub const FixedSizeListBuilder = struct {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
         if (values.data().length != self.values_len) return BuilderError.InvalidChildLength;
 
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
 
         const buffers = try self.allocator.alloc(SharedBuffer, 1);

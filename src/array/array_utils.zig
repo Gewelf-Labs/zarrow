@@ -47,6 +47,15 @@ pub fn ensureValidityForNull(
     null_count.* += 1;
 }
 
+/// Hand the validity bitmap to a SharedBuffer and drop it from the builder, so the next
+/// batch only allocates validity if it actually appends a null.
+pub fn takeValidity(validity: *?OwnedBuffer, len: usize) !buffer.SharedBuffer {
+    const buf = if (validity.*) |*b| b else return buffer.SharedBuffer.empty;
+    const shared = try buf.toShared(bitmap.byteLength(len));
+    validity.* = null;
+    return shared;
+}
+
 /// Mark an existing appended slot as valid if a validity bitmap has been allocated.
 pub fn setValidBit(validity: *?OwnedBuffer, index: usize) !void {
     if (validity.* == null) return;

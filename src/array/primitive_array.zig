@@ -121,6 +121,24 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
             self.len = next_len;
         }
 
+        /// Ensure capacity for `additional` more values without further reallocation.
+        pub fn reserve(self: *Self, additional: usize) !void {
+            try self.ensureValuesCapacity(self.len + additional);
+            if (self.validity) |*valid| try array_utils.ensureBitmapCapacity(valid, self.len + additional);
+        }
+
+        /// Append non-null values in bulk (one memcpy when no validity bitmap exists yet).
+        pub fn appendSlice(self: *Self, items: []const T) !void {
+            if (self.state == .finished) return Error.AlreadyFinished;
+            try self.reserve(items.len);
+            const slice = std.mem.bytesAsSlice(T, self.values.data);
+            @memcpy(slice[self.len..][0..items.len], items);
+            if (self.validity) |*valid| {
+                for (self.len..self.len + items.len) |i| bitmap.setBit(valid.data, i);
+            }
+            self.len += items.len;
+        }
+
         /// Append a null entry into the builder.
         pub fn appendNull(self: *Self) !void {
             if (self.state == .finished) return Error.AlreadyFinished;
@@ -133,7 +151,7 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
         /// Finalize builder state and return an immutable array reference.
         pub fn finish(self: *Self) !ArrayRef {
             if (self.state == .finished) return Error.AlreadyFinished;
-            const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+            const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
             self.buffers[0] = validity_buf;
             self.buffers[1] = try self.values.toShared(self.len * @sizeOf(T));
 
@@ -176,6 +194,24 @@ test "primitive builder appends values and nulls" {
     try std.testing.expect(built.isNull(1));
     try std.testing.expectEqual(@as(i32, 30), try built.value(2));
     try std.testing.expectError(error.IndexOutOfBounds, built.value(3));
+}
+
+test "primitive builder appendSlice matches per-element append" {
+    var builder = try PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(std.testing.allocator, 0);
+    defer builder.deinit();
+
+    try builder.appendSlice(&.{ 1, 2 });
+    try builder.appendNull();
+    try builder.appendSlice(&.{ 4, 5, 6 });
+
+    var array_handle = try builder.finish();
+    defer array_handle.release();
+    const built = PrimitiveArray(i32){ .data = array_handle.data() };
+    try std.testing.expectEqual(@as(usize, 6), built.len());
+    try std.testing.expect(built.isNull(2));
+    try std.testing.expect(!built.isNull(3) and !built.isNull(5));
+    try std.testing.expectEqual(@as(i32, 6), try built.value(5));
+    try std.testing.expectEqual(@as(usize, 1), array_handle.data().null_count.?);
 }
 
 test "primitive array values returns error for missing value buffer" {

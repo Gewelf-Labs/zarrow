@@ -341,7 +341,7 @@ pub const MapBuilder = struct {
         if (!fieldMatches(self.item_field, st.struct_.fields[1])) return BuilderError.InvalidEntriesSchema;
         const map_type = DataType{ .map = .{ .key_field = self.key_field, .item_field = self.item_field, .keys_sorted = self.keys_sorted } };
 
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(i32));
 

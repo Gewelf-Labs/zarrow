@@ -301,7 +301,7 @@ pub const FileReader = struct {
 
     fn readSharedAt(self: *Self, offset: usize, len: usize) FileError!array_data.SharedBuffer {
         if (len == 0) return array_data.SharedBuffer.empty;
-        var owned = try buffer.OwnedBuffer.init(self.allocator, len);
+        var owned = try buffer.OwnedBuffer.initUninit(self.allocator, len);
         errdefer owned.deinit();
         try self.readAtNoEof(offset, owned.data[0..len]);
         return try owned.toShared(len);

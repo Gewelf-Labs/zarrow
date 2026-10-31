@@ -24,16 +24,45 @@ pub fn concatArrayRefs(
         if (!datatype.dataTypeEql(part.data().data_type, data_type)) return error.InvalidInput;
     }
 
-    var acc = try parts[0].slice(0, 0);
-    errdefer acc.release();
-
-    for (parts) |part| {
-        const merged = try concatTwoArrayRefs(allocator, acc, part);
-        acc.release();
-        acc = merged;
+    if (parts.len == 1) {
+        // Single part still returns a fresh, compacted copy (offset 0), as before.
+        var empty = try parts[0].slice(0, 0);
+        defer empty.release();
+        return concatTwoArrayRefs(allocator, empty, parts[0]);
     }
 
-    return acc;
+    // Balanced pairwise merge: O(total_len * log(parts.len)) instead of the
+    // O(total_len * parts.len) left fold (take/filter concat one piece per row).
+    // ponytail: an N-ary concat (allocate output once) would be O(total_len).
+    var level = try mergePairs(allocator, parts);
+    while (level.items.len > 1) {
+        const next = mergePairs(allocator, level.items) catch |err| {
+            releaseAll(allocator, &level);
+            return err;
+        };
+        releaseAll(allocator, &level);
+        level = next;
+    }
+    const out = level.items[0];
+    level.deinit(allocator);
+    return out;
+}
+
+/// Concatenates `refs` two at a time; an odd trailing ref is retained as-is.
+fn mergePairs(allocator: std.mem.Allocator, refs: []const ArrayRef) Error!std.ArrayList(ArrayRef) {
+    var out = try std.ArrayList(ArrayRef).initCapacity(allocator, (refs.len + 1) / 2);
+    errdefer releaseAll(allocator, &out);
+    var i: usize = 0;
+    while (i + 1 < refs.len) : (i += 2) {
+        out.appendAssumeCapacity(try concatTwoArrayRefs(allocator, refs[i], refs[i + 1]));
+    }
+    if (i < refs.len) out.appendAssumeCapacity(refs[i].retain());
+    return out;
+}
+
+fn releaseAll(allocator: std.mem.Allocator, list: *std.ArrayList(ArrayRef)) void {
+    for (list.items) |*ref| ref.release();
+    list.deinit(allocator);
 }
 
 fn concatTwoArrayRefs(
@@ -754,13 +783,9 @@ fn concatVariableBinaryArrayI64(
 fn nullCountForArray(data: *const ArrayData) ConcatArrayError!usize {
     if (data.null_count) |count| return count;
     if (data.validity()) |v| {
-        var nulls: usize = 0;
-        var i: usize = 0;
-        while (i < data.length) : (i += 1) {
-            const is_valid = v.isValid(data.offset + i) catch return error.InvalidInput;
-            if (!is_valid) nulls += 1;
-        }
-        return nulls;
+        const end = data.offset + data.length;
+        if (bitmap.byteLength(end) > v.data.len) return error.InvalidInput;
+        return bitmap.countUnsetBitsInRange(v.data, data.offset, end);
     }
     return 0;
 }
@@ -1392,4 +1417,29 @@ test "concatArrayRefs rejects empty input" {
         error.InvalidInput,
         concatArrayRefs(std.testing.allocator, .{ .int32 = {} }, &[_]ArrayRef{}),
     );
+}
+
+test "concatArrayRefs merges many sliced parts in order" {
+    const allocator = std.testing.allocator;
+    var builder = try array_mod.Int32Builder.init(allocator, 16);
+    defer builder.deinit();
+    for (0..16) |i| {
+        if (i % 3 == 0) try builder.appendNull() else try builder.append(@intCast(i));
+    }
+    var full = try builder.finish();
+    defer full.release();
+
+    // 7 parts (odd count exercises the retained trailing ref), all sliced from `full`.
+    var parts: [7]ArrayRef = undefined;
+    for (&parts, 0..) |*part, i| part.* = try full.slice(i * 2, 2);
+    defer for (&parts) |*part| part.release();
+
+    var out = try concatArrayRefs(allocator, DataType{ .int32 = {} }, parts[0..]);
+    defer out.release();
+    const view = array_mod.Int32Array{ .data = out.data() };
+    try std.testing.expectEqual(@as(usize, 14), view.len());
+    for (0..14) |i| {
+        try std.testing.expectEqual(i % 3 == 0, view.isNull(i));
+        if (i % 3 != 0) try std.testing.expectEqual(@as(i32, @intCast(i)), try view.value(i));
+    }
 }

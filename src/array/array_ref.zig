@@ -106,7 +106,9 @@ pub const ArrayRef = struct {
                 const total_offset = self.node.data.offset + offset;
                 var i: usize = 0;
                 while (i < sliced.children.len) : (i += 1) {
-                    children[i] = try sliced.children[i].slice(total_offset, length);
+                    // Children already row-aligned by a previous slice use the relative offset.
+                    const child_offset = if (sliced.children[i].data().length == self.node.data.length) offset else total_offset;
+                    children[i] = try sliced.children[i].slice(child_offset, length);
                     child_count += 1;
                 }
             },
