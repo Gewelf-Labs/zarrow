@@ -309,6 +309,13 @@ pub const ArrayData = struct {
     }
 
     // Run ends must be strictly increasing and cover the logical length.
+    /// Run ends `[start, end)` of the run-ends child buffer, which must hold them.
+    fn runEndsWindow(comptime T: type, buf: SharedBuffer, start: usize, end: usize) ValidationError![]const T {
+        const all = buf.typedSlice(T) catch return error.InvalidOffsetBuffer;
+        if (end > all.len) return error.BufferTooSmall;
+        return all[start..end];
+    }
+
     fn validateRunEndsSigned(comptime T: type, run_ends: []const T, total_len: usize) ValidationError!void {
         if (total_len == 0) {
             if (run_ends.len != 0) return error.InvalidOffsets;
@@ -377,10 +384,8 @@ pub const ArrayData = struct {
             const child_index = unionTypeIdToChildIndex(uni, type_ids[i]) orelse return error.InvalidOffsets;
             const off = offsets[i];
             if (off < 0) return error.InvalidOffsets;
-            const child_data = children[child_index].data();
-            const child_total = std.math.add(usize, child_data.length, child_data.offset) catch return error.InvalidOffsets;
             const off_usize = std.math.cast(usize, off) orelse return error.InvalidOffsets;
-            if (off_usize >= child_total) return error.InvalidOffsets;
+            if (off_usize >= children[child_index].data().length) return error.InvalidOffsets;
         }
     }
 
@@ -536,8 +541,7 @@ pub const ArrayData = struct {
                 if (self.buffers[2].len() % offset_width != 0) return error.InvalidOffsetBuffer;
 
                 // Views are validated against the child logical length.
-                const child_data = self.children[0].data();
-                const child_len = std.math.add(usize, child_data.length, child_data.offset) catch return error.InvalidChildren;
+                const child_len = self.children[0].data().length;
                 if (offset_width == 4) {
                     const offsets = self.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer;
                     const sizes = self.buffers[2].typedSlice(i32) catch return error.InvalidOffsetBuffer;
@@ -560,10 +564,9 @@ pub const ArrayData = struct {
                     return error.InvalidBufferCount;
                 }
 
-                const data_len = if (is_list) blk: {
-                    const child_data = self.children[0].data();
-                    break :blk std.math.add(usize, child_data.length, child_data.offset) catch return error.InvalidChildren;
-                } else if (self.buffers.len >= 3) self.buffers[2].len() else 0;
+                const data_len = if (is_list)
+                    self.children[0].data().length
+                else if (self.buffers.len >= 3) self.buffers[2].len() else 0;
 
                 if (offset_width == 4) {
                     const offsets = self.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer;
@@ -586,9 +589,7 @@ pub const ArrayData = struct {
                 if (dt == .fixed_size_list) {
                     const list_size = std.math.cast(usize, dt.fixed_size_list.list_size) orelse return error.InvalidChildren;
                     const required = std.math.mul(usize, total_len, list_size) catch return error.InvalidChildren;
-                    const child_data = self.children[0].data();
-                    const child_total = std.math.add(usize, child_data.length, child_data.offset) catch return error.InvalidChildren;
-                    if (child_total < required) return error.InvalidChildren;
+                    if (self.children[0].data().length < required) return error.InvalidChildren;
                 }
             },
             .dictionary => |dict| {
@@ -648,17 +649,17 @@ pub const ArrayData = struct {
 
                 switch (byte_width) {
                     2 => if (dt.run_end_encoded.run_end_type.signed)
-                        try validateRunEndsSigned(i16, (run_ends.buffers[1].typedSlice(i16) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len)
+                        try validateRunEndsSigned(i16, try runEndsWindow(i16, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len)
                     else
-                        try validateRunEndsUnsigned(u16, (run_ends.buffers[1].typedSlice(u16) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len),
+                        try validateRunEndsUnsigned(u16, try runEndsWindow(u16, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len),
                     4 => if (dt.run_end_encoded.run_end_type.signed)
-                        try validateRunEndsSigned(i32, (run_ends.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len)
+                        try validateRunEndsSigned(i32, try runEndsWindow(i32, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len)
                     else
-                        try validateRunEndsUnsigned(u32, (run_ends.buffers[1].typedSlice(u32) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len),
+                        try validateRunEndsUnsigned(u32, try runEndsWindow(u32, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len),
                     8 => if (dt.run_end_encoded.run_end_type.signed)
-                        try validateRunEndsSigned(i64, (run_ends.buffers[1].typedSlice(i64) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len)
+                        try validateRunEndsSigned(i64, try runEndsWindow(i64, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len)
                     else
-                        try validateRunEndsUnsigned(u64, (run_ends.buffers[1].typedSlice(u64) catch return error.InvalidOffsetBuffer)[run_ends_slice_start..run_ends_slice_end], total_len),
+                        try validateRunEndsUnsigned(u64, try runEndsWindow(u64, run_ends.buffers[1], run_ends_slice_start, run_ends_slice_end), total_len),
                     else => return error.InvalidOffsetBuffer,
                 }
             },
@@ -1455,6 +1456,57 @@ test "array data validateLayout accepts run_end_encoded" {
     };
 
     try data.validateLayout();
+}
+
+test "array data validateLayout bounds run ends and list offsets by the child's own data" {
+    // Fuzz findings: the run-ends window was sliced without checking the buffer (index out of
+    // bounds inside validateLayout), and list offsets were checked against child.offset +
+    // child.length although readers and kernels index the child's logical elements.
+    const run_end_bytes: [@sizeOf(i32)]u8 align(buffer.ALIGNMENT) = @bitCast(@as(i32, 2));
+    const run_ends_child = ArrayData{
+        .data_type = .{ .int32 = {} },
+        .length = 2, // two run ends claimed, one stored
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(run_end_bytes[0..]) },
+    };
+    const value_type = DataType{ .int32 = {} };
+    const values_bytes: [2 * @sizeOf(i32)]u8 align(buffer.ALIGNMENT) = @splat(0);
+    const values_child = ArrayData{
+        .data_type = value_type,
+        .length = 2,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(values_bytes[0..]) },
+    };
+    var ree_refs = try ReeTestRefs.init(std.testing.allocator, run_ends_child, values_child);
+    defer ree_refs.deinit();
+    const ree = ArrayData{
+        .data_type = .{ .run_end_encoded = .{ .run_end_type = .{ .bit_width = 32, .signed = true }, .value_type = &value_type } },
+        .length = 2,
+        .buffers = &[_]SharedBuffer{},
+        .children = ree_refs.children[0..],
+    };
+    try std.testing.expectError(error.BufferTooSmall, ree.validateLayout());
+
+    // A child sliced to 2 elements (offset 2 into 4 stored values); offsets [0, 3] overrun it.
+    const stored: [4 * @sizeOf(i32)]u8 align(buffer.ALIGNMENT) = @splat(0);
+    var child = try ArrayRef.fromBorrowed(std.testing.allocator, .{
+        .data_type = value_type,
+        .length = 2,
+        .offset = 2,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(stored[0..]) },
+    });
+    defer child.release();
+    const offsets: [2 * @sizeOf(i32)]u8 align(buffer.ALIGNMENT) = @bitCast([2]i32{ 0, 3 });
+    const value_field = datatype.Field{ .name = "item", .data_type = &value_type };
+    const list = ArrayData{
+        .data_type = .{ .list = .{ .value_field = value_field } },
+        .length = 1,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(offsets[0..]) },
+        .children = &[_]ArrayRef{child},
+    };
+    try std.testing.expectError(error.InvalidOffsets, list.validateLayout());
 }
 
 test "array data validateLayout rejects run_end_encoded nonmonotonic" {

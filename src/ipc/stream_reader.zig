@@ -322,6 +322,23 @@ fn reuseOrAlloc(allocator: std.mem.Allocator, spare: ?*?array_data.SharedBuffer,
     return OwnedBuffer.initUninit(allocator, len);
 }
 
+/// Reads `len` bytes whose count came from the stream. Memory grows with the bytes that actually
+/// arrive (doubling from what is already buffered, at least 1 MiB), so a lying length prefix on a
+/// short stream fails with EndOfStream after allocating about twice the real input, not `len`.
+fn readOwned(allocator: std.mem.Allocator, reader: *std.Io.Reader, spare: ?*?array_data.SharedBuffer, len: usize) (std.Io.Reader.Error || error{OutOfMemory})!OwnedBuffer {
+    var have = @min(len, @max(reader.bufferedLen(), 1 << 20));
+    var buf = try reuseOrAlloc(allocator, spare, have);
+    errdefer buf.deinit();
+    try reader.readSliceAll(buf.data[0..have]);
+    while (have < len) {
+        const next = @min(len, have * 2);
+        try buf.resize(next);
+        try reader.readSliceAll(buf.data[have..next]);
+        have = next;
+    }
+    return buf;
+}
+
 /// Keeps one extra handle on `buf` in `spare` (replacing the previous one) for `reuseOrAlloc`.
 fn keepSpare(spare: ?*?array_data.SharedBuffer, buf: array_data.SharedBuffer) void {
     const slot = spare orelse return;
@@ -334,9 +351,8 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
     if (meta_len_opt == null) return null;
     const meta_len = meta_len_opt.?;
 
-    var meta_buf_owned = try OwnedBuffer.initUninit(self.allocator, meta_len);
+    var meta_buf_owned = try readOwned(self.allocator, self.reader, null, meta_len);
     errdefer meta_buf_owned.deinit();
-    if (meta_len > 0) try self.reader.readSliceAll(meta_buf_owned.data[0..meta_len]);
     var metadata = try meta_buf_owned.toShared(meta_len);
     errdefer metadata.release();
     try format.skipPadding(self.reader, format.padLen(meta_len));
@@ -351,6 +367,7 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
     if (!isSupportedMetadataVersion(msg_t.version)) return StreamError.InvalidMetadata;
 
     var body_shared: ?array_data.SharedBuffer = null;
+    errdefer if (body_shared) |*b| b.release();
     const body_len = std.math.cast(usize, envelope.body_length) orelse return StreamError.InvalidBody;
     // Zero-copy only when the reader really is a fixed reader over `source` (release-safe check).
     if (body_len > 0 and self.source != null and self.reader.buffer.ptr == self.source.?.data.ptr) {
@@ -358,9 +375,8 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
         try self.reader.discardAll(body_len);
         body_shared = self.source.?.slice(start, start + body_len) catch return StreamError.InvalidBody;
     } else if (body_len > 0) {
-        var body_buf = try reuseOrAlloc(self.allocator, &self.spare_body, body_len);
+        var body_buf = try readOwned(self.allocator, self.reader, &self.spare_body, body_len);
         errdefer body_buf.deinit();
-        try self.reader.readSliceAll(body_buf.data[0..body_len]);
         body_shared = try body_buf.toShared(body_len);
         keepSpare(&self.spare_body, body_shared.?);
     }
@@ -539,6 +555,41 @@ fn expectZeroCopyMatchesCopy(allocator: std.mem.Allocator, bytes: []const u8, ex
     if (expect_shared) try std.testing.expect(shared_seen);
 }
 
+/// Every single-byte corruption of a valid stream must decode or return an error: no panic and
+/// no leak (std.testing.allocator). Guards the fuzz findings fixed in fbs_lite/verify.zig
+/// (unchecked flatbuffer offsets/enums) and readArrayFromMeta (children leaked on error).
+fn expectCorruptionsFailCleanly(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    const copy = try allocator.dupe(u8, bytes);
+    defer allocator.free(copy);
+    for (copy) |*byte| {
+        const saved = byte.*;
+        defer byte.* = saved;
+        for ([_]u8{ 0x00, 0x01, 0x10, 0x7f, 0x80, 0xff }) |v| {
+            byte.* = v;
+            var fixed: std.Io.Reader = .fixed(copy);
+            var reader = StreamReader.init(allocator, &fixed);
+            defer reader.deinit();
+            _ = reader.readSchema() catch continue;
+            while (reader.nextRecordBatch() catch null) |b| {
+                var batch = b;
+                batch.deinit();
+            }
+        }
+    }
+}
+
+test "stream reader does not allocate a lying length prefix up front" {
+    // Fuzz finding: 2 GiB metadata length on a 16-byte input was allocated before reading.
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xf0, 0xff, 0xff, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const backing = try std.testing.allocator.alloc(u8, 4 << 20);
+    defer std.testing.allocator.free(backing);
+    var fba = std.heap.FixedBufferAllocator.init(backing);
+    var fixed: std.Io.Reader = .fixed(&bytes);
+    var reader = StreamReader.init(fba.allocator(), &fixed);
+    defer reader.deinit();
+    try std.testing.expectError(error.EndOfStream, reader.readSchema());
+}
+
 test "stream reader zero-copy read equals copying read on pyarrow fixtures" {
     const allocator = std.testing.allocator;
     try expectZeroCopyMatchesCopy(allocator, @embedFile("testdata/pyarrow_simple_stream.arrow"), true);
@@ -636,6 +687,7 @@ test "stream reader zero-copy read equals copying read for nested, dictionary an
         try writer.writeRecordBatch(batch);
         try writer.writeEnd();
         try expectZeroCopyMatchesCopy(allocator, out.written(), true);
+        try expectCorruptionsFailCleanly(allocator, out.written());
     }
 
     // Compressed bodies are decompressed into fresh buffers on both paths; values must still match.
@@ -968,12 +1020,17 @@ pub fn buildRecordBatchFromMessageMetadata(
     metadata: []const u8,
     body: array_data.SharedBuffer,
 ) (StreamError || array_data.ValidationError || record_batch.RecordBatchError || fbs_lite_builder.PackError || error{OutOfMemory})!RecordBatch {
+    // Owns `schema_ref` (callers pass a retained ref); buildRecordBatchFromFlatbuf takes it over.
+    var ref = schema_ref;
+    var handed_off = false;
+    errdefer if (!handed_off) ref.release();
     var msg_t = try unpackMessageFromMetadata(allocator, metadata);
     defer msg_t.deinit(allocator);
     if (msg_t.header != .RecordBatch) return StreamError.InvalidMessage;
+    handed_off = true;
     return try buildRecordBatchFromFlatbuf(
         allocator,
-        schema_ref,
+        ref,
         msg_t.header.RecordBatch.?,
         body,
         dictionary_values,
@@ -1466,16 +1523,19 @@ fn buildRecordBatchFromFlatbuf(
         return StreamError.InvalidMetadata;
     }
     if (variadic_index != record_batch_t.variadicBufferCounts.items.len) return StreamError.InvalidMetadata;
+    // Checked before the batch exists: an error return after the manual column release below
+    // would run the columns errdefer again (double release + double free).
+    const expected_rows = std.math.cast(usize, record_batch_t.length) orelse return StreamError.InvalidMetadata;
+    const num_rows = if (col_count == 0) 0 else columns[0].data().length;
+    if (num_rows != expected_rows) return StreamError.InvalidMetadata;
 
     const batch = try RecordBatch.initPrevalidated(allocator, mut_ref, columns);
     // RecordBatch.initPrevalidated succeeded and owns mut_ref now; cancel the schema errdefer.
     schema_taken = true;
-    // Release the temporary column refs — batch has its own retains.
+    // Release the temporary column refs — batch has its own retains. No error return after this.
     var i: usize = 0;
     while (i < col_count) : (i += 1) columns[i].release();
     allocator.free(columns);
-    const expected_rows = std.math.cast(usize, record_batch_t.length) orelse return StreamError.InvalidMetadata;
-    if (batch.numRows() != expected_rows) return StreamError.InvalidMetadata;
     return batch;
 }
 
@@ -1500,6 +1560,8 @@ fn readArrayFromMeta(
 
     const layout_dt = storageDataType(dt);
     const buffer_count = try bufferCountForType(layout_dt, variadic_buffer_counts, variadic_index, metadata_version);
+    // Checked before allocating: a view type's count comes from the untrusted variadicBufferCounts.
+    if (buffer_count > buffers_meta.len -| buffer_index.*) return StreamError.InvalidMetadata;
     var buffers = try allocator.alloc(array_data.SharedBuffer, buffer_count);
     var buf_count: usize = 0;
     errdefer {
@@ -1567,25 +1629,24 @@ fn readArrayFromMeta(
     }
 
     var children: []ArrayRef = &.{};
+    var filled: usize = 0;
+    errdefer {
+        for (children[0..filled]) |*child| child.release();
+        if (children.len > 0) allocator.free(children);
+    }
     var dictionary_ref: ?ArrayRef = null;
     errdefer if (dictionary_ref) |*dict| dict.release();
     if (layout_dt == .list or layout_dt == .large_list or layout_dt == .fixed_size_list or layout_dt == .map or layout_dt == .list_view or layout_dt == .large_list_view) {
-        children = try allocator.alloc(ArrayRef, 1);
-        errdefer allocator.free(children);
         const child_dt = if (layout_dt == .map)
             (layout_dt.map.entries_type orelse return StreamError.InvalidMetadata).*
         else
             childValueType(layout_dt);
+        children = try allocator.alloc(ArrayRef, 1);
         children[0] = try readArrayFromMeta(allocator, child_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+        filled = 1;
     } else if (layout_dt == .struct_) {
         const field_count = layout_dt.struct_.fields.len;
         children = try allocator.alloc(ArrayRef, field_count);
-        var filled: usize = 0;
-        errdefer {
-            var j: usize = 0;
-            while (j < filled) : (j += 1) children[j].release();
-            allocator.free(children);
-        }
         var idx: usize = 0;
         while (idx < field_count) : (idx += 1) {
             children[idx] = try readArrayFromMeta(allocator, layout_dt.struct_.fields[idx].data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
@@ -1594,26 +1655,13 @@ fn readArrayFromMeta(
     } else if (layout_dt == .sparse_union or layout_dt == .dense_union) {
         const union_fields = if (layout_dt == .sparse_union) layout_dt.sparse_union.fields else layout_dt.dense_union.fields;
         children = try allocator.alloc(ArrayRef, union_fields.len);
-        var filled: usize = 0;
-        errdefer {
-            var j: usize = 0;
-            while (j < filled) : (j += 1) children[j].release();
-            allocator.free(children);
-        }
         for (union_fields, 0..) |field, idx| {
             children[idx] = try readArrayFromMeta(allocator, field.data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
             filled += 1;
         }
     } else if (layout_dt == .run_end_encoded) {
-        children = try allocator.alloc(ArrayRef, 2);
-        var filled: usize = 0;
-        errdefer {
-            var j: usize = 0;
-            while (j < filled) : (j += 1) children[j].release();
-            allocator.free(children);
-        }
-
         const run_end_dt = try dataTypeFromIntType(layout_dt.run_end_encoded.run_end_type);
+        children = try allocator.alloc(ArrayRef, 2);
         children[0] = try readArrayFromMeta(allocator, run_end_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
         filled += 1;
         children[1] = try readArrayFromMeta(allocator, layout_dt.run_end_encoded.value_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
@@ -1836,7 +1884,7 @@ fn decodeRecordBatchBody(
     errdefer allocator.free(decoded_meta);
 
     // Pass 1: lay out the decoded body from the 8-byte uncompressed-length prefixes.
-    const cursor = try layoutDecodedBody(record_batch_t.buffers.items, body, decoded_meta);
+    const cursor = try layoutDecodedBody(record_batch_t.buffers.items, body, decoded_meta, compression.codec);
 
     // Pass 2: decompress each buffer straight into its slot (no staging buffers or copies).
     var owned = try reuseOrAlloc(allocator, spare, cursor);
@@ -1872,14 +1920,27 @@ fn decodeRecordBatchBody(
 /// ponytail: fixed cap; make it a StreamReader option if someone needs bigger batches.
 pub const max_decompressed_body_bytes: usize = 1 << 31;
 
+/// Most output bytes one compressed byte can decode to: an LZ4 frame spends at least one byte
+/// per 255 output bytes, a zstd block at least 4 bytes per 128 KiB (an RLE block). A declared
+/// size above `payload.len * ratio` cannot be honest, so it is rejected before allocating.
+fn maxDecodeRatio(codec: fbs.CompressionType) usize {
+    return switch (codec) {
+        .LZ4_FRAME => 255,
+        .ZSTD => 32 << 10,
+    };
+}
+
 /// Fills `decoded_meta` with the decoded offset/length of every buffer and returns the total
-/// padded body size, rejecting declared sizes that overflow or exceed the cap.
-fn layoutDecodedBody(buffers: []const fbs.BufferT, body: array_data.SharedBuffer, decoded_meta: []fbs.BufferT) StreamError!usize {
+/// padded body size, rejecting declared sizes that overflow, exceed the cap or exceed what the
+/// codec can produce from the payload.
+fn layoutDecodedBody(buffers: []const fbs.BufferT, body: array_data.SharedBuffer, decoded_meta: []fbs.BufferT, codec: fbs.CompressionType) StreamError!usize {
     var cursor: usize = 0;
     for (buffers, decoded_meta) |meta, *out| {
         const chunk = try compressedChunk(body, meta);
         const len = if (chunk.len == 0) 0 else try decodedChunkLen(chunk);
         if (len > max_decompressed_body_bytes) return StreamError.InvalidBody;
+        const stored = chunk.len > 0 and std.mem.readInt(i64, chunk[0..8], .little) == -1;
+        if (!stored and len > (chunk.len -| 8) *| maxDecodeRatio(codec)) return StreamError.InvalidBody;
         out.* = .{ .offset = @intCast(cursor), .length = @intCast(len) };
         cursor += format.paddedLen(len);
         if (cursor > max_decompressed_body_bytes) return StreamError.InvalidBody;
@@ -1896,16 +1957,23 @@ test "layoutDecodedBody rejects hostile uncompressed-length prefixes" {
     @memset(bytes[24..32], 0);
     const metas = [_]fbs.BufferT{ .{ .offset = 0, .length = 16 }, .{ .offset = 16, .length = 16 } };
     var decoded: [2]fbs.BufferT = undefined;
-    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..]));
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..], .ZSTD));
 
     // A single declared size just over the cap is rejected too.
     std.mem.writeInt(i64, bytes[0..8], @intCast(max_decompressed_body_bytes + 1), .little);
-    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..1], array_data.SharedBuffer.fromSlice(bytes[0..16]), decoded[0..1]));
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..1], array_data.SharedBuffer.fromSlice(bytes[0..16]), decoded[0..1], .ZSTD));
+
+    // Fuzz finding: a few payload bytes declaring hundreds of MiB were allocated before
+    // decompressing. 8 payload bytes decode to at most 8 * 255 (LZ4) or 8 * 32 KiB (zstd).
+    std.mem.writeInt(i64, bytes[0..8], 8 * 255 + 1, .little);
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..1], array_data.SharedBuffer.fromSlice(bytes[0..16]), decoded[0..1], .LZ4_FRAME));
+    std.mem.writeInt(i64, bytes[0..8], 8 * (32 << 10) + 1, .little);
+    try std.testing.expectError(StreamError.InvalidBody, layoutDecodedBody(metas[0..1], array_data.SharedBuffer.fromSlice(bytes[0..16]), decoded[0..1], .ZSTD));
 
     // Sane sizes lay out with 8-byte padding.
     std.mem.writeInt(i64, bytes[0..8], 5, .little);
     std.mem.writeInt(i64, bytes[16..24], 3, .little);
-    try std.testing.expectEqual(@as(usize, 16), try layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..]));
+    try std.testing.expectEqual(@as(usize, 16), try layoutDecodedBody(metas[0..], array_data.SharedBuffer.fromSlice(bytes[0..]), decoded[0..], .LZ4_FRAME));
     try std.testing.expectEqual(@as(i64, 8), decoded[1].offset);
     try std.testing.expectEqual(@as(i64, 3), decoded[1].length);
 }
@@ -1952,11 +2020,13 @@ fn decompressLz4FrameInto(payload: []const u8, out: []u8) StreamError!void {
     while (true) {
         var src_size = payload.len - src_pos;
         var dst_size = expected_len - dst_pos;
+        // Never NULL, even for size 0: LZ4F_decompress memcpy()s from srcPtr with a zero length
+        // on truncated frames, and memcpy from NULL is undefined (UBSan aborts on Linux).
         const rc = syms.*.decompress(
             dctx,
-            if (dst_size == 0) null else @ptrCast(out.ptr + dst_pos),
+            @ptrCast(out.ptr + dst_pos),
             &dst_size,
-            if (src_size == 0) null else @ptrCast(payload.ptr + src_pos),
+            @ptrCast(payload.ptr + src_pos),
             &src_size,
             null,
         );
