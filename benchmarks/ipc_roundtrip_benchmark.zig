@@ -86,11 +86,14 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var read_ns: u64 = 0;
     var zero_copy_read_ns: u64 = 0;
 
+    // One pre-sized sink reused across iterations: times zarrow, not Allocating growth or the
+    // first-touch page faults of a fresh 5 MB sink every iteration.
+    var sink: std.Io.Writer.Allocating = try .initCapacity(allocator, cfg.rows * batches_per_iter * 32 + 4096);
+    defer sink.deinit();
+
     var iter: usize = 0;
     while (iter < cfg.iterations) : (iter += 1) {
-        // Pre-sized so the timing measures zarrow, not std.Io.Writer.Allocating growth.
-        var sink: std.Io.Writer.Allocating = try .initCapacity(allocator, cfg.rows * batches_per_iter * 32 + 4096);
-        defer sink.deinit();
+        sink.clearRetainingCapacity();
 
         const write_start = std.Io.Timestamp.now(io, .awake);
         {
