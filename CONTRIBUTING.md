@@ -4,7 +4,7 @@ Thank you for contributing to `zarrow`.
 
 ## Development Setup
 
-1. Install Zig `0.17.x` (minimum `0.17.0`).
+1. Install Zig `0.16.x` or `0.17.x` (minimum `0.16.0`).
 2. Clone the repository.
 3. Run:
 
@@ -22,6 +22,8 @@ zig build test
 zig fmt src tools examples benchmarks build.zig
 zig build test
 ```
+
+Format with Zig 0.16's `zig fmt`: Zig 0.17's formatter rewrites `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt`, which does not compile on 0.16.
 
 4. If the change is performance-sensitive, also run:
 

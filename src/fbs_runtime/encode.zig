@@ -87,7 +87,7 @@ pub fn write(comptime T: type, buf: []u8, t: T) void {
                 std.math.ceilPowerOfTwo(u16, @max(8, taginfo.int.bits)) catch
                     unreachable,
             );
-            mem.writeInt(I, buf[0..@sizeOf(I)], @backingInt(t), .little);
+            mem.writeInt(I, buf[0..@sizeOf(I)], @intFromEnum(t), .little);
         },
         else => mem.writeInt(T, buf[0..@sizeOf(T)], t, .little),
     }

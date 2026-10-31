@@ -74,7 +74,7 @@ Zig 在这个领域有天然优势：显式内存管理、可预测性能、清�
 
 ## 版本要求
 
-`master` 分支当前目标 Zig 版本为 `0.17.x`。
+`master` 分支当前目标 Zig 版本为 `0.16.x` 或 `0.17.x`。
 
 由于 Zig 编译器版本间存在较多 breaking changes，`zarrow` 使用带编译器后缀的标签来维护多版本兼容：
 
@@ -91,6 +91,7 @@ Zig 在这个领域有天然优势：显式内存管理、可预测性能、清�
 | Zig 版本 | 使用标签 |
 | --- | --- |
 | `0.17.x` | `v<zarrow-version>-zig0.17` |
+| `0.16.x` | `v<zarrow-version>-zig0.16` |
 | `0.15.x` | `v<zarrow-version>-zig0.15` |
 | `0.14.x` | `v<zarrow-version>-zig0.14` |
 | `0.13.x` | `v<zarrow-version>-zig0.13` |

@@ -72,7 +72,7 @@ The project favors correctness, explicit ownership, interop testing, and spec-al
 
 ## Requirements
 
-`master` currently targets Zig `0.17.x`.
+`master` currently targets Zig `0.16.x` and `0.17.x`.
 
 Because Zig has frequent breaking changes between compiler versions, `zarrow` maintains versioned tags that encode both:
 
@@ -89,6 +89,7 @@ Recommended tag mapping:
 | Zig version | Use tag |
 | --- | --- |
 | `0.17.x` | `v<zarrow-version>-zig0.17` |
+| `0.16.x` | `v<zarrow-version>-zig0.16` |
 | `0.15.x` | `v<zarrow-version>-zig0.15` |
 | `0.14.x` | `v<zarrow-version>-zig0.14` |
 | `0.13.x` | `v<zarrow-version>-zig0.13` |
@@ -297,6 +298,8 @@ Run formatting before opening a PR:
 zig fmt src tools examples benchmarks build.zig
 ```
 
+Format with Zig 0.16's `zig fmt`: Zig 0.17's formatter rewrites `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt`, which does not compile on 0.16.
+
 Run benchmarks:
 
 ```sh
@@ -434,6 +437,8 @@ zig fmt src tools examples benchmarks build.zig
 zig build test
 zig build benchmark-smoke
 ```
+
+Format with Zig 0.16's `zig fmt`: Zig 0.17's formatter rewrites `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt`, which does not compile on 0.16.
 
 Please keep changes focused and mention any compatibility impact on public API, IPC behavior, or interop behavior.
 

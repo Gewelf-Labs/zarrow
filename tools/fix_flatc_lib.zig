@@ -70,34 +70,13 @@ fn rewriteArrayListEmpty(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// `@enumFromInt(X)` -> `@fromBackingInt(@intCast(X))`
-fn rewriteEnumFromInt(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
-    const needle = "@enumFromInt(";
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |start| {
-        const arg_start = start + needle.len;
-        const close = matchingParen(src, arg_start) orelse break;
-        try out.appendSlice(gpa, src[i..start]);
-        try out.appendSlice(gpa, "@fromBackingInt(@intCast(");
-        try out.appendSlice(gpa, src[arg_start..close]);
-        try out.appendSlice(gpa, "))");
-        i = close + 1;
-    }
-    try out.appendSlice(gpa, src[i..]);
-    return out.toOwnedSlice(gpa);
-}
-
 /// Applies every fix to one generated file. Caller owns the returned slice.
 fn fixSource(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     const a = try patchImportBackslashes(gpa, src);
     defer gpa.free(a);
     const b = try patchUnionMissingSemicolon(gpa, a);
     defer gpa.free(b);
-    const c = try rewriteArrayListEmpty(gpa, b);
-    defer gpa.free(c);
-    return rewriteEnumFromInt(gpa, c);
+    return rewriteArrayListEmpty(gpa, b);
 }
 
 /// Usage: fix_flatc_lib <flatc output root dir>

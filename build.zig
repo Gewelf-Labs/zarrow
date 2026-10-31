@@ -2,12 +2,32 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Enforce supported Zig version at compile time.
-// master is pinned to Zig 0.17.x.
+// master supports Zig 0.16.x and 0.17.x.
 comptime {
     const ver = builtin.zig_version;
-    if (ver.major != 0 or ver.minor != 17) {
-        @compileError("zarrow master requires Zig 0.17.x. For Zig 0.15.x use branch release/zig-0.15");
+    if (ver.major != 0 or (ver.minor != 16 and ver.minor != 17)) {
+        @compileError("zarrow master requires Zig 0.16.x or 0.17.x. For Zig 0.15.x use branch release/zig-0.15");
     }
+}
+
+const is_zig_0_17 = builtin.zig_version.minor >= 17;
+
+/// Opens a build-root subdirectory for iteration (0.17: `b.root`, 0.16: `b.build_root.handle`).
+fn openBuildDir(b: *std.Build, sub_path: []const u8) std.Io.Dir.OpenError!std.Io.Dir {
+    const options: std.Io.Dir.OpenOptions = .{ .iterate = true };
+    if (is_zig_0_17) return b.root.openDir(b.graph.io, sub_path, options);
+    return b.build_root.handle.openDir(b.graph.io, sub_path, options);
+}
+
+/// Declares a configure-time directory dependency (0.17 only; 0.16 has no configure cache).
+fn dependOnDir(b: *std.Build, sub_path: []const u8) void {
+    if (is_zig_0_17) b.dependOnDirectoryContents(b.path(sub_path));
+}
+
+/// Forwards `zig build <step> -- args` to the run step.
+fn addPassthru(run: *std.Build.Step.Run) void {
+    if (is_zig_0_17) return run.addPassthruArgs();
+    if (run.step.owner.args) |args| run.addArgs(args);
 }
 
 fn configureIpcCompression(b: *std.Build, step: *std.Build.Step.Compile, deps_check: *std.Build.Step) void {
@@ -105,8 +125,8 @@ pub fn build(b: *std.Build) !void {
 
     // Discover example files in the `examples` directory and wire them into the build.
     const io = b.graph.io;
-    b.dependOnDirectoryContents(b.path("examples"));
-    var dir = b.root.openDir(io, "examples", .{ .iterate = true }) catch |err| {
+    dependOnDir(b, "examples");
+    var dir = openBuildDir(b, "examples") catch |err| {
         std.debug.print("warning: failed to open examples directory: {s}\n", .{@errorName(err)});
         return;
     };
@@ -130,7 +150,7 @@ pub fn build(b: *std.Build) !void {
     fuzz_layout_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
 
     const run_fuzz_layout = b.addRunArtifact(fuzz_layout_exe);
-    run_fuzz_layout.addPassthruArgs();
+    addPassthru(run_fuzz_layout);
     const fuzz_layout_step = b.step("fuzz-array-layout", "Run ArrayData.validateLayout fuzz harness");
     fuzz_layout_step.dependOn(&run_fuzz_layout.step);
 
@@ -146,15 +166,15 @@ pub fn build(b: *std.Build) !void {
     fuzz_ipc_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
 
     const run_fuzz_ipc = b.addRunArtifact(fuzz_ipc_exe);
-    run_fuzz_ipc.addPassthruArgs();
+    addPassthru(run_fuzz_ipc);
     const fuzz_ipc_step = b.step("fuzz-ipc-reader", "Run IPC reader fuzz harness");
     fuzz_ipc_step.dependOn(&run_fuzz_ipc.step);
 
     const fuzz_corpus_step = b.step("fuzz-corpus", "Replay built-in fuzz seed corpus");
-    b.dependOnDirectoryContents(b.path("fuzz/corpus/array-validate-layout"));
-    b.dependOnDirectoryContents(b.path("fuzz/corpus/ipc-reader"));
+    dependOnDir(b, "fuzz/corpus/array-validate-layout");
+    dependOnDir(b, "fuzz/corpus/ipc-reader");
 
-    var corpus_layout_dir = b.root.openDir(io, "fuzz/corpus/array-validate-layout", .{ .iterate = true }) catch null;
+    var corpus_layout_dir = openBuildDir(b, "fuzz/corpus/array-validate-layout") catch null;
     if (corpus_layout_dir) |*dir_handle| {
         defer dir_handle.close(io);
         var it_corpus_layout = dir_handle.iterate();
@@ -168,7 +188,7 @@ pub fn build(b: *std.Build) !void {
         std.debug.print("warning: fuzz corpus missing: fuzz/corpus/array-validate-layout\n", .{});
     }
 
-    var corpus_ipc_dir = b.root.openDir(io, "fuzz/corpus/ipc-reader", .{ .iterate = true }) catch null;
+    var corpus_ipc_dir = openBuildDir(b, "fuzz/corpus/ipc-reader") catch null;
     if (corpus_ipc_dir) |*dir_handle| {
         defer dir_handle.close(io);
         var it_corpus_ipc = dir_handle.iterate();
@@ -229,7 +249,7 @@ pub fn build(b: *std.Build) !void {
     interop_writer_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
 
     const run_interop_writer = b.addRunArtifact(interop_writer_exe);
-    run_interop_writer.addPassthruArgs();
+    addPassthru(run_interop_writer);
     const interop_writer_step = b.step("interop-fixture-writer", "Write canonical IPC fixture with zarrow");
     interop_writer_step.dependOn(&run_interop_writer.step);
 
@@ -245,7 +265,7 @@ pub fn build(b: *std.Build) !void {
     interop_check_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
 
     const run_interop_check = b.addRunArtifact(interop_check_exe);
-    run_interop_check.addPassthruArgs();
+    addPassthru(run_interop_check);
     const interop_check_step = b.step("interop-fixture-check", "Validate canonical IPC fixture with zarrow");
     interop_check_step.dependOn(&run_interop_check.step);
 
@@ -261,13 +281,13 @@ pub fn build(b: *std.Build) !void {
     compute_compat_exe.root_module.addImport("zarrow-core", b.modules.get("zarrow-core").?);
 
     const run_compute_compat = b.addRunArtifact(compute_compat_exe);
-    run_compute_compat.addPassthruArgs();
+    addPassthru(run_compute_compat);
     const compute_compat_step = b.step("compute-compat-check", "Run compute compatibility check cases");
     compute_compat_step.dependOn(&run_compute_compat.step);
 
     // Discover benchmark files in `benchmarks` and wire dedicated run steps.
-    b.dependOnDirectoryContents(b.path("benchmarks"));
-    var benches = b.root.openDir(io, "benchmarks", .{ .iterate = true }) catch |err| {
+    dependOnDir(b, "benchmarks");
+    var benches = openBuildDir(b, "benchmarks") catch |err| {
         std.debug.print("warning: failed to open benchmarks directory: {s}\n", .{@errorName(err)});
         return;
     };

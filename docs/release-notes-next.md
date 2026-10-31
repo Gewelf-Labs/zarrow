@@ -56,7 +56,7 @@
 
 ## Compatibility Notes
 
-- Minimum Zig: `0.17.0`.
+- Minimum Zig: `0.16.0` (0.16.x and 0.17.x supported).
 - Arrow Go IPC:
   - main lane targets Go `1.24.x`;
   - version-smoke lane validates Go `1.23.x` and `1.24.x`.
