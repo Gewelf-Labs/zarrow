@@ -20,12 +20,12 @@ pub fn concatArrayRefs(
 ) Error!ArrayRef {
     if (parts.len == 0) return error.InvalidInput;
 
+    // Flat layouts: two passes over `parts`, each output buffer allocated once; checks part types itself.
+    if (try concatManyFlat(allocator, data_type, parts)) |out| return out;
+
     for (parts) |part| {
         if (!datatype.dataTypeEql(part.data().data_type, data_type)) return error.InvalidInput;
     }
-
-    // Flat layouts: allocate each output buffer once and copy every part once (O(total_len)).
-    if (try concatManyFlat(allocator, data_type, parts)) |out| return out;
 
     if (parts.len == 1) {
         // Single part still returns a fresh, compacted copy (offset 0), as before.
@@ -512,119 +512,125 @@ fn flatKind(layout_dt: DataType) Error!?FlatKind {
     };
 }
 
-/// N-ary concat for flat layouts (null, bool, fixed-width, binary/string): each output buffer
-/// is allocated once and every part is copied once. Returns null for nested and view types,
-/// which use the pairwise merge.
+/// N-ary concat for flat layouts (null, bool, fixed-width, binary/string) in two passes over
+/// `parts`: one sizing pass (types, rows, bytes, may-have-nulls), then one copy pass that writes
+/// validity and values of each part together. Nulls are counted once on the output bitmap.
+/// Returns null for nested and view types, which use the pairwise merge.
 fn concatManyFlat(allocator: std.mem.Allocator, dt: DataType, parts: []const ArrayRef) Error!?ArrayRef {
     const kind = (try flatKind(storageDataType(dt))) orelse return null;
 
+    // Copying a DataType for dataTypeEql touches a second cache line of every part's node;
+    // for parameterless types the tag compare is the whole equality.
+    const tag_only = switch (dt) {
+        .null, .bool, .uint8, .int8, .uint16, .int16, .uint32, .int32, .uint64, .int64, .half_float, .float, .double, .string, .binary, .large_string, .large_binary, .date32, .date64 => true,
+        else => false,
+    };
     var total_len: usize = 0;
-    var total_nulls: usize = 0;
+    var total_data: usize = 0;
+    var maybe_nulls = false;
     for (parts) |part| {
-        total_len = std.math.add(usize, total_len, part.data().length) catch return error.InvalidInput;
-        if (kind != .null_type) {
-            total_nulls = std.math.add(usize, total_nulls, try nullCountForArray(part.data())) catch return error.InvalidInput;
-        }
+        const d = part.data();
+        if (std.meta.activeTag(d.data_type) != std.meta.activeTag(dt)) return error.InvalidInput;
+        if (!tag_only and !datatype.dataTypeEql(d.data_type, dt)) return error.InvalidInput;
+        total_len = std.math.add(usize, total_len, d.length) catch return error.InvalidInput;
+        maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and d.buffers.len > 0 and !d.buffers[0].isEmpty());
+        const r: ByteRange = switch (kind) {
+            .binary32 => try binaryDataRange(i32, d),
+            .binary64 => try binaryDataRange(i64, d),
+            else => .{ .start = 0, .end = 0 },
+        };
+        total_data = std.math.add(usize, total_data, r.end - r.start) catch return error.InvalidInput;
+    }
+    if (kind == .null_type) {
+        return try ArrayRef.fromOwnedInlineBuffers(allocator, .{ .data_type = dt, .length = total_len, .null_count = total_len, .buffers = &.{} });
     }
 
-    var bufs: [3]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
-    var buf_count: usize = 0;
-    errdefer for (bufs[0..buf_count]) |*b| b.release();
+    // Every output buffer is allocated once. Validity only if some part may hold a null.
+    const used = bitmap.byteLength(total_len);
+    const width: usize = switch (kind) {
+        .fixed => |w| w,
+        .binary32 => @sizeOf(i32),
+        .binary64 => @sizeOf(i64),
+        else => 0,
+    };
+    const values_len = switch (kind) {
+        .boolean => used,
+        .fixed => std.math.mul(usize, total_len, width) catch return error.InvalidInput,
+        else => (total_len + 1) * width, // offsets
+    };
+    const is_binary = kind == .binary32 or kind == .binary64;
+    if (total_data > (if (kind == .binary32) @as(usize, std.math.maxInt(i32)) else @as(usize, std.math.maxInt(i64)))) return error.InvalidInput;
+    var validity = try buffer.OwnedBuffer.init(allocator, if (maybe_nulls) used else 0);
+    errdefer validity.deinit();
+    // Bool values are OR-ed bits (need zeroed memory); other slots are all written below.
+    var values = try (if (kind == .boolean) buffer.OwnedBuffer.init(allocator, values_len) else buffer.OwnedBuffer.initUninit(allocator, values_len + 16));
+    errdefer values.deinit();
+    var data_bytes = try buffer.OwnedBuffer.initUninit(allocator, total_data + 16); // wildCopy slack
+    errdefer data_bytes.deinit();
 
-    if (kind != .null_type) {
-        bufs[0] = try concatValidityMany(allocator, parts, total_len, total_nulls);
-        buf_count = 1;
-    }
-    switch (kind) {
-        .null_type => total_nulls = total_len,
-        .boolean => {
-            const used = bitmap.byteLength(total_len);
-            var values = try buffer.OwnedBuffer.init(allocator, used);
-            errdefer values.deinit();
-            var pos: usize = 0;
-            for (parts) |part| {
-                const d = part.data();
+    var row: usize = 0;
+    var byte_pos: usize = 0;
+    for (parts) |part| {
+        const d = part.data();
+        if (maybe_nulls) try appendValidityBits(validity.data, row, d);
+        switch (kind) {
+            .null_type => unreachable,
+            .boolean => {
                 try requireBufferCount(d, 2);
                 try requireBitmapBits(d.buffers[1], d.offset + d.length);
-                bitmap.copyBits(values.data, pos, d.buffers[1].data, d.offset, d.length);
-                pos += d.length;
-            }
-            bufs[1] = try values.toShared(used);
-            buf_count = 2;
-        },
-        .fixed => |byte_width| {
-            const total_bytes = std.math.mul(usize, total_len, byte_width) catch return error.InvalidInput;
-            var values = try buffer.OwnedBuffer.initUninit(allocator, total_bytes);
-            errdefer values.deinit();
-            var pos: usize = 0;
-            for (parts) |part| {
-                try requireBufferCount(part.data(), 2);
-                const bytes = try dataBytesForFixedWidth(part.data(), byte_width);
-                @memcpy(values.data[pos..][0..bytes.len], bytes);
-                pos += bytes.len;
-            }
-            bufs[1] = try values.toShared(total_bytes);
-            buf_count = 2;
-        },
-        .binary32 => {
-            try concatManyBinary(i32, allocator, parts, total_len, &bufs);
-            buf_count = 3;
-        },
-        .binary64 => {
-            try concatManyBinary(i64, allocator, parts, total_len, &bufs);
-            buf_count = 3;
-        },
+                bitmap.copyBits(values.data, row, d.buffers[1].data, d.offset, d.length);
+            },
+            .fixed => {
+                try requireBufferCount(d, 2);
+                const bytes = try dataBytesForFixedWidth(d, width);
+                wildCopy(values.data[row * width ..], d.buffers[1].data, d.offset * width, bytes.len);
+            },
+            .binary32 => byte_pos = try copyBinaryPart(i32, values.typedSlice(i32), data_bytes.data, row, byte_pos, d),
+            .binary64 => byte_pos = try copyBinaryPart(i64, values.typedSlice(i64), data_bytes.data, row, byte_pos, d),
+        }
+        row += d.length;
     }
+    if (kind == .binary32) values.typedSlice(i32)[0] = 0;
+    if (kind == .binary64) values.typedSlice(i64)[0] = 0;
+    const null_count = if (maybe_nulls) total_len - bitmap.countSetBit(validity.data, total_len) else 0;
+
+    var bufs: [3]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+    errdefer for (&bufs) |*b| b.release();
+    if (null_count == 0) validity.deinit() else bufs[0] = try validity.toShared(used);
+    bufs[1] = try values.toShared(values_len);
+    if (is_binary) bufs[2] = try data_bytes.toShared(total_data) else data_bytes.deinit();
+    const buf_count: usize = if (is_binary) 3 else 2;
 
     const data = ArrayData{
         .data_type = dt,
         .length = total_len,
-        .null_count = total_nulls,
+        .null_count = null_count,
         .buffers = bufs[0..buf_count],
     };
     try data.validateLayout();
     return try ArrayRef.fromOwnedInlineBuffers(allocator, data);
 }
 
-/// Fills `bufs[1]` (offsets) and `bufs[2]` (values) for an N-ary string/binary concat.
-fn concatManyBinary(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    parts: []const ArrayRef,
-    total_len: usize,
-    bufs: *[3]array_data.SharedBuffer,
-) Error!void {
-    var total_data: usize = 0;
-    for (parts) |part| {
-        const r = try binaryDataRange(T, part.data());
-        total_data = std.math.add(usize, total_data, r.end - r.start) catch return error.InvalidInput;
-    }
-    if (total_data > std.math.maxInt(T)) return error.InvalidInput;
+/// Copies `src[lo..][0..n]` to the front of `dst` in 16-byte chunks when both sides have room
+/// for the rounded-up length (bytes past `n` in `dst` are scratch); else one @memcpy.
+inline fn wildCopy(dst: []u8, src: []const u8, lo: usize, n: usize) void {
+    const rounded = (n + 15) & ~@as(usize, 15);
+    if (n <= 256 and lo + rounded <= src.len and rounded <= dst.len) {
+        var k: usize = 0;
+        while (k < n) : (k += 16) dst[k..][0..16].* = src[lo + k ..][0..16].*;
+    } else @memcpy(dst[0..n], src[lo..][0..n]);
+}
 
-    const offsets_len = total_len + 1;
-    var offsets_owned = try buffer.OwnedBuffer.initUninit(allocator, offsets_len * @sizeOf(T));
-    errdefer offsets_owned.deinit();
-    var values_owned = try buffer.OwnedBuffer.initUninit(allocator, total_data);
-    errdefer values_owned.deinit();
-
-    const out_offsets = offsets_owned.typedSlice(T)[0..offsets_len];
-    out_offsets[0] = 0;
-    var row: usize = 0;
-    var byte_pos: usize = 0;
-    for (parts) |part| {
-        const d = part.data();
-        const r = try binaryDataRange(T, d);
-        const src = (d.buffers[1].typedSlice(T) catch unreachable)[d.offset .. d.offset + d.length + 1];
-        // Wrapping math: malformed (non-monotonic) input yields offsets that validateLayout rejects.
-        const shift: T = @as(T, @intCast(byte_pos)) -% src[0];
-        for (src[1..], out_offsets[row + 1 ..][0..d.length]) |o, *out| out.* = o +% shift;
-        @memcpy(values_owned.data[byte_pos..][0 .. r.end - r.start], d.buffers[2].data[r.start..r.end]);
-        row += d.length;
-        byte_pos += r.end - r.start;
-    }
-    bufs[1] = try offsets_owned.toShared(offsets_len * @sizeOf(T));
-    errdefer bufs[1].release();
-    bufs[2] = try values_owned.toShared(total_data);
+/// Appends one string/binary part: offsets `out_offsets[row + 1 ..]` rebased onto `byte_pos`,
+/// and its bytes at `out_bytes[byte_pos..]`. Returns the new byte position.
+fn copyBinaryPart(comptime T: type, out_offsets: []T, out_bytes: []u8, row: usize, byte_pos: usize, d: *const ArrayData) Error!usize {
+    const r = try binaryDataRange(T, d);
+    const src = (d.buffers[1].typedSlice(T) catch unreachable)[d.offset .. d.offset + d.length + 1];
+    // Wrapping math: malformed (non-monotonic) input yields offsets that validateLayout rejects.
+    const shift: T = @as(T, @intCast(byte_pos)) -% src[0];
+    for (src[1..], out_offsets[row + 1 ..][0..d.length]) |o, *out| out.* = o +% shift;
+    wildCopy(out_bytes[byte_pos..], d.buffers[2].data, r.start, r.end - r.start);
+    return byte_pos + (r.end - r.start);
 }
 
 const ByteRange = struct { start: usize, end: usize };
@@ -666,24 +672,6 @@ fn concatValidityBuffer(
     return owned.toShared(used);
 }
 
-fn concatValidityMany(
-    allocator: std.mem.Allocator,
-    parts: []const ArrayRef,
-    total_len: usize,
-    total_nulls: usize,
-) ConcatArrayError!array_data.SharedBuffer {
-    if (total_nulls == 0) return array_data.SharedBuffer.empty;
-    const used = bitmap.byteLength(total_len);
-    var owned = try buffer.OwnedBuffer.init(allocator, used);
-    errdefer owned.deinit();
-    var pos: usize = 0;
-    for (parts) |part| {
-        try appendValidityBits(owned.data, pos, part.data());
-        pos += part.data().length;
-    }
-    return owned.toShared(used);
-}
-
 /// Writes `data`'s validity bits into zeroed `dst` at bit `dst_off` (all-null parts stay zero).
 fn appendValidityBits(dst: []u8, dst_off: usize, data: *const ArrayData) ConcatArrayError!void {
     if (data.length == 0) return;
@@ -691,9 +679,11 @@ fn appendValidityBits(dst: []u8, dst_off: usize, data: *const ArrayData) ConcatA
         if (count == data.length) return;
         if (count == 0) return bitmap.setBits(dst, dst_off, data.length);
     }
-    const validity = data.validity() orelse return bitmap.setBits(dst, dst_off, data.length);
-    if (bitmap.byteLength(data.offset + data.length) > validity.data.len) return error.InvalidInput;
-    bitmap.copyBits(dst, dst_off, validity.data, data.offset, data.length);
+    // Every caller's layout has a top-level bitmap, so read buffers[0] directly (cheaper than validity()).
+    if (data.buffers.len == 0 or data.buffers[0].isEmpty()) return bitmap.setBits(dst, dst_off, data.length);
+    const bits = data.buffers[0].data;
+    if (bitmap.byteLength(data.offset + data.length) > bits.len) return error.InvalidInput;
+    bitmap.copyBits(dst, dst_off, bits, data.offset, data.length);
 }
 
 fn dataBytesForFixedWidth(data: *const ArrayData, byte_width: usize) ConcatArrayError![]const u8 {
@@ -1374,4 +1364,24 @@ test "concatArrayRefs N-ary path matches per-row values for int32, string and bo
             }
         }
     }
+}
+
+test "concatArrayRefs rejects parts whose type differs in tag or parameters" {
+    const allocator = std.testing.allocator;
+    const values = [_]i64{ 1, 2 };
+    const bufs = [_]array_data.SharedBuffer{ array_data.SharedBuffer.empty, array_data.SharedBuffer.fromSlice(std.mem.sliceAsBytes(values[0..])) };
+    const sec = DataType{ .timestamp = .{ .unit = .second, .timezone = null } };
+    const ms = DataType{ .timestamp = .{ .unit = .millisecond, .timezone = null } };
+    var a = try ArrayRef.fromBorrowed(allocator, .{ .data_type = sec, .length = 2, .null_count = 0, .buffers = bufs[0..] });
+    defer a.release();
+    var b = try ArrayRef.fromBorrowed(allocator, .{ .data_type = ms, .length = 2, .null_count = 0, .buffers = bufs[0..] });
+    defer b.release();
+    var c = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .int64 = {} }, .length = 2, .null_count = 0, .buffers = bufs[0..] });
+    defer c.release();
+    // Same tag, different unit (full dataTypeEql) and different tag (tag compare) are both rejected.
+    try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, sec, &[_]ArrayRef{ a, b }));
+    try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, .{ .int64 = {} }, &[_]ArrayRef{ c, a }));
+    var ok = try concatArrayRefs(allocator, sec, &[_]ArrayRef{ a, a });
+    defer ok.release();
+    try std.testing.expectEqual(@as(usize, 4), ok.data().length);
 }

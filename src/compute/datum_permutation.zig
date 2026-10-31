@@ -196,13 +196,14 @@ fn datumTakeChunkedNullable(
     return Datum.fromChunked(out);
 }
 
-/// Direct gather for fixed-width and boolean arrays: the output buffers are
-/// allocated once and each index copies one value + one validity bit.
+/// Direct gather for fixed-width and boolean arrays: output buffers are allocated once, every
+/// slot copies its value without a branch, and validity is packed 8 rows per byte (gatherBits).
+/// `indices` is `[]const ?usize` (null = null row) or dense `[]const usize` / `[]const u32`.
 /// Returns null for layouts it does not handle so callers fall back to slice+concat.
 fn takeFixedWidthArray(
     allocator: std.mem.Allocator,
     src: *const array_mod.ArrayData,
-    indices: []const ?usize,
+    indices: anytype,
 ) KernelError!?ArrayRef {
     const byte_width: usize = switch (src.data_type) {
         .bool => 0,
@@ -220,35 +221,28 @@ fn takeFixedWidthArray(
     const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
     const src_need = if (is_bool) bitmap.byteLength(src_end) else std.math.mul(usize, src_end, byte_width) catch return error.Overflow;
     if (src_bytes.len < src_need) return error.InvalidInput;
-    for (indices) |maybe| if (maybe) |idx| {
-        if (idx >= src.length) return error.InvalidInput;
-    };
+    const src_validity = try validityBytes(src, src_end);
+    try checkIndices(indices, src.length);
 
-    const src_validity = src.validity();
     const out_len = indices.len;
-    var values = buffer.OwnedBuffer.init(allocator, if (is_bool) bitmap.byteLength(out_len) else out_len * byte_width) catch return error.OutOfMemory;
+    const values_len = if (is_bool) bitmap.byteLength(out_len) else out_len * byte_width;
+    // Bool values are OR-ed bits (need zeroed memory); fixed-width slots are all written below.
+    var values = (if (is_bool) buffer.OwnedBuffer.init(allocator, values_len) else buffer.OwnedBuffer.initUninit(allocator, values_len)) catch return error.OutOfMemory;
     errdefer values.deinit();
     var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
     errdefer validity.deinit();
 
-    var null_count: usize = 0;
-    for (indices, 0..) |maybe, i| {
-        const idx = maybe orelse {
-            null_count += 1;
-            continue;
-        };
-        const j = src.offset + idx;
-        if (src_validity) |v| if (!(v.isValid(j) catch unreachable)) {
-            null_count += 1;
-            continue;
-        };
-        bitmap.setBit(validity.data, i);
-        if (is_bool) {
-            if (bitmap.bitIsSet(src_bytes, j)) bitmap.setBit(values.data, i);
-        } else switch (byte_width) {
-            inline 1, 2, 4, 8, 16, 32 => |w| @memcpy(values.data[i * w ..][0..w], src_bytes[j * w ..][0..w]),
-            else => unreachable,
-        }
+    const null_count = out_len - gatherBits(validity.data, src_validity, src.offset, indices);
+    if (is_bool) {
+        _ = gatherBits(values.data, src_bytes, src.offset, indices);
+    } else switch (byte_width) {
+        inline 1, 2, 4, 8, 16, 32 => |w| {
+            const E = [w]u8;
+            const s = std.mem.bytesAsSlice(E, src_bytes[src.offset * w ..][0 .. src.length * w]);
+            const d = std.mem.bytesAsSlice(E, values.data[0..values_len]);
+            for (indices, d) |m, *o| o.* = if (@as(?usize, m)) |j| s[j] else @splat(0);
+        },
+        else => unreachable,
     }
 
     var buffers: [2]buffer.SharedBuffer = undefined;
@@ -257,7 +251,7 @@ fn takeFixedWidthArray(
         break :blk buffer.SharedBuffer.empty;
     } else validity.toShared(bitmap.byteLength(out_len)) catch return error.OutOfMemory;
     errdefer buffers[0].release();
-    buffers[1] = values.toShared(if (is_bool) bitmap.byteLength(out_len) else out_len * byte_width) catch return error.OutOfMemory;
+    buffers[1] = values.toShared(values_len) catch return error.OutOfMemory;
     errdefer buffers[1].release();
 
     return ArrayRef.fromOwnedInlineBuffers(allocator, .{
@@ -266,6 +260,56 @@ fn takeFixedWidthArray(
         .null_count = null_count,
         .buffers = buffers[0..],
     }) catch return error.OutOfMemory;
+}
+
+/// The source validity bytes (null when there is no bitmap), checked to cover `src_end` bits.
+fn validityBytes(src: *const array_mod.ArrayData, src_end: usize) KernelError!?[]const u8 {
+    const v = src.validity() orelse return null;
+    if (v.data.len < bitmap.byteLength(src_end)) return error.InvalidInput;
+    return v.data;
+}
+
+/// Index slices without null entries (`[]const usize`, `[]const u32`).
+fn isDense(comptime I: type) bool {
+    return I == []const usize or I == []const u32;
+}
+
+/// Every non-null index must be < len. Dense slices use a max-reduce, which vectorizes.
+fn checkIndices(indices: anytype, len: usize) KernelError!void {
+    const I = @TypeOf(indices);
+    if (comptime isDense(I)) {
+        if (indices.len > 0 and std.mem.max(@typeInfo(I).pointer.child, indices) >= len) return error.InvalidInput;
+    } else for (indices) |maybe| if (maybe) |idx| {
+        if (idx >= len) return error.InvalidInput;
+    };
+}
+
+/// Bit i of zeroed `dst` = indices[i] is non-null and bit `offset + indices[i]` of `src` is set
+/// (`src == null` means all set). 8 indices per output byte, no data-dependent branch
+/// (arrow-rs take_bits). Returns the number of set bits. Callers bounds-check indices and `src`.
+fn gatherBits(dst: []u8, src: ?[]const u8, offset: usize, indices: anytype) usize {
+    var set: usize = 0;
+    var i: usize = 0;
+    while (i + 8 <= indices.len) : (i += 8) {
+        var byte: u8 = 0;
+        inline for (0..8) |k| byte |= bitOf(src, offset, indices[i + k]) << k;
+        dst[i >> 3] = byte;
+        set += @popCount(byte);
+    }
+    if (i < indices.len) {
+        var byte: u8 = 0;
+        for (indices[i..], 0..) |m, k| byte |= bitOf(src, offset, m) << @intCast(k);
+        dst[i >> 3] = byte;
+        set += @popCount(byte);
+    }
+    return set;
+}
+
+inline fn bitOf(src: ?[]const u8, offset: usize, maybe: anytype) u8 {
+    const idx = @as(?usize, maybe) orelse return 0;
+    const s = src orelse return 1;
+    const j = offset + idx;
+    return (s[j >> 3] >> @intCast(j & 7)) & 1;
 }
 
 fn validAt(src_validity: ?bitmap.ValidityBitmap, j: usize) bool {
@@ -281,35 +325,27 @@ fn offsetRange(comptime T: type, offsets: []const T, j: usize, limit: usize) Ker
     return .{ lo, hi };
 }
 
-/// Direct gather for string/binary (i32 or i64 offsets): one pass sizes the value buffer,
-/// a second copies offsets, bytes and validity. Returns null for other layouts.
+/// Direct gather for string/binary (i32 or i64 offsets): pass 1 bounds-checks offsets and sizes
+/// the value buffer, pass 2 copies offsets + bytes, validity is packed by gatherBits.
+/// Null source rows keep their bytes (usually none), like arrow-rs. Returns null for other layouts.
 fn takeBinaryArray(
     comptime T: type,
     allocator: std.mem.Allocator,
     src: *const array_mod.ArrayData,
-    indices: []const ?usize,
+    indices: anytype,
 ) KernelError!?ArrayRef {
     if (src.buffers.len != 3) return null;
     const offsets = src.buffers[1].typedSlice(T) catch return error.InvalidInput;
     const bytes = src.buffers[2].data;
     const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
     if (offsets.len <= src_end) return error.InvalidInput;
-    const src_validity = src.validity();
+    const src_validity = try validityBytes(src, src_end);
+    try checkIndices(indices, src.length);
 
     var total: usize = 0;
-    var null_count: usize = 0;
     for (indices) |maybe| {
-        const idx = maybe orelse {
-            null_count += 1;
-            continue;
-        };
-        if (idx >= src.length) return error.InvalidInput;
-        const j = src.offset + idx;
-        if (!validAt(src_validity, j)) {
-            null_count += 1;
-            continue;
-        }
-        const r = try offsetRange(T, offsets, j, bytes.len);
+        const idx: usize = @as(?usize, maybe) orelse continue;
+        const r = try offsetRange(T, offsets, src.offset + idx, bytes.len);
         total = std.math.add(usize, total, r[1] - r[0]) catch return error.Overflow;
     }
     if (total > std.math.maxInt(T)) return error.Overflow;
@@ -317,7 +353,8 @@ fn takeBinaryArray(
     const out_len = indices.len;
     var out_offsets = buffer.OwnedBuffer.initUninit(allocator, (out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
     errdefer out_offsets.deinit();
-    var out_bytes = buffer.OwnedBuffer.initUninit(allocator, total) catch return error.OutOfMemory;
+    // 16 bytes of slack so short values move as one fixed 16-byte copy (copyShort).
+    var out_bytes = buffer.OwnedBuffer.initUninit(allocator, total + 16) catch return error.OutOfMemory;
     errdefer out_bytes.deinit();
     var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
     errdefer validity.deinit();
@@ -326,18 +363,16 @@ fn takeBinaryArray(
     o[0] = 0;
     var pos: usize = 0;
     for (indices, 0..) |maybe, i| {
-        if (maybe) |idx| {
+        if (@as(?usize, maybe)) |idx| {
             const j = src.offset + idx;
-            if (validAt(src_validity, j)) {
-                const lo: usize = @intCast(offsets[j]);
-                const n: usize = @intCast(offsets[j + 1] - offsets[j]);
-                @memcpy(out_bytes.data[pos..][0..n], bytes[lo..][0..n]);
-                pos += n;
-                bitmap.setBit(validity.data, i);
-            }
+            const lo: usize = @intCast(offsets[j]);
+            const n: usize = @intCast(offsets[j + 1] - offsets[j]);
+            copyShort(out_bytes.data[pos..], bytes, lo, n);
+            pos += n;
         }
         o[i + 1] = @intCast(pos);
     }
+    const null_count = out_len - gatherBits(validity.data, src_validity, src.offset, indices);
 
     var buffers: [3]buffer.SharedBuffer = undefined;
     buffers[0] = if (null_count == 0) blk: {
@@ -358,13 +393,21 @@ fn takeBinaryArray(
     }) catch return error.OutOfMemory;
 }
 
+/// Copies `src[lo..][0..n]` to the front of `dst`. Values of at most 16 bytes move as one fixed
+/// 16-byte load/store when both sides have room; `dst` bytes past `n` are scratch.
+inline fn copyShort(dst: []u8, src: []const u8, lo: usize, n: usize) void {
+    if (n <= 16 and lo + 16 <= src.len and dst.len >= 16) {
+        dst[0..16].* = src[lo..][0..16].*;
+    } else @memcpy(dst[0..n], src[lo..][0..n]);
+}
+
 /// Direct gather for list/large_list: rebuilds offsets + validity and takes the child once
 /// with the expanded child indices (recursing into the fast kernels). Returns null for other layouts.
 fn takeListArray(
     comptime T: type,
     allocator: std.mem.Allocator,
     src: *const array_mod.ArrayData,
-    indices: []const ?usize,
+    indices: anytype,
 ) KernelError!?ArrayRef {
     if (src.buffers.len != 2 or src.children.len != 1) return null;
     const offsets = src.buffers[1].typedSlice(T) catch return error.InvalidInput;
@@ -377,7 +420,7 @@ fn takeListArray(
     var total: usize = 0;
     var null_count: usize = 0;
     for (indices) |maybe| {
-        const idx = maybe orelse {
+        const idx: usize = @as(?usize, maybe) orelse {
             null_count += 1;
             continue;
         };
@@ -392,7 +435,7 @@ fn takeListArray(
     }
     if (total > std.math.maxInt(T)) return error.Overflow;
 
-    const child_indices = allocator.alloc(?usize, total) catch return error.OutOfMemory;
+    const child_indices = allocator.alloc(usize, total) catch return error.OutOfMemory;
     defer allocator.free(child_indices);
     const out_len = indices.len;
     var out_offsets = buffer.OwnedBuffer.initUninit(allocator, (out_len + 1) * @sizeOf(T)) catch return error.OutOfMemory;
@@ -404,7 +447,7 @@ fn takeListArray(
     o[0] = 0;
     var pos: usize = 0;
     for (indices, 0..) |maybe, i| {
-        if (maybe) |idx| {
+        if (@as(?usize, maybe)) |idx| {
             const j = src.offset + idx;
             if (validAt(src_validity, j)) {
                 const lo: usize = @intCast(offsets[j]);
@@ -417,7 +460,7 @@ fn takeListArray(
         o[i + 1] = @intCast(pos);
     }
 
-    var taken = try datumTakeArrayLikeNullable(allocator, Datum.fromArray(child), child.data().data_type, child_indices);
+    var taken = try datumTakeArrayLikeNullable(allocator, Datum.fromArray(child), child.data().data_type, @as([]const usize, child_indices));
     if (taken != .array) {
         taken.release();
         return error.InvalidInput;
@@ -454,7 +497,7 @@ fn datumTakeArrayLikeNullable(
     allocator: std.mem.Allocator,
     datum: Datum,
     out_type: DataType,
-    indices: []const ?usize,
+    indices: anytype,
 ) KernelError!Datum {
     if (indices.len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
     if (datum == .array) {
@@ -477,7 +520,7 @@ fn datumTakeArrayLikeNullable(
     try pieces.ensureTotalCapacity(allocator, indices.len);
 
     for (indices) |choice| {
-        const piece = if (choice) |idx|
+        const piece = if (@as(?usize, choice)) |idx|
             try accessors.datumElementArrayAt(allocator, datum, idx)
         else
             try builders.buildNullLikeArray(allocator, out_type, 1);
@@ -514,22 +557,13 @@ fn predicateDecisionAt(predicate: Datum, logical_index: usize, options: FilterOp
     };
 }
 
-/// 8 bits of `bytes` starting at bit `bit` (bits past the end of `bytes` read as 0).
-fn byteAtBit(bytes: []const u8, bit: usize) u8 {
-    const i = bit >> 3;
-    const sh: u3 = @intCast(bit & 7);
-    const lo = bytes[i] >> sh;
-    if (sh == 0 or i + 1 >= bytes.len) return lo;
-    return lo | (bytes[i + 1] << @intCast(8 - @as(u4, sh)));
-}
-
 const SelectionByte = struct { emit: u8, valid: u8 };
 
 /// Rows `row .. row+8` of a bool predicate: which rows emit an entry and which of those are valid.
 fn selectionByte(values: []const u8, validity: []const u8, bit: usize, rows_left: usize, drop_nulls: bool) SelectionByte {
     const tail_mask: u8 = if (rows_left >= 8) 0xFF else (@as(u8, 1) << @intCast(rows_left)) - 1;
-    const valid = if (validity.len > 0) byteAtBit(validity, bit) else 0xFF;
-    var emit = byteAtBit(values, bit) & valid;
+    const valid = if (validity.len > 0) bitmap.byteAtBit(validity, bit) else 0xFF;
+    var emit = bitmap.byteAtBit(values, bit) & valid;
     if (!drop_nulls) emit |= ~valid;
     return .{ .emit = emit & tail_mask, .valid = valid };
 }
@@ -538,7 +572,7 @@ fn selectionByte(values: []const u8, validity: []const u8, bit: usize, rows_left
 /// `base` is the logical index of the predicate's row 0.
 fn appendBoolSelections(
     allocator: std.mem.Allocator,
-    selections: *std.ArrayList(?usize),
+    selections: anytype,
     pred: *const array_mod.ArrayData,
     len: usize,
     base: usize,
@@ -556,7 +590,7 @@ fn appendBoolSelections(
     while (row < len) : (row += 8) {
         count += @popCount(selectionByte(values, validity, pred.offset + row, len - row, options.drop_nulls).emit);
     }
-    try selections.ensureUnusedCapacity(allocator, count);
+    try selections.ensureTotalCapacityPrecise(allocator, selections.items.len + count);
 
     row = 0;
     while (row < len) : (row += 8) {
@@ -565,7 +599,10 @@ fn appendBoolSelections(
         while (emit != 0) : (emit &= emit - 1) {
             const bit: u3 = @intCast(@ctz(emit));
             const is_valid = (sb.valid >> bit) & 1 != 0;
-            selections.appendAssumeCapacity(if (is_valid) base + row + bit else null);
+            if (@TypeOf(selections.items[0]) != ?usize) {
+                std.debug.assert(is_valid); // dense lists are only built with drop_nulls
+                selections.appendAssumeCapacity(@intCast(base + row + bit));
+            } else selections.appendAssumeCapacity(if (is_valid) base + row + bit else null);
         }
     }
 }
@@ -636,12 +673,7 @@ pub fn datumTake(datum: Datum, indices: []const usize) KernelError!Datum {
             for (indices, 0..) |index, i| nullable[i] = index;
             break :blk try datumTakeChunkedNullable(allocator, chunks, out_type, nullable);
         },
-        else => blk: {
-            var nullable = allocator.alloc(?usize, indices.len) catch break :blk error.OutOfMemory;
-            defer allocator.free(nullable);
-            for (indices, 0..) |index, i| nullable[i] = index;
-            break :blk try datumTakeArrayLikeNullable(allocator, datum, out_type, nullable);
-        },
+        else => datumTakeArrayLikeNullable(allocator, datum, out_type, indices),
     };
 }
 
@@ -744,6 +776,16 @@ pub fn datumFilter(datum: Datum, predicate: Datum, options: FilterOptions) Kerne
     const out_type = datum.dataType();
 
     if (output_len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
+    if (datum == .array and predicate == .array and options.drop_nulls and output_len <= std.math.maxInt(u32)) {
+        // drop_nulls: every kept row is a valid index, so the selections are dense u32 (4 B per
+        // kept row, exact size) and the take runs the branch-free dense kernels.
+        const pred = predicate.array.data();
+        if (pred.data_type != .bool or output_len > pred.length) return error.InvalidInput;
+        var selections: std.ArrayList(u32) = .empty;
+        defer selections.deinit(allocator);
+        try appendBoolSelections(allocator, &selections, pred, output_len, 0, options);
+        return datumTakeArrayLikeNullable(allocator, datum, out_type, @as([]const u32, selections.items));
+    }
     if (datum == .array) {
         const selections = try datumFilterSelectionIndices(allocator, predicate, output_len, options);
         defer allocator.free(selections);

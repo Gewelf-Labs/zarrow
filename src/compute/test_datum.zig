@@ -1072,3 +1072,79 @@ test "compute datumFilterSelectionIndices word path matches per-row decisions on
     }
     try std.testing.expectError(error.InvalidInput, datumFilterSelectionIndices(allocator, Datum.fromArray(pred), 24, .{}));
 }
+
+test "compute dense take and u32 filter kernels match the nullable path" {
+    const allocator = std.testing.allocator;
+    const SharedBuffer = @import("../buffer.zig").SharedBuffer;
+
+    // int32 with nulls; 10 indices cover a full validity byte and a tail.
+    var ints = try makeInt32Array(allocator, &[_]?i32{ 10, null, 30, 40, null, 60, 70, 80, 90 });
+    defer ints.release();
+    const idx = [_]usize{ 8, 0, 4, 4, 1, 2, 7, 3, 5, 6 };
+    var nidx: [idx.len]?usize = undefined;
+    for (idx, &nidx) |i, *n| n.* = i;
+    var dense = try datumTake(Datum.fromArray(ints), idx[0..]);
+    defer dense.release();
+    var nullable = try datumTakeNullable(Datum.fromArray(ints), nidx[0..]);
+    defer nullable.release();
+    const dense_values = try collectInt32ValuesFromDatum(allocator, dense);
+    defer allocator.free(dense_values);
+    const nullable_values = try collectInt32ValuesFromDatum(allocator, nullable);
+    defer allocator.free(nullable_values);
+    try std.testing.expectEqualSlices(?i32, nullable_values, dense_values);
+    try std.testing.expectEqual(@as(?usize, 3), dense.array.data().null_count);
+    try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(ints), &[_]usize{ 0, 9 }));
+
+    // Boundary change: a null string slot that holds bytes keeps them (like arrow-rs); the row stays null.
+    const offsets = [_]i32{ 0, 1, 3, 6 };
+    const validity = [_]u8{0b101};
+    const bufs = [_]SharedBuffer{
+        SharedBuffer.fromSlice(validity[0..]),
+        SharedBuffer.fromSlice(std.mem.sliceAsBytes(offsets[0..])),
+        SharedBuffer.fromSlice("abbccc"),
+    };
+    var strs = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .string = {} }, .length = 3, .null_count = 1, .buffers = bufs[0..] });
+    defer strs.release();
+    var taken = try datumTake(Datum.fromArray(strs), &[_]usize{ 1, 2, 1 });
+    defer taken.release();
+    try taken.array.data().validateLayout();
+    const out = array_mod.StringArray{ .data = taken.array.data() };
+    try std.testing.expect(out.isNull(0) and !out.isNull(1) and out.isNull(2));
+    try std.testing.expectEqualStrings("bb", try out.value(0));
+    try std.testing.expectEqualStrings("ccc", try out.value(1));
+    try std.testing.expectEqual(@as(?usize, 2), taken.array.data().null_count);
+
+    // A validity bitmap shorter than offset + length bits is rejected, not read past.
+    const zeros: [10]i32 = @splat(0);
+    const short_bufs = [_]SharedBuffer{
+        SharedBuffer.fromSlice(validity[0..]),
+        SharedBuffer.fromSlice(std.mem.sliceAsBytes(zeros[0..])),
+        SharedBuffer.fromSlice(""),
+    };
+    var short = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .string = {} }, .length = 9, .null_count = 1, .buffers = short_bufs[0..] });
+    defer short.release();
+    try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(short), &[_]usize{0}));
+
+    // datumFilter (dense u32 selections) equals take of the nullable selection indices.
+    const words = [_]?[]const u8{ "a", null, "ccc", "", "eeeee", null, "g", "hh", "i", "jjj", "k" };
+    var sb = try array_mod.StringBuilder.init(allocator, 0, 0);
+    defer sb.deinit();
+    for (words) |w| if (w) |v| try sb.append(v) else try sb.appendNull();
+    var word_ref = try sb.finish();
+    defer word_ref.release();
+    var pred = try makeBoolArray(allocator, &[_]?bool{ true, true, null, false, true, true, null, true, false, true, true });
+    defer pred.release();
+    var filtered = try datumFilter(Datum.fromArray(word_ref), Datum.fromArray(pred), .{});
+    defer filtered.release();
+    const sel = try datumFilterSelectionIndices(allocator, Datum.fromArray(pred), words.len, .{});
+    defer allocator.free(sel);
+    var expected = try datumTakeNullable(Datum.fromArray(word_ref), sel);
+    defer expected.release();
+    const got = array_mod.StringArray{ .data = filtered.array.data() };
+    const want = array_mod.StringArray{ .data = expected.array.data() };
+    try std.testing.expectEqual(want.len(), got.len());
+    for (0..want.len()) |i| {
+        try std.testing.expectEqual(want.isNull(i), got.isNull(i));
+        if (!want.isNull(i)) try std.testing.expectEqualStrings(try want.value(i), try got.value(i));
+    }
+}

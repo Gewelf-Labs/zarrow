@@ -134,6 +134,11 @@ pub const StreamReader = struct {
     /// Set by `initZeroCopy`: `reader` is `std.Io.Reader.fixed(source.data)`, so message
     /// bodies are retained slices of `source` instead of copies.
     source: ?array_data.SharedBuffer = null,
+    /// Extra handles on the last copied body and the last decoded (decompressed) body. Once the
+    /// caller drops every batch that used one, the next message reuses that allocation instead
+    /// of faulting in fresh pages; otherwise the handle is released and a new buffer allocated.
+    spare_body: ?array_data.SharedBuffer = null,
+    spare_decoded: ?array_data.SharedBuffer = null,
 
     const Self = @This();
 
@@ -177,6 +182,10 @@ pub const StreamReader = struct {
         self.schema_ref = null;
         if (self.source) |*src| src.release();
         self.source = null;
+        if (self.spare_body) |*b| b.release();
+        self.spare_body = null;
+        if (self.spare_decoded) |*b| b.release();
+        self.spare_decoded = null;
     }
 
     fn clearDictionaryValues(self: *Self) void {
@@ -238,6 +247,7 @@ pub const StreamReader = struct {
                         msg.body.?,
                         &self.dictionary_values,
                         msg.msg.version,
+                        &self.spare_decoded,
                     );
                 },
                 // Tensor/SparseTensor are valid IPC message headers but are
@@ -294,6 +304,31 @@ const MessageWithBody = struct {
     }
 };
 
+/// A writable buffer of at least `len` bytes: the allocation held in `spare` when no batch uses
+/// it any more, else a fresh one. `spare == null` always allocates.
+fn reuseOrAlloc(allocator: std.mem.Allocator, spare: ?*?array_data.SharedBuffer, len: usize) error{OutOfMemory}!OwnedBuffer {
+    if (spare) |slot| if (slot.*) |*old| {
+        if (old.reclaim()) |reclaimed| {
+            slot.* = null;
+            // Within 2x so one huge body is not pinned by a stream of small batches.
+            if (reclaimed.len() >= len and reclaimed.len() / 2 <= len) return reclaimed;
+            var unfit = reclaimed;
+            unfit.deinit();
+        } else {
+            old.release();
+            slot.* = null;
+        }
+    };
+    return OwnedBuffer.initUninit(allocator, len);
+}
+
+/// Keeps one extra handle on `buf` in `spare` (replacing the previous one) for `reuseOrAlloc`.
+fn keepSpare(spare: ?*?array_data.SharedBuffer, buf: array_data.SharedBuffer) void {
+    const slot = spare orelse return;
+    if (slot.*) |*old| old.release();
+    slot.* = buf.retain();
+}
+
 fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.PackError || std.Io.Reader.Error || error{ EndOfStream, OutOfMemory })!?MessageWithBody {
     const meta_len_opt = try format.readMessageLength(self.reader);
     if (meta_len_opt == null) return null;
@@ -323,10 +358,11 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
         try self.reader.discardAll(body_len);
         body_shared = self.source.?.slice(start, start + body_len) catch return StreamError.InvalidBody;
     } else if (body_len > 0) {
-        var body_buf = try OwnedBuffer.initUninit(self.allocator, body_len);
+        var body_buf = try reuseOrAlloc(self.allocator, &self.spare_body, body_len);
         errdefer body_buf.deinit();
         try self.reader.readSliceAll(body_buf.data[0..body_len]);
         body_shared = try body_buf.toShared(body_len);
+        keepSpare(&self.spare_body, body_shared.?);
     }
     try format.skipPadding(self.reader, format.padLen(body_len));
 
@@ -942,6 +978,7 @@ pub fn buildRecordBatchFromMessageMetadata(
         body,
         dictionary_values,
         msg_t.version,
+        null,
     );
 }
 
@@ -1388,6 +1425,7 @@ fn buildRecordBatchFromFlatbuf(
     body: array_data.SharedBuffer,
     dictionary_values: *const std.AutoHashMap(i64, ArrayRef),
     metadata_version: fbs.MetadataVersion,
+    spare_decoded: ?*?array_data.SharedBuffer,
 ) (StreamError || array_data.ValidationError || record_batch.RecordBatchError || error{OutOfMemory})!RecordBatch {
     // schema_ref is already retained by the caller; track it so early‑error paths release it.
     var schema_taken = false;
@@ -1402,7 +1440,7 @@ fn buildRecordBatchFromFlatbuf(
         allocator.free(columns);
     }
 
-    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body);
+    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, spare_decoded);
     defer decoded.deinit(allocator);
 
     var node_index: usize = 0;
@@ -1779,6 +1817,7 @@ fn decodeRecordBatchBody(
     allocator: std.mem.Allocator,
     record_batch_t: *fbs.RecordBatchT,
     body: array_data.SharedBuffer,
+    spare: ?*?array_data.SharedBuffer,
 ) (StreamError || error{OutOfMemory})!DecodedRecordBatchBody {
     if (record_batch_t.compression == null) {
         return .{
@@ -1800,7 +1839,7 @@ fn decodeRecordBatchBody(
     const cursor = try layoutDecodedBody(record_batch_t.buffers.items, body, decoded_meta);
 
     // Pass 2: decompress each buffer straight into its slot (no staging buffers or copies).
-    var owned = try buffer.OwnedBuffer.initUninit(allocator, cursor);
+    var owned = try reuseOrAlloc(allocator, spare, cursor);
     errdefer owned.deinit();
     for (record_batch_t.buffers.items, decoded_meta) |meta, out| {
         const dst_len: usize = @intCast(out.length);
@@ -1818,8 +1857,10 @@ fn decodeRecordBatchBody(
         }
     }
 
+    const decoded_body = try owned.toShared(cursor);
+    keepSpare(spare, decoded_body);
     return .{
-        .body = try owned.toShared(cursor),
+        .body = decoded_body,
         .buffers_meta = decoded_meta,
         .owned_body = true,
         .owned_meta = true,
@@ -1963,7 +2004,7 @@ fn ingestDictionaryBatchWithMap(
 ) (StreamError || array_data.ValidationError || error{OutOfMemory})!void {
     const record_batch_t = dictionary_batch_t.data orelse return StreamError.InvalidMetadata;
     const value_type = findDictionaryValueType(schema, dictionary_batch_t.id) orelse return StreamError.InvalidMetadata;
-    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body);
+    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, null);
     defer decoded.deinit(allocator);
 
     var node_index: usize = 0;
@@ -4239,7 +4280,7 @@ test "ipc reader decodes real lz4 frame payload for compressed record batch body
         .variadicBufferCounts = try std.ArrayList(i64).initCapacity(allocator, 0),
     };
 
-    var decoded = try decodeRecordBatchBody(allocator, rb, body);
+    var decoded = try decodeRecordBatchBody(allocator, rb, body, null);
     defer decoded.deinit(allocator);
     try std.testing.expect(decoded.body.len() >= raw.len);
     try std.testing.expectEqual(@as(i64, @intCast(raw.len)), decoded.buffers_meta[1].length);
@@ -5262,5 +5303,50 @@ fn appendSchemaMessageWithBodyAndEndianness(
 
     if (body_opt) |body| {
         try writer.writeAll(body);
+    }
+}
+
+test "stream reader reuses released bodies without touching a batch the caller still holds" {
+    const allocator = std.testing.allocator;
+    const id_type = DataType{ .int32 = {} };
+    const fields = [_]Field{.{ .name = "id", .data_type = &id_type, .nullable = false }};
+    const schema = Schema{ .fields = fields[0..] };
+
+    inline for (.{ false, true }) |compressed| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var writer = if (compressed) stream_writer.StreamWriter.initWithBodyCompression(allocator, &out.writer, .zstd) else stream_writer.StreamWriter.init(allocator, &out.writer);
+        defer writer.deinit();
+        try writer.writeSchema(schema);
+        for (0..3) |k| {
+            var b = try @import("../array/primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 64);
+            defer b.deinit();
+            for (0..64) |i| try b.append(@intCast(k * 1000 + i));
+            var col = try b.finish();
+            defer col.release();
+            var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{col});
+            defer batch.deinit();
+            try writer.writeRecordBatch(batch);
+        }
+        try writer.writeEnd();
+
+        var src: std.Io.Reader = .fixed(out.written());
+        var reader = StreamReader.init(allocator, &src);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        var held = (try reader.nextRecordBatch()).?; // kept across the next two reads
+        defer held.deinit();
+        var second = (try reader.nextRecordBatch()).?;
+        second.deinit(); // released: its body may be reused by the third read
+        var third = (try reader.nextRecordBatch()).?;
+        defer third.deinit();
+        try std.testing.expect((try reader.nextRecordBatch()) == null);
+        const P = @import("../array/primitive_array.zig").PrimitiveArray(i32);
+        const h = P{ .data = held.columns[0].data() };
+        const t = P{ .data = third.columns[0].data() };
+        for (0..64) |i| {
+            try std.testing.expectEqual(@as(i32, @intCast(i)), try h.value(i));
+            try std.testing.expectEqual(@as(i32, @intCast(2000 + i)), try t.value(i));
+        }
     }
 }

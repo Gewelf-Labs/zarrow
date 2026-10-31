@@ -182,14 +182,11 @@ pub fn copyBits(dst: []u8, dst_off: usize, src: []const u8, src_off: usize, len:
     const full = (end - d) >> 3;
     if (full > 0) {
         const di = d >> 3;
-        const si = s >> 3;
-        const shift: u3 = @intCast(s & 7);
-        if (shift == 0) {
-            @memcpy(dst[di..][0..full], src[si..][0..full]);
+        if ((s & 7) == 0 and full >= 64) {
+            @memcpy(dst[di..][0..full], src[s >> 3 ..][0..full]);
         } else {
-            // Bits s .. s+8*full-1 are in range, so src[si + k + 1] is always readable here.
-            const back: u3 = @intCast(8 - @as(u4, shift));
-            for (0..full) |k| dst[di + k] = (src[si + k] >> shift) | (src[si + k + 1] << back);
+            // Short runs (e.g. 16-row chunks in N-ary concat) stay inline: no memcpy call per part.
+            for (0..full) |k| dst[di + k] = byteAtBit(src, s + k * 8);
         }
         d += full * 8;
         s += full * 8;
@@ -198,6 +195,15 @@ pub fn copyBits(dst: []u8, dst_off: usize, src: []const u8, src_off: usize, len:
         d += 1;
         s += 1;
     }) writeBit(dst, d, bitIsSet(src, s));
+}
+
+/// 8 bits of `bytes` starting at bit `bit` (bits past the end of `bytes` read as 0).
+pub fn byteAtBit(bytes: []const u8, bit: usize) u8 {
+    const i = bit >> 3;
+    const sh: u3 = @intCast(bit & 7);
+    const lo = bytes[i] >> sh;
+    if (sh == 0 or i + 1 >= bytes.len) return lo;
+    return lo | (bytes[i + 1] << @intCast(8 - @as(u4, sh)));
 }
 
 // Set bits [off, off + len) of `dst` to 1.

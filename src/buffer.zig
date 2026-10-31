@@ -113,6 +113,18 @@ pub const SharedBuffer = struct {
         return self.data.len == 0;
     }
 
+    /// Turns the last handle to an `OwnedBuffer` allocation back into a writable `OwnedBuffer`
+    /// (full capacity, contents unspecified) and empties this handle. Returns null, leaving the
+    /// handle untouched, when other handles exist or the memory is not OwnedBuffer-allocated.
+    /// Like arrow-rs `Buffer::into_mutable`.
+    pub fn reclaim(self: *Self) ?OwnedBuffer {
+        const storage = self.storage orelse return null;
+        if (storage.release_fn != &BufferStorage.releaseDefault) return null;
+        if (storage.ref_count.load(.acquire) != 1) return null;
+        self.* = empty;
+        return .{ .data = @alignCast(storage.data[ALIGNMENT..]), .allocator = storage.allocator };
+    }
+
     /// Create a logical slice view over the current value.
     pub fn slice(self: Self, start: usize, end: usize) Error!Self {
         if (start > end or end > self.data.len) {
@@ -358,6 +370,20 @@ test "shared buffer typedSlice returns error on invalid byte length" {
     defer shared.release();
 
     try std.testing.expectError(SharedBuffer.Error.LengthNotMultipleOfTypeSize, shared.typedSlice(u16));
+}
+
+test "shared buffer reclaim returns the allocation only to the last handle" {
+    var owned = try OwnedBuffer.init(std.testing.allocator, 100);
+    owned.data[0] = 7;
+    var a = try owned.toShared(100);
+    var b = a.retain();
+    try std.testing.expect(a.reclaim() == null); // b still holds it
+    b.release();
+    var back = a.reclaim().?;
+    defer back.deinit();
+    try std.testing.expect(a.storage == null and back.len() >= 100 and back.data[0] == 7);
+    var borrowed = SharedBuffer.fromSlice("x");
+    try std.testing.expect(borrowed.reclaim() == null);
 }
 
 test "alignedSize demo values" {
