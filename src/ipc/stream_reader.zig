@@ -142,7 +142,7 @@ pub const StreamReader = struct {
     /// Batches keep `source` alive through its ref count; `source` must be owning
     /// (`storage != null`) for column buffers to be zero-copy.
     pub fn initZeroCopy(allocator: std.mem.Allocator, reader: *std.Io.Reader, source: array_data.SharedBuffer) Self {
-        std.debug.assert(reader.buffer.ptr == source.data.ptr and reader.seek == 0);
+        std.debug.assert(reader.buffer.ptr == source.data.ptr);
         var self = init(allocator, reader);
         self.source = source.retain();
         return self;
@@ -317,7 +317,8 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
 
     var body_shared: ?array_data.SharedBuffer = null;
     const body_len = std.math.cast(usize, envelope.body_length) orelse return StreamError.InvalidBody;
-    if (body_len > 0 and self.source != null) {
+    // Zero-copy only when the reader really is a fixed reader over `source` (release-safe check).
+    if (body_len > 0 and self.source != null and self.reader.buffer.ptr == self.source.?.data.ptr) {
         const start = self.reader.seek;
         try self.reader.discardAll(body_len);
         body_shared = self.source.?.slice(start, start + body_len) catch return StreamError.InvalidBody;
@@ -1254,7 +1255,7 @@ fn buildRecordBatchFromFlatbuf(
     if (variadic_index != record_batch_t.variadicBufferCounts.items.len) return StreamError.InvalidMetadata;
 
     const batch = try RecordBatch.initPrevalidated(allocator, mut_ref, columns);
-    // RecordBatch.init succeeded and owns mut_ref now; cancel the schema errdefer.
+    // RecordBatch.initPrevalidated succeeded and owns mut_ref now; cancel the schema errdefer.
     schema_taken = true;
     // Release the temporary column refs — batch has its own retains.
     var i: usize = 0;

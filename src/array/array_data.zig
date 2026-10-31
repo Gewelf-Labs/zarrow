@@ -377,9 +377,11 @@ pub const ArrayData = struct {
         }
     }
 
-    fn childCoversRange(child_data: *const ArrayData, end: usize) ValidationError!void {
-        const child_total = std.math.add(usize, child_data.offset, child_data.length) catch return error.InvalidChildren;
-        if (child_total < end) return error.InvalidChildren;
+    /// A struct child is either row-aligned with the parent (same length, as produced by
+    /// `ArrayRef.slice`) or in parent coordinates, where it must reach `end = offset + length`.
+    fn childCoversRange(child_data: *const ArrayData, parent_len: usize, end: usize) ValidationError!void {
+        if (child_data.length == parent_len) return;
+        if (child_data.length < end) return error.InvalidChildren;
     }
 
     fn validateStructChildren(self: Self, fields: []const datatype.Field, end: usize) ValidationError!void {
@@ -387,7 +389,7 @@ pub const ArrayData = struct {
         for (fields, 0..) |field, i| {
             const child_data = self.children[i].data();
             if (!child_data.data_type.eql(field.data_type.*)) return error.InvalidChildren;
-            try childCoversRange(child_data, end);
+            try childCoversRange(child_data, self.length, end);
         }
     }
 
@@ -573,7 +575,7 @@ pub const ArrayData = struct {
                 };
                 if (self.children.len != expected) return error.InvalidChildren;
                 // Struct children must cover the parent window (types are checked by validateFull).
-                if (dt == .struct_) for (self.children) |child| try childCoversRange(child.data(), total_len);
+                if (dt == .struct_) for (self.children) |child| try childCoversRange(child.data(), self.length, total_len);
                 if (dt == .fixed_size_list) {
                     const list_size = std.math.cast(usize, dt.fixed_size_list.list_size) orelse return error.InvalidChildren;
                     const required = std.math.mul(usize, total_len, list_size) catch return error.InvalidChildren;
@@ -1640,4 +1642,60 @@ test "array data validateLayout rejects string_view with mismatched prefix" {
         },
     };
     try std.testing.expectError(error.InvalidOffsets, data.validateLayout());
+}
+
+test "array data validateLayout rejects struct child that does not cover the parent window" {
+    const allocator = std.testing.allocator;
+    const value_type = DataType{ .int32 = {} };
+    const fields = &[_]datatype.Field{.{ .name = "x", .data_type = &value_type, .nullable = true }};
+
+    var child_values: [4 * @sizeOf(i32)]u8 align(buffer.ALIGNMENT) = undefined;
+    @memset(child_values[0..], 0);
+    // Child in parent coordinates with only 3 logical rows; parent needs rows [5, 10).
+    const short_child = ArrayData{
+        .data_type = value_type,
+        .length = 3,
+        .offset = 1,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(child_values[0..]) },
+    };
+    var short_ref = try ArrayRef.fromBorrowed(allocator, short_child);
+    defer short_ref.release();
+    const short_children = &[_]ArrayRef{short_ref.retain()};
+    defer {
+        var owned = short_children[0];
+        owned.release();
+    }
+    const too_short = ArrayData{
+        .data_type = DataType{ .struct_ = .{ .fields = fields } },
+        .length = 5,
+        .offset = 5,
+        .buffers = &[_]SharedBuffer{SharedBuffer.empty},
+        .children = short_children,
+    };
+    try std.testing.expectError(error.InvalidChildren, too_short.validateLayout());
+
+    // Row-aligned child (same length as the parent) is valid regardless of offsets.
+    const aligned_child = ArrayData{
+        .data_type = value_type,
+        .length = 2,
+        .offset = 2,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(child_values[0..]) },
+    };
+    var aligned_ref = try ArrayRef.fromBorrowed(allocator, aligned_child);
+    defer aligned_ref.release();
+    const aligned_children = &[_]ArrayRef{aligned_ref.retain()};
+    defer {
+        var owned = aligned_children[0];
+        owned.release();
+    }
+    const aligned = ArrayData{
+        .data_type = DataType{ .struct_ = .{ .fields = fields } },
+        .length = 2,
+        .offset = 5,
+        .buffers = &[_]SharedBuffer{SharedBuffer.empty},
+        .children = aligned_children,
+    };
+    try aligned.validateLayout();
 }

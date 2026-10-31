@@ -1224,17 +1224,28 @@ test "struct builder finishFromChildrenClear does not partially recycle on child
 
 test "struct slice of a slice keeps child rows aligned" {
     const allocator = std.testing.allocator;
-    var ib = try @import("primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 10);
+    var ib = try @import("primitive_array.zig").PrimitiveBuilder(i32, DataType{ .int32 = {} }).init(allocator, 12);
     defer ib.deinit();
-    for (0..10) |i| try ib.append(@intCast(i));
-    var child = try ib.finish();
+    for (0..12) |i| try ib.append(@intCast(i));
+    var child_full = try ib.finish();
+    defer child_full.release();
+    // Child already carries its own offset (rows 2..11) before the struct is sliced,
+    // like an imported array; the builder would reject this, so assemble the struct by hand.
+    var child = try child_full.slice(2, 10);
     defer child.release();
     const value_type = DataType{ .int32 = {} };
     const fields = [_]datatype.Field{.{ .name = "a", .data_type = &value_type, .nullable = true }};
-    var sb = StructBuilder.init(allocator, fields[0..]);
-    defer sb.deinit();
-    for (0..10) |_| try sb.appendValid();
-    var s = try sb.finish(&[_]ArrayRef{child});
+    const children = &[_]ArrayRef{child.retain()};
+    defer {
+        var owned = children[0];
+        owned.release();
+    }
+    var s = try ArrayRef.fromBorrowed(allocator, .{
+        .data_type = DataType{ .struct_ = .{ .fields = fields[0..] } },
+        .length = 10,
+        .buffers = &[_]SharedBuffer{SharedBuffer.empty},
+        .children = children,
+    });
     defer s.release();
     var s1 = try s.slice(4, 6);
     defer s1.release();
@@ -1244,7 +1255,7 @@ test "struct slice of a slice keeps child rows aligned" {
     var f = try sa.field(0);
     defer f.release();
     const pa = @import("primitive_array.zig").PrimitiveArray(i32){ .data = f.data() };
-    try std.testing.expectEqual(@as(i32, 6), try pa.value(0));
+    try std.testing.expectEqual(@as(i32, 8), try pa.value(0));
 }
 
 test "builder drops validity after finishReset" {
