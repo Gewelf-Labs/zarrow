@@ -168,8 +168,14 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
 
         /// Finalize output and then reset builder state for reuse.
         pub fn finishReset(self: *Self) !ArrayRef {
+            const finished_len = self.len;
             const finished_ref = try self.finish();
             try self.reset();
+            // Batches built in a loop are usually the same size: start the next one at that capacity
+            // (one allocation instead of ~log2(len) regrowths). On OOM it just grows lazily.
+            if (finished_len > 0) {
+                if (OwnedBuffer.init(self.allocator, finished_len * @sizeOf(T))) |buf| self.values = buf else |_| {}
+            }
             return finished_ref;
         }
     };

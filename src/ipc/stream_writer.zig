@@ -1231,16 +1231,13 @@ fn applyBodyCompression(
             continue;
         }
 
-        const compressed_payload = try compressBodyBufferPayload(allocator, codec, src.data);
-        defer allocator.free(compressed_payload);
-        const encoded_len = std.math.add(usize, 8, compressed_payload.len) catch return StreamError.InvalidMetadata;
-        var encoded = try buffer.OwnedBuffer.init(allocator, encoded_len);
+        // Compress straight into the final buffer behind its 8-byte length prefix: no staging
+        // allocation, no realloc, no copy. Pages past the compressed size are never touched.
+        const capacity = std.math.add(usize, 8, try compressBound(codec, src.len())) catch return StreamError.InvalidMetadata;
+        var encoded = try buffer.OwnedBuffer.initUninit(allocator, capacity);
         errdefer encoded.deinit();
-
-        var header: [8]u8 = undefined;
-        std.mem.writeInt(i64, &header, try castI64Metadata(src.len()), .little);
-        @memcpy(encoded.data[0..8], header[0..]);
-        @memcpy(encoded.data[8..encoded_len], compressed_payload);
+        std.mem.writeInt(i64, encoded.data[0..8], try castI64Metadata(src.len()), .little);
+        const encoded_len = 8 + try compressInto(codec, encoded.data[8..capacity], src.data);
 
         const shared = try encoded.toShared(encoded_len);
         try body_buffers.append(allocator, shared);
@@ -1264,61 +1261,40 @@ fn applyBodyCompression(
     return compression_ptr;
 }
 
-fn compressBodyBufferPayload(
-    allocator: std.mem.Allocator,
-    codec: BodyCompressionCodec,
-    input: []const u8,
-) (WriterError || error{OutOfMemory})![]u8 {
-    return switch (codec) {
-        .zstd => try compressZstdPayload(allocator, input),
-        .lz4_frame => try compressLz4FramePayload(allocator, input),
+/// Worst-case compressed size of `len` input bytes for `codec`.
+fn compressBound(codec: BodyCompressionCodec, len: usize) WriterError!usize {
+    const bound = switch (codec) {
+        .zstd => (compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType).*.compress_bound(len),
+        .lz4_frame => blk: {
+            const syms = compression_dynlib.loadLz4Symbols() catch return StreamError.UnsupportedType;
+            const n = syms.*.compress_frame_bound(len, null);
+            if (syms.*.is_error(n) != 0) return StreamError.InvalidMetadata;
+            break :blk n;
+        },
     };
-}
-
-fn compressZstdPayload(
-    allocator: std.mem.Allocator,
-    input: []const u8,
-) (WriterError || error{OutOfMemory})![]u8 {
-    const syms = compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType;
-
-    const bound = syms.*.compress_bound(input.len);
     if (bound == 0) return StreamError.InvalidMetadata;
-    const out = try allocator.alloc(u8, bound);
-    errdefer allocator.free(out);
-
-    const written = syms.*.compress(
-        @ptrCast(out.ptr),
-        out.len,
-        if (input.len == 0) null else @ptrCast(input.ptr),
-        input.len,
-        1,
-    );
-    if (syms.*.is_error(written) != 0) return StreamError.InvalidMetadata;
-    if (written == 0 or written > out.len) return StreamError.InvalidMetadata;
-    return try allocator.realloc(out, written);
+    return bound;
 }
 
-fn compressLz4FramePayload(
-    allocator: std.mem.Allocator,
-    input: []const u8,
-) (WriterError || error{OutOfMemory})![]u8 {
-    const syms = compression_dynlib.loadLz4Symbols() catch return StreamError.UnsupportedType;
-
-    const bound = syms.*.compress_frame_bound(input.len, null);
-    if (bound == 0 or syms.*.is_error(bound) != 0) return StreamError.InvalidMetadata;
-    const out = try allocator.alloc(u8, bound);
-    errdefer allocator.free(out);
-
-    const written = syms.*.compress_frame(
-        @ptrCast(out.ptr),
-        out.len,
-        if (input.len == 0) null else @ptrCast(input.ptr),
-        input.len,
-        null,
-    );
-    if (syms.*.is_error(written) != 0) return StreamError.InvalidMetadata;
+/// Compresses `input` into `out` (sized by `compressBound`) and returns the bytes written.
+fn compressInto(codec: BodyCompressionCodec, out: []u8, input: []const u8) WriterError!usize {
+    const in_ptr: ?*const anyopaque = if (input.len == 0) null else @ptrCast(input.ptr);
+    const written = switch (codec) {
+        .zstd => blk: {
+            const syms = compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType;
+            const n = syms.*.compress(@ptrCast(out.ptr), out.len, in_ptr, input.len, 1);
+            if (syms.*.is_error(n) != 0) return StreamError.InvalidMetadata;
+            break :blk n;
+        },
+        .lz4_frame => blk: {
+            const syms = compression_dynlib.loadLz4Symbols() catch return StreamError.UnsupportedType;
+            const n = syms.*.compress_frame(@ptrCast(out.ptr), out.len, in_ptr, input.len, null);
+            if (syms.*.is_error(n) != 0) return StreamError.InvalidMetadata;
+            break :blk n;
+        },
+    };
     if (written == 0 or written > out.len) return StreamError.InvalidMetadata;
-    return try allocator.realloc(out, written);
+    return written;
 }
 
 fn computeNullCount(data: *const ArrayData) usize {

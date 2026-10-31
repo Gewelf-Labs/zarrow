@@ -215,19 +215,31 @@ pub const ArrayData = struct {
         };
     }
 
+    /// True when `xs[k] <= xs[k + 1]` for every k. No early exit, so the compare-and-OR loop
+    /// vectorizes; a hostile buffer costs the same as a valid one.
+    fn isNonDecreasing(comptime T: type, xs: []const T) bool {
+        if (xs.len < 2) return true;
+        const L = 16;
+        var bad: @Vector(L, u1) = @splat(0);
+        var i: usize = 0;
+        while (i + L < xs.len) : (i += L) {
+            const a: @Vector(L, T) = xs[i..][0..L].*;
+            const b: @Vector(L, T) = xs[i + 1 ..][0..L].*;
+            bad |= @intFromBool(b < a);
+        }
+        var tail: u1 = 0;
+        while (i + 1 < xs.len) : (i += 1) tail |= @intFromBool(xs[i + 1] < xs[i]);
+        return @reduce(.Or, bad) == 0 and tail == 0;
+    }
+
     fn validateOffsetsI32(offsets: []const i32, start: usize, total_len: usize, data_len: usize) ValidationError!void {
         const needed_len = std.math.add(usize, total_len, 1) catch return error.InvalidOffsets;
         if (offsets.len < needed_len) return error.BufferTooSmall;
-        var prev: i32 = offsets[start];
-        if (prev < 0) return error.InvalidOffsets;
-        var i: usize = start + 1;
-        while (i < needed_len) : (i += 1) {
-            const cur = offsets[i];
-            if (cur < prev or cur < 0) return error.InvalidOffsets;
-            prev = cur;
-        }
-        const prev_usize = std.math.cast(usize, prev) orelse return error.InvalidOffsets;
-        if (prev_usize > data_len) return error.InvalidOffsets;
+        // Non-decreasing from a non-negative first offset implies every offset is >= 0.
+        if (offsets[start] < 0) return error.InvalidOffsets;
+        if (!isNonDecreasing(i32, offsets[start..needed_len])) return error.InvalidOffsets;
+        const last = std.math.cast(usize, offsets[needed_len - 1]) orelse return error.InvalidOffsets;
+        if (last > data_len) return error.InvalidOffsets;
     }
 
     // ListView offsets/sizes are per-element views into the child array.
@@ -249,16 +261,11 @@ pub const ArrayData = struct {
     fn validateOffsetsI64(offsets: []const i64, start: usize, total_len: usize, data_len: usize) ValidationError!void {
         const needed_len = std.math.add(usize, total_len, 1) catch return error.InvalidOffsets;
         if (offsets.len < needed_len) return error.BufferTooSmall;
-        var prev: i64 = offsets[start];
-        if (prev < 0) return error.InvalidOffsets;
-        var i: usize = start + 1;
-        while (i < needed_len) : (i += 1) {
-            const cur = offsets[i];
-            if (cur < prev or cur < 0) return error.InvalidOffsets;
-            prev = cur;
-        }
-        const prev_usize = std.math.cast(usize, prev) orelse return error.InvalidOffsets;
-        if (prev_usize > data_len) return error.InvalidOffsets;
+        // Non-decreasing from a non-negative first offset implies every offset is >= 0.
+        if (offsets[start] < 0) return error.InvalidOffsets;
+        if (!isNonDecreasing(i64, offsets[start..needed_len])) return error.InvalidOffsets;
+        const last = std.math.cast(usize, offsets[needed_len - 1]) orelse return error.InvalidOffsets;
+        if (last > data_len) return error.InvalidOffsets;
     }
 
     fn readU32Le(bytes: []const u8) u32 {
@@ -1698,4 +1705,20 @@ test "array data validateLayout rejects struct child that does not cover the par
         .children = aligned_children,
     };
     try aligned.validateLayout();
+}
+
+test "array data validateLayout finds a decreasing offset in the vector body and the tail" {
+    var offsets: [41]i32 = undefined;
+    for (&offsets, 0..) |*o, i| o.* = @intCast(i);
+    const bytes: [40]u8 = @splat('x');
+    const ok_bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(std.mem.sliceAsBytes(offsets[0..])), SharedBuffer.fromSlice(bytes[0..]) };
+    try (ArrayData{ .data_type = .{ .string = {} }, .length = 40, .null_count = 0, .buffers = ok_bufs[0..] }).validateLayout();
+    // Positions 5 and 20 fall in the 16-lane loop, 39 in the scalar tail.
+    for ([_]usize{ 5, 20, 39 }) |bad| {
+        var o = offsets;
+        o[bad] = o[bad - 1] - 1;
+        const bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(std.mem.sliceAsBytes(o[0..])), SharedBuffer.fromSlice(bytes[0..]) };
+        const data = ArrayData{ .data_type = .{ .string = {} }, .length = 40, .null_count = 0, .buffers = bufs[0..] };
+        try std.testing.expectError(error.InvalidOffsets, data.validateLayout());
+    }
 }
