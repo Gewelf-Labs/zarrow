@@ -80,6 +80,7 @@ const countLifecycleDeinit = common.countLifecycleDeinit;
 const makeInt32Array = common.makeInt32Array;
 const makeBoolArray = common.makeBoolArray;
 const collectInt32ValuesFromDatum = common.collectInt32ValuesFromDatum;
+const datumTakeNullable = @import("core.zig").datumTakeNullable;
 
 test "compute datum chunked variant retain and release" {
     const allocator = std.testing.allocator;
@@ -546,6 +547,44 @@ test "compute datumTake keeps chunked output and matches array logical result on
     try std.testing.expectEqual(@as(?i32, 30), chunked_values[1]);
     try std.testing.expectEqual(@as(?i32, 50), chunked_values[2]);
     try std.testing.expectEqual(@as(?i32, 10), chunked_values[3]);
+}
+
+test "compute datumTake direct gather matches slice+concat path for int32 and bool" {
+    const allocator = std.testing.allocator;
+
+    // Array datums hit the direct gather kernel; single-chunk chunked datums use the existing slice+concat path.
+    var ints = try makeInt32Array(allocator, &[_]?i32{ 10, null, 30, 40, null, 60 });
+    defer ints.release();
+    var bools = try makeBoolArray(allocator, &[_]?bool{ true, null, false, true, true, null });
+    defer bools.release();
+    const indices = [_]?usize{ 5, 0, 3, 3, null, 1, 2, 0, 4 };
+
+    var int_chunked = try ChunkedArray.init(allocator, .{ .int32 = {} }, &[_]ArrayRef{ints});
+    defer int_chunked.release();
+    var int_fast = try datumTakeNullable(Datum.fromArray(ints), indices[0..]);
+    defer int_fast.release();
+    var int_slow = try datumTakeNullable(Datum.fromChunked(int_chunked), indices[0..]);
+    defer int_slow.release();
+    try std.testing.expect(int_fast.isArray());
+    try std.testing.expectEqual(@as(?usize, 3), int_fast.array.data().null_count);
+    const fast_values = try collectInt32ValuesFromDatum(allocator, int_fast);
+    defer allocator.free(fast_values);
+    const slow_values = try collectInt32ValuesFromDatum(allocator, int_slow);
+    defer allocator.free(slow_values);
+    try std.testing.expectEqualSlices(?i32, slow_values, fast_values);
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ 60, 10, 40, 40, null, null, 30, 10, null }, fast_values);
+
+    var bool_fast = try datumTakeNullable(Datum.fromArray(bools), indices[0..]);
+    defer bool_fast.release();
+    const fast_bools = array_mod.BooleanArray{ .data = bool_fast.array.data() };
+    const expected_bools = [_]?bool{ null, true, true, true, null, null, false, true, true };
+    for (expected_bools, 0..) |expected, i| {
+        try std.testing.expectEqual(expected == null, fast_bools.isNull(i));
+        if (expected) |e| try std.testing.expectEqual(e, try fast_bools.value(i));
+    }
+
+    // Out-of-range index is rejected, not read.
+    try std.testing.expectError(error.InvalidInput, datumTakeNullable(Datum.fromArray(ints), &[_]?usize{6}));
 }
 
 test "compute datumFilterSelectionIndices and datumFilterChunkAware stay consistent for array and chunked" {

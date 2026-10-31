@@ -19,20 +19,27 @@ pub inline fn alignedSize(size: usize) usize {
 }
 
 // Internal ref-counted storage backing shared buffers.
+// Lives in the first `ALIGNMENT` bytes of the allocation it describes, so
+// `OwnedBuffer.toShared` costs no extra allocation.
 const BufferStorage = struct {
     // Allocator used to create and free this storage.
     allocator: std.mem.Allocator,
-    // Aligned buffer bytes owned by this storage.
+    // Whole allocation: this header followed by the buffer bytes.
     data: []align(ALIGNMENT) u8,
     // Shared reference count for all SharedBuffer views.
     ref_count: std.atomic.Value(u32),
     // Custom release hook for external/FFI-managed memory.
     release_fn: *const fn (*BufferStorage) void,
 
-    // Default release: free the data and destroy the control block.
+    // Default release: free the allocation (which holds this header).
     fn releaseDefault(storage: *BufferStorage) void {
-        storage.allocator.free(storage.data);
-        storage.allocator.destroy(storage);
+        const allocator = storage.allocator;
+        const data = storage.data;
+        allocator.free(data);
+    }
+
+    comptime {
+        std.debug.assert(@sizeOf(BufferStorage) <= ALIGNMENT);
     }
 };
 
@@ -137,7 +144,8 @@ pub const SharedBuffer = struct {
 /// ownership to an immutable `SharedBuffer` — the `OwnedBuffer` is emptied in
 /// the process and must not be written to afterwards.
 pub const OwnedBuffer = struct {
-    /// Aligned mutable backing storage.
+    /// Aligned mutable backing storage; the `ALIGNMENT` bytes before it are
+    /// reserved for the `BufferStorage` header written by `toShared`.
     data: []align(ALIGNMENT) u8,
     /// Allocator used for all (re)allocations.
     allocator: std.mem.Allocator,
@@ -153,17 +161,24 @@ pub const OwnedBuffer = struct {
         // Ensure a minimum of ALIGNMENT bytes so the pointer is never null.
         const actualCapacity = alignedSize(if (capacity == 0) ALIGNMENT else capacity);
 
-        const data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, actualCapacity);
+        const raw_data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, ALIGNMENT + actualCapacity);
+        const data: []align(ALIGNMENT) u8 = @alignCast(raw_data[ALIGNMENT..]);
         // Zero-initialise the buffer so that uninitialised bytes are always valid to read.
         @memset(data, 0);
         return .{ .data = data, .allocator = allocator };
+    }
+
+    /// The whole allocation behind `data`: header slot followed by the bytes.
+    fn raw(self: Self) []align(ALIGNMENT) u8 {
+        return @alignCast((self.data.ptr - ALIGNMENT)[0 .. self.data.len + ALIGNMENT]);
     }
 
     /// Like `init`, but leaves `[0, capacity)` undefined; only the alignment padding is zeroed.
     /// For callers that immediately overwrite the bytes (e.g. `readSliceAll`).
     pub fn initUninit(allocator: std.mem.Allocator, capacity: usize) !Self {
         const actualCapacity = alignedSize(if (capacity == 0) ALIGNMENT else capacity);
-        const data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, actualCapacity);
+        const raw_data = try allocator.alignedAlloc(u8, ALIGNMENT_VALUE, ALIGNMENT + actualCapacity);
+        const data: []align(ALIGNMENT) u8 = @alignCast(raw_data[ALIGNMENT..]);
         @memset(data[capacity..], 0);
         return .{ .data = data, .allocator = allocator };
     }
@@ -171,7 +186,7 @@ pub const OwnedBuffer = struct {
     /// Release resources owned by this instance.
     pub fn deinit(self: *Self) void {
         if (self.data.len == 0) return;
-        self.allocator.free(self.data);
+        self.allocator.free(self.raw());
         self.data = empty_storage[0..];
     }
 
@@ -192,10 +207,10 @@ pub const OwnedBuffer = struct {
     /// the empty sentinel — any previously held pointer into `self.data` must
     /// not be dereferenced.
     pub fn toShared(self: *Self, used: usize) !SharedBuffer {
-        const storage = try self.allocator.create(BufferStorage);
+        const storage: *BufferStorage = @ptrCast(self.raw().ptr);
         storage.* = .{
             .allocator = self.allocator,
-            .data = self.data,
+            .data = self.raw(),
             .ref_count = std.atomic.Value(u32).init(1),
             .release_fn = BufferStorage.releaseDefault,
         };
@@ -221,9 +236,15 @@ pub const OwnedBuffer = struct {
     ///   allocating, so `self.data.len` may exceed `newSize` after the call.
     pub fn resize(self: *Self, newSize: usize) !void {
         const old_len = self.data.len;
+        // After `toShared`/`deinit` there is no allocation (and no header slot) to grow.
+        if (old_len == 0) {
+            self.* = try init(self.allocator, newSize);
+            return;
+        }
         // Grow geometrically so repeated appends are amortized O(1) for every builder.
         const actualSize = if (newSize > old_len) @max(alignedSize(newSize), old_len * 2) else alignedSize(newSize);
-        self.data = try self.allocator.realloc(self.data, actualSize);
+        const raw_data = try self.allocator.realloc(self.raw(), ALIGNMENT + actualSize);
+        self.data = @alignCast(raw_data[ALIGNMENT..]);
         if (actualSize > old_len) @memset(self.data[old_len..], 0);
     }
 };

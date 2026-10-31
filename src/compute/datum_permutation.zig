@@ -1,5 +1,7 @@
 const std = @import("std");
 const array_mod = @import("../array/array.zig");
+const bitmap = @import("../bitmap.zig");
+const buffer = @import("../buffer.zig");
 const chunked_array_mod = @import("../chunked_array.zig");
 const concat_array_refs = @import("../concat_array_refs.zig");
 const core = @import("core.zig");
@@ -194,6 +196,78 @@ fn datumTakeChunkedNullable(
     return Datum.fromChunked(out);
 }
 
+/// Direct gather for fixed-width and boolean arrays: the output buffers are
+/// allocated once and each index copies one value + one validity bit.
+/// Returns null for layouts it does not handle so callers fall back to slice+concat.
+fn takeFixedWidthArray(
+    allocator: std.mem.Allocator,
+    src: *const array_mod.ArrayData,
+    indices: []const ?usize,
+) KernelError!?ArrayRef {
+    const byte_width: usize = switch (src.data_type) {
+        .bool => 0,
+        .uint8, .int8 => 1,
+        .uint16, .int16, .half_float => 2,
+        .uint32, .int32, .float, .date32, .time32, .interval_months, .decimal32 => 4,
+        .uint64, .int64, .double, .date64, .time64, .timestamp, .duration, .interval_day_time, .decimal64 => 8,
+        .decimal128, .interval_month_day_nano => 16,
+        .decimal256 => 32,
+        else => return null,
+    };
+    if (src.buffers.len != 2) return null;
+    const is_bool = byte_width == 0;
+    const src_bytes = src.buffers[1].data;
+    const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    const src_need = if (is_bool) bitmap.byteLength(src_end) else std.math.mul(usize, src_end, byte_width) catch return error.Overflow;
+    if (src_bytes.len < src_need) return error.InvalidInput;
+    for (indices) |maybe| if (maybe) |idx| {
+        if (idx >= src.length) return error.InvalidInput;
+    };
+
+    const src_validity = src.validity();
+    const out_len = indices.len;
+    var values = buffer.OwnedBuffer.init(allocator, if (is_bool) bitmap.byteLength(out_len) else out_len * byte_width) catch return error.OutOfMemory;
+    errdefer values.deinit();
+    var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer validity.deinit();
+
+    var null_count: usize = 0;
+    for (indices, 0..) |maybe, i| {
+        const idx = maybe orelse {
+            null_count += 1;
+            continue;
+        };
+        const j = src.offset + idx;
+        if (src_validity) |v| if (!(v.isValid(j) catch unreachable)) {
+            null_count += 1;
+            continue;
+        };
+        bitmap.setBit(validity.data, i);
+        if (is_bool) {
+            if (bitmap.bitIsSet(src_bytes, j)) bitmap.setBit(values.data, i);
+        } else switch (byte_width) {
+            inline 1, 2, 4, 8, 16, 32 => |w| @memcpy(values.data[i * w ..][0..w], src_bytes[j * w ..][0..w]),
+            else => unreachable,
+        }
+    }
+
+    var buffers: [2]buffer.SharedBuffer = undefined;
+    buffers[0] = if (null_count == 0) blk: {
+        validity.deinit();
+        break :blk buffer.SharedBuffer.empty;
+    } else validity.toShared(bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer buffers[0].release();
+    buffers[1] = values.toShared(if (is_bool) bitmap.byteLength(out_len) else out_len * byte_width) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = null_count,
+        .buffers = buffers[0..],
+    }) catch return error.OutOfMemory;
+}
+
 fn datumTakeArrayLikeNullable(
     allocator: std.mem.Allocator,
     datum: Datum,
@@ -201,6 +275,9 @@ fn datumTakeArrayLikeNullable(
     indices: []const ?usize,
 ) KernelError!Datum {
     if (indices.len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
+    if (datum == .array) {
+        if (try takeFixedWidthArray(allocator, datum.array.data(), indices)) |out| return Datum.fromArray(out);
+    }
 
     var pieces: std.ArrayList(ArrayRef) = .empty;
     defer {
@@ -437,6 +514,11 @@ pub fn datumFilter(datum: Datum, predicate: Datum, options: FilterOptions) Kerne
     const out_type = datum.dataType();
 
     if (output_len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
+    if (datum == .array) {
+        const selections = try datumFilterSelectionIndices(allocator, predicate, output_len, options);
+        defer allocator.free(selections);
+        return datumTakeArrayLikeNullable(allocator, datum, out_type, selections);
+    }
 
     var pieces: std.ArrayList(ArrayRef) = .empty;
     defer {
