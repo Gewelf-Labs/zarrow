@@ -71,27 +71,16 @@ jobs:
       - name: Replay fuzz corpus seeds
         run: zig build fuzz-corpus
 
-      - name: Random fuzz smoke for ArrayData.validateLayout
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .fuzz-smoke
-          for i in $(seq 1 30); do
-            size=$(( (RANDOM % 512) + 1 ))
-            head -c "$size" /dev/urandom > .fuzz-smoke/layout.bin
-            zig build fuzz-array-layout -- .fuzz-smoke/layout.bin
-          done
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
 
-      - name: Random fuzz smoke for IPC reader
-        shell: bash
+      - name: Mutation smoke (20 s per target)
         run: |
-          set -euo pipefail
-          mkdir -p .fuzz-smoke
-          for i in $(seq 1 30); do
-            size=$(( (RANDOM % 4096) + 1 ))
-            head -c "$size" /dev/urandom > .fuzz-smoke/ipc.bin
-            zig build fuzz-ipc-reader -- .fuzz-smoke/ipc.bin
-          done
+          python tools/fuzz.py --out .fuzz-smoke run --targets all --seconds 20 --chunk 20
+          python tools/fuzz_triage.py .fuzz-smoke
+          test -z "$(ls .fuzz-smoke/*/index.json 2>/dev/null)"
 
   test:
     name: Test on ${{ matrix.os }} with Zig ${{ matrix.zig }}

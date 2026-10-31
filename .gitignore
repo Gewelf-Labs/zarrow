@@ -4,6 +4,8 @@
 /zig-out/
 /.venv*/
 /tools/__pycache__/
+/.fuzz-out/
+/.fuzz-smoke/
 
 # Native build artifacts
 *.o

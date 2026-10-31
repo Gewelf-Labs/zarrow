@@ -4,15 +4,23 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Mutation-loop seconds per target"
+        default: "600"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  random-fuzz:
-    name: Random Fuzz (nightly)
+  campaign:
+    name: Fuzz ${{ matrix.target }} (nightly)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ipc-stream, ipc-stream-zero-copy, ipc-file, array-layout, compute, c-abi]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -22,27 +30,47 @@ jobs:
         with:
           version: "0.17.0"
 
-      - name: Replay known seed corpus first
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Replay committed corpus
         run: zig build fuzz-corpus
 
-      - name: Random fuzz for ArrayData.validateLayout
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .fuzz-random
-          for i in $(seq 1 200); do
-            size=$(( (RANDOM % 512) + 1 ))
-            head -c "$size" /dev/urandom > .fuzz-random/layout.bin
-            zig build fuzz-array-layout -- .fuzz-random/layout.bin
-          done
+      # ReleaseSafe keeps every safety check (our sanitizer) at several times Debug's speed.
+      - name: Mutation campaign
+        run: python tools/fuzz.py --optimize ReleaseSafe --out .fuzz-out run --targets ${{ matrix.target }} --seconds ${{ inputs.seconds || '600' }}
 
-      - name: Random fuzz for IPC reader
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .fuzz-random
-          for i in $(seq 1 200); do
-            size=$(( (RANDOM % 4096) + 1 ))
-            head -c "$size" /dev/urandom > .fuzz-random/ipc.bin
-            zig build fuzz-ipc-reader -- .fuzz-random/ipc.bin
-          done
+      - name: Triage report
+        if: always()
+        run: python tools/fuzz_triage.py .fuzz-out | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload findings and corpus growth
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: .fuzz-out/${{ matrix.target }}
+          if-no-files-found: ignore
+
+      - name: Fail on findings
+        run: test ! -e .fuzz-out/${{ matrix.target }}/index.json
+
+  coverage-guided:
+    name: std.testing.fuzz (coverage-guided, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Zig's built-in fuzzer is young: informational until it has run green for a while.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.0"
+
+      - name: Fuzz every target (iteration-limited, headless)
+        run: zig build fuzz-test --fuzz=2M

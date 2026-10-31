@@ -137,70 +137,56 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run zarrow unit tests");
     test_step.dependOn(&run_tests.step);
 
-    // Fuzz harnesses for parser/layout robustness.
-    const fuzz_layout_exe = b.addExecutable(.{
-        .name = "fuzz-array-validate-layout",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/fuzz_array_validate_layout.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    // Fuzzing (docs/fuzzing.md): one harness exe for every target, plus std.testing.fuzz tests.
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("fuzz/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    configureIpcCompression(b, fuzz_layout_exe, &run_compression_deps_check.step);
-    fuzz_layout_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
-
-    const run_fuzz_layout = b.addRunArtifact(fuzz_layout_exe);
-    addPassthru(run_fuzz_layout);
-    const fuzz_layout_step = b.step("fuzz-array-layout", "Run ArrayData.validateLayout fuzz harness");
-    fuzz_layout_step.dependOn(&run_fuzz_layout.step);
-
-    const fuzz_ipc_exe = b.addExecutable(.{
-        .name = "fuzz-ipc-reader",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/fuzz_ipc_reader.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    fuzz_module.addImport("zarrow", zarrow_module);
+    // zstd/lz4 in their own library: a `--fuzz` rebuild would instrument the C sources with
+    // sanitizer-coverage calls that Zig's fuzzer runtime does not provide.
+    const fuzz_codecs = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zarrow-fuzz-codecs",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
     });
-    configureIpcCompression(b, fuzz_ipc_exe, &run_compression_deps_check.step);
-    fuzz_ipc_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
+    configureIpcCompression(b, fuzz_codecs, &run_compression_deps_check.step);
+    fuzz_module.linkLibrary(fuzz_codecs);
+    fuzz_module.link_libc = true;
+    const fuzz_exe = b.addExecutable(.{ .name = "zarrow-fuzz", .root_module = fuzz_module });
 
-    const run_fuzz_ipc = b.addRunArtifact(fuzz_ipc_exe);
-    addPassthru(run_fuzz_ipc);
-    const fuzz_ipc_step = b.step("fuzz-ipc-reader", "Run IPC reader fuzz harness");
-    fuzz_ipc_step.dependOn(&run_fuzz_ipc.step);
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    addPassthru(run_fuzz);
+    b.step("fuzz", "Fuzz harness: zig build fuzz -- <target> replay|run ...").dependOn(&run_fuzz.step);
+    b.step("fuzz-install", "Install the fuzz harness (zig-out/bin/zarrow-fuzz) for tools/fuzz.py").dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
 
-    const fuzz_corpus_step = b.step("fuzz-corpus", "Replay built-in fuzz seed corpus");
-    dependOnDir(b, "fuzz/corpus/array-validate-layout");
-    dependOnDir(b, "fuzz/corpus/ipc-reader");
+    const run_gen_seeds = b.addRunArtifact(fuzz_exe);
+    run_gen_seeds.addArg("gen-seeds");
+    run_gen_seeds.addDirectoryArg(b.path("fuzz/corpus"));
+    b.step("fuzz-gen-seeds", "Re-encode fuzz/corpus/ipc-stream with zarrow writers into gen-* seeds").dependOn(&run_gen_seeds.step);
 
-    var corpus_layout_dir = openBuildDir(b, "fuzz/corpus/array-validate-layout") catch null;
-    if (corpus_layout_dir) |*dir_handle| {
-        defer dir_handle.close(io);
-        var it_corpus_layout = dir_handle.iterate();
-        while (it_corpus_layout.next(io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            const run_one = b.addRunArtifact(fuzz_layout_exe);
-            run_one.addFileArg(b.path(b.fmt("fuzz/corpus/array-validate-layout/{s}", .{entry.name})));
-            fuzz_corpus_step.dependOn(&run_one.step);
-        }
-    } else {
-        std.debug.print("warning: fuzz corpus missing: fuzz/corpus/array-validate-layout\n", .{});
+    const fuzz_corpus_step = b.step("fuzz-corpus", "Replay the committed fuzz corpus through every target");
+    const corpus_dirs = [_][2][]const u8{
+        .{ "ipc-stream", "ipc-stream" },
+        .{ "ipc-stream-zero-copy", "ipc-stream" },
+        .{ "compute", "ipc-stream" },
+        .{ "ipc-file", "ipc-file" },
+        .{ "array-layout", "array-layout" },
+        .{ "c-abi", "c-abi" },
+    };
+    for (corpus_dirs) |entry| {
+        const run_replay = b.addRunArtifact(fuzz_exe);
+        run_replay.addArgs(&.{ entry[0], "replay" });
+        run_replay.addDirectoryArg(b.path(b.fmt("fuzz/corpus/{s}", .{entry[1]})));
+        fuzz_corpus_step.dependOn(&run_replay.step);
     }
 
-    var corpus_ipc_dir = openBuildDir(b, "fuzz/corpus/ipc-reader") catch null;
-    if (corpus_ipc_dir) |*dir_handle| {
-        defer dir_handle.close(io);
-        var it_corpus_ipc = dir_handle.iterate();
-        while (it_corpus_ipc.next(io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            const run_one = b.addRunArtifact(fuzz_ipc_exe);
-            run_one.addFileArg(b.path(b.fmt("fuzz/corpus/ipc-reader/{s}", .{entry.name})));
-            fuzz_corpus_step.dependOn(&run_one.step);
-        }
-    } else {
-        std.debug.print("warning: fuzz corpus missing: fuzz/corpus/ipc-reader\n", .{});
-    }
+    // `zig build fuzz-test --fuzz=100K` runs the coverage-guided engine (Linux); `test` runs them once.
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_module });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    b.step("fuzz-test", "std.testing.fuzz targets (add --fuzz=N on Linux)").dependOn(&run_fuzz_tests.step);
+    test_step.dependOn(&run_fuzz_tests.step);
 
     var run_default: ?*std.Build.Step = null;
     var run_all_step = b.step("examples", "Run all examples");

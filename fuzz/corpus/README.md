@@ -1,34 +1,22 @@
 # Fuzz Corpus
 
-This directory stores seed inputs used by CI and local fuzz replay.
+Seeds replayed by `zig build fuzz-corpus` (CI, every PR) and loaded by every fuzz campaign.
+See [docs/fuzzing.md](../../docs/fuzzing.md).
 
-## Layout
+| Dir | Targets |
+|---|---|
+| `ipc-stream/` | `ipc-stream`, `ipc-stream-zero-copy`, `compute` |
+| `ipc-file/` | `ipc-file` |
+| `array-layout/` | `array-layout` |
+| `c-abi/` | `c-abi` |
 
-- `array-validate-layout/`: seeds for `zig build fuzz-array-layout`
-- `ipc-reader/`: seeds for `zig build fuzz-ipc-reader`
+File names:
 
-## Why commit these files
+- `at-*`: copied from apache/arrow-testing (Apache-2.0, see `NOTICE` in each dir) by
+  `tools/fuzz_import_seeds.py`.
+- `gen-*`: written by `zig build fuzz-gen-seeds` (zarrow writers, plain / lz4 / zstd).
+- `regress-<hash>.bin`: reproducers of fixed fuzz findings; they must keep returning an error
+  (or decoding) without a crash, leak or allocation blow-up.
+- anything else: small hand-made seeds.
 
-- Reproducibility: any crash found in CI/nightly can be replayed locally.
-- Regression protection: `zig build fuzz-corpus` runs in PR/Push CI.
-- Fast signal: seed replay is deterministic and much faster than long random fuzzing.
-
-## How to run
-
-- Replay all seeds: `zig build fuzz-corpus`
-- Single harness: `zig build fuzz-array-layout -- <seed.bin>`
-- Single harness: `zig build fuzz-ipc-reader -- <seed.bin>`
-
-## Seed conventions
-
-Prefer small, focused files. Use descriptive names such as:
-
-- `malformed_eos.bin`
-- `negative_length_like.bin`
-- `oob_offset_like.bin`
-
-When a new crash is found:
-
-1. Minimize the input.
-2. Add it under the corresponding subdirectory.
-3. Use a descriptive filename and include context in the PR description.
+Keep the whole corpus under about 2 MB; prefer small inputs.

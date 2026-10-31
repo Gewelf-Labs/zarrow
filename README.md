@@ -314,11 +314,12 @@ Run built-in fuzz corpus replay:
 zig build fuzz-corpus
 ```
 
-Run IPC fuzz harnesses manually:
+Fuzz a target (IPC stream / file readers, array validation, compute, C ABI import); see
+[docs/fuzzing.md](docs/fuzzing.md) for campaigns, triage and fixing:
 
 ```sh
-zig build fuzz-array-layout
-zig build fuzz-ipc-reader
+zig build fuzz -- ipc-stream replay fuzz/corpus/ipc-stream
+python tools/fuzz.py --out .fuzz-out run --targets all --seconds 300
 ```
 
 ---
