@@ -10,10 +10,10 @@ pub const CsvMeta = struct {
     }
 };
 
-pub fn resolve(allocator: std.mem.Allocator) !CsvMeta {
-    const timestamp = std.time.timestamp();
-    const git_sha = std.process.getEnvVarOwned(allocator, "ZARROW_GIT_SHA") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
+pub fn resolve(init: std.process.Init, allocator: std.mem.Allocator) !CsvMeta {
+    const timestamp = std.Io.Timestamp.now(init.io, .real).toSeconds();
+    const git_sha = init.minimal.environ.getAlloc(allocator, "ZARROW_GIT_SHA") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
         else => return err,
     };
 

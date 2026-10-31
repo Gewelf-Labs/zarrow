@@ -20,12 +20,12 @@ pub fn padLen(len: usize) usize {
     return if (rem == 0) 0 else Alignment - rem;
 }
 
-pub fn writeMessageLength(writer: anytype, len: u32) !void {
+pub fn writeMessageLength(writer: *std.Io.Writer, len: u32) std.Io.Writer.Error!void {
     try writeInt(writer, u32, ContinuationMarker);
     try writeInt(writer, u32, len);
 }
 
-pub fn readMessageLength(reader: anytype) !?u32 {
+pub fn readMessageLength(reader: *std.Io.Reader) std.Io.Reader.Error!?u32 {
     const first = try readInt(reader, u32);
     if (first == 0) return null;
     if (first == ContinuationMarker) {
@@ -36,36 +36,21 @@ pub fn readMessageLength(reader: anytype) !?u32 {
     return first;
 }
 
-pub fn writePadding(writer: anytype, pad_len: usize) !void {
-    if (pad_len == 0) return;
-    var zeros: [Alignment]u8 = [_]u8{0} ** Alignment;
-    var remaining = pad_len;
-    while (remaining > 0) {
-        const chunk = @min(remaining, zeros.len);
-        try writer.writeAll(zeros[0..chunk]);
-        remaining -= chunk;
-    }
+pub fn writePadding(writer: *std.Io.Writer, pad_len: usize) std.Io.Writer.Error!void {
+    try writer.splatByteAll(0, pad_len);
 }
 
-pub fn skipPadding(reader: anytype, pad_len: usize) !void {
-    if (pad_len == 0) return;
-    var buf: [Alignment]u8 = undefined;
-    var remaining = pad_len;
-    while (remaining > 0) {
-        const chunk = @min(remaining, buf.len);
-        try reader.readNoEof(buf[0..chunk]);
-        remaining -= chunk;
-    }
+pub fn skipPadding(reader: *std.Io.Reader, pad_len: usize) std.Io.Reader.Error!void {
+    try reader.discardAll(pad_len);
 }
 
-pub fn writeInt(writer: anytype, comptime T: type, value: T) !void {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &buf, value, .little);
-    try writer.writeAll(&buf);
+pub fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
+    try writer.writeInt(T, value, .little);
 }
 
-pub fn readInt(reader: anytype, comptime T: type) !T {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    try reader.readNoEof(&buf);
-    return std.mem.readInt(T, &buf, .little);
+pub fn readInt(reader: *std.Io.Reader, comptime T: type) std.Io.Reader.Error!T {
+    // takeInt asserts the reader buffer can hold T; readSliceAll works with unbuffered readers too.
+    var b: [@sizeOf(T)]u8 = undefined;
+    try reader.readSliceAll(&b);
+    return std.mem.readInt(T, &b, .little);
 }

@@ -265,7 +265,7 @@ pub fn GenericListBuilder(comptime OffsetsT: type) type {
 
             try self.ensureOffsetsCapacity(self.len + 1);
 
-            const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+            const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
             self.buffers[0] = validity_buf;
             self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(OffsetsT));
 

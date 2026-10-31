@@ -49,11 +49,16 @@ flatc-zig --schema src/format/Schema.fbs --out src/format/.zig-cache/flatc-zig
 flatc-zig --schema src/format/Message.fbs --out src/format/.zig-cache/flatc-zig
 # … (see tools/generate_ipc_fixtures.py for the full invocation)
 
-# patch Windows path bugs and missing semicolons in generated Union files
+# post-process the whole output directory in place for Zig 0.17:
+#   - Windows path backslashes on @import lines
+#   - missing semicolons in generated Union files
+#   - `std.ArrayList(T){}` / `= .{}`  ->  `.empty`
+#   - `@enumFromInt(X)`               ->  `@fromBackingInt(@intCast(X))`
+# Already-fixed files are left unchanged, so re-running is harmless.
 zig run tools/fix_flatc_lib.zig -- src/format/.zig-cache/flatc-zig
 
 # copy the patched output over the committed files
-cp -r src/format/.zig-cache/flatc-zig/. src/arrow_fbs/
+cp -r src/format/.zig-cache/flatc-zig/. src/ipc_schema/
 ```
 
 The `fbs_runtime` module referenced by `@import("fbs_runtime")` in each

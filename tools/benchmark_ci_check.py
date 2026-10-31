@@ -16,6 +16,7 @@ EXPECTED_HEADER = [
 ]
 
 EXPECTED_BENCHES = {
+    "ipc_roundtrip",
     "primitive_builder",
     "record_batch_builder",
     "struct_builder",

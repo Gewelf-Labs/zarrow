@@ -38,13 +38,22 @@ pub const RecordBatch = struct {
     /// Initialize and return a new instance. Takes ownership of `schema_ref`
     /// (caller must retain before passing if the ref is still needed elsewhere).
     pub fn init(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []const ArrayRef) !Self {
+        return initChecked(allocator, schema_ref, columns, true);
+    }
+
+    /// `init` for callers that already ran `validateLayout` on every column (IPC reader).
+    pub fn initPrevalidated(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []const ArrayRef) !Self {
+        return initChecked(allocator, schema_ref, columns, false);
+    }
+
+    fn initChecked(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []const ArrayRef, comptime validate_layout: bool) !Self {
         const sc = schema_ref.schema();
         if (sc.fields.len != columns.len) return RecordBatchError.InvalidColumnCount;
 
         const num_rows = if (columns.len == 0) 0 else columns[0].data().length;
         for (columns, 0..) |col_ref, i| {
             const data = col_ref.data();
-            try data.validateLayout();
+            if (validate_layout) try data.validateLayout();
             if (data.length != num_rows) return RecordBatchError.InvalidColumnLength;
             if (!data.data_type.eql(sc.fields[i].data_type.*)) return RecordBatchError.InvalidColumnType;
             if (!sc.fields[i].nullable and data.hasNulls()) return RecordBatchError.NullInNonNullableField;
@@ -185,10 +194,8 @@ pub const RecordBatchBuilder = struct {
 
     pub fn setColumnByName(self: *Self, name: []const u8, column_ref: ArrayRef) RecordBatchBuilderError!void {
         if (self.finished) return RecordBatchBuilderError.AlreadyFinished;
-        for (self.schema_ref.schema().fields, 0..) |field, i| {
-            if (std.mem.eql(u8, field.name, name)) return self.setColumn(i, column_ref);
-        }
-        return RecordBatchBuilderError.UnknownField;
+        const index = self.schema_ref.fieldIndex(name) orelse return RecordBatchBuilderError.UnknownField;
+        return self.setColumn(index, column_ref);
     }
 
     /// Finalize builder state and return an immutable array reference.

@@ -1,19 +1,6 @@
 const std = @import("std");
 const zarrow = @import("zarrow");
 
-const WriterAdapter = struct {
-    inner: *std.Io.Writer,
-    pub const Error = anyerror;
-
-    pub fn writeAll(self: @This(), bytes: []const u8) Error!void {
-        try self.inner.writeAll(bytes);
-    }
-
-    pub fn flush(self: @This()) Error!void {
-        try self.inner.flush();
-    }
-};
-
 const FixtureCase = enum {
     canonical,
     dict_delta,
@@ -31,12 +18,11 @@ const ContainerMode = enum {
     file,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // exe
     const out_path = args.next() orelse {
@@ -73,24 +59,22 @@ pub fn main() !void {
         return error.InvalidArgs;
     }
 
-    const file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+    defer file.close(io);
     var io_buf: [4096]u8 = undefined;
-    const fw = file.writer(&io_buf);
-    var writer_adapter = WriterAdapter{ .inner = @constCast(&fw.interface) };
+    var fw = file.writer(io, &io_buf);
     switch (container_mode) {
         .stream => {
-            var writer = zarrow.IpcStreamWriter(WriterAdapter).init(allocator, writer_adapter);
+            var writer = zarrow.IpcStreamWriter.init(allocator, &fw.interface);
             defer writer.deinit();
             try writeFixture(allocator, &writer, fixture_case);
         },
         .file => {
-            var writer = try zarrow.IpcFileWriter(WriterAdapter).init(allocator, writer_adapter);
+            var writer = try zarrow.IpcFileWriter.init(allocator, &fw.interface);
             defer writer.deinit();
             try writeFixture(allocator, &writer, fixture_case);
         },
     }
-    try writer_adapter.flush();
 }
 
 fn writeFixture(allocator: std.mem.Allocator, writer: anytype, fixture_case: FixtureCase) !void {

@@ -65,10 +65,19 @@ pub fn loadLz4Symbols() !*const Lz4Symbols {
     return &linked_lz4_symbols;
 }
 
+fn repeatStr(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        @setEvalBranchQuota(n * (s.len + 16));
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        return &final;
+    }
+}
 test "zstd c api round-trip via compression symbol table" {
     const allocator = std.testing.allocator;
     const syms = try loadZstdSymbols();
-    const input = ("zstd-c-api-roundtrip-0123456789abcdef\n" ** 256);
+    const input = comptime repeatStr("zstd-c-api-roundtrip-0123456789abcdef\n", 256);
 
     const bound = syms.*.compress_bound(input.len);
     try std.testing.expect(bound > 0);
@@ -102,7 +111,7 @@ test "zstd c api round-trip via compression symbol table" {
 test "lz4 frame c api round-trip via compression symbol table" {
     const allocator = std.testing.allocator;
     const syms = try loadLz4Symbols();
-    const input = ("lz4-frame-c-api-roundtrip-0123456789abcdef\n" ** 256);
+    const input = comptime repeatStr("lz4-frame-c-api-roundtrip-0123456789abcdef\n", 256);
 
     const bound = syms.*.compress_frame_bound(input.len, null);
     try std.testing.expect(bound > 0);

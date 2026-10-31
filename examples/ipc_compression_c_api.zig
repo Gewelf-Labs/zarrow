@@ -21,12 +21,21 @@ extern fn LZ4F_isError(code: usize) callconv(.c) c_uint;
 
 const LZ4F_VERSION: c_uint = 100;
 
+fn repeatStr(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        @setEvalBranchQuota(n * (s.len + 16));
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        return &final;
+    }
+}
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     const payload =
-        ("Arrow IPC BodyCompression C API probe. 0123456789abcdef\n" ** 256) ++
-        ("This verifies vendored zstd/lz4 C functions are linked and working.\n" ** 64);
+        comptime repeatStr("Arrow IPC BodyCompression C API probe. 0123456789abcdef\n", 256) ++
+        repeatStr("This verifies vendored zstd/lz4 C functions are linked and working.\n", 64);
 
     try verifyZstdRoundTrip(allocator, payload);
     try verifyLz4FrameRoundTrip(allocator, payload);

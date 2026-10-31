@@ -218,7 +218,7 @@ pub const DictionaryBuilder = struct {
         if (self.state == .finished) return BuilderError.AlreadyFinished;
         if (!std.meta.eql(dictionary.data().data_type, self.value_type.*)) return BuilderError.InvalidDictionaryType;
 
-        const validity_buf = if (self.validity) |*buf| try buf.toShared(bitmap.byteLength(self.len)) else SharedBuffer.empty;
+        const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
         self.buffers[1] = try self.indices.toShared(self.len * (@as(usize, self.index_type.bit_width) / 8));
 

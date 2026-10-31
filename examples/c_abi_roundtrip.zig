@@ -21,10 +21,8 @@ fn releasedArrowArrayStream() zarrow.ArrowArrayStream {
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     const id_type = zarrow.DataType{ .int32 = {} };
     const fields = [_]zarrow.Field{
@@ -46,7 +44,7 @@ pub fn main() !void {
     var input_stream = try zarrow.exportRecordBatchStreamToC(allocator, schema, &[_]zarrow.RecordBatch{batch});
     errdefer if (input_stream.release) |release_fn| release_fn(&input_stream);
 
-    const import_stream_out_param_ty = @typeInfo(@TypeOf(c_api.zarrow_c_import_stream)).@"fn".params[1].type.?;
+    const import_stream_out_param_ty = @FieldType(std.meta.ArgsTuple(@TypeOf(c_api.zarrow_c_import_stream)), "1");
     const stream_handle_ty = @typeInfo(@typeInfo(import_stream_out_param_ty).optional.child).pointer.child;
     var stream_handle: stream_handle_ty = null;
     try ensureOk(c_api.zarrow_c_import_stream(&input_stream, &stream_handle), "zarrow_c_import_stream");
