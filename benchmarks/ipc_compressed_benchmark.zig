@@ -66,13 +66,16 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var batch = try zarrow.RecordBatch.init(allocator, schema_ref.retain(), &[_]zarrow.ArrayRef{ ints, strs });
     defer batch.deinit();
 
+    // One sink reused across iterations: times zarrow, not first-touch page faults of a fresh sink.
+    var sink: std.Io.Writer.Allocating = try .initCapacity(allocator, cfg.rows * 16 + 4096);
+    defer sink.deinit();
+
     var checksum: usize = 0;
     const timer_start = std.Io.Timestamp.now(io, .awake);
 
     var iter: usize = 0;
     while (iter < cfg.iterations) : (iter += 1) {
-        var sink: std.Io.Writer.Allocating = try .initCapacity(allocator, cfg.rows * 16 + 4096);
-        defer sink.deinit();
+        sink.clearRetainingCapacity();
         {
             var writer = zarrow.IpcStreamWriter.initWithBodyCompression(allocator, &sink.writer, .zstd);
             defer writer.deinit();

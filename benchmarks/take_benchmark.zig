@@ -86,7 +86,7 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.smp_allocator;
     const mode = try parseMode(init, allocator);
     const meta = try csv_meta.resolve(init, allocator);
     defer meta.deinit(allocator);
