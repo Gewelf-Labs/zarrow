@@ -441,6 +441,181 @@ test "stream reader initZeroCopy slices column buffers out of the source" {
     try std.testing.expectEqual(@as(i32, 3), try view.value(2));
 }
 
+fn expectArrayDataEqual(a: *const ArrayData, b: *const ArrayData) !void {
+    try std.testing.expect(a.data_type.eql(b.data_type));
+    try std.testing.expectEqual(a.length, b.length);
+    try std.testing.expectEqual(a.offset, b.offset);
+    try std.testing.expectEqual(a.null_count, b.null_count);
+    try std.testing.expectEqual(a.buffers.len, b.buffers.len);
+    for (a.buffers, b.buffers) |x, y| try std.testing.expectEqualSlices(u8, x.data, y.data);
+    try std.testing.expectEqual(a.children.len, b.children.len);
+    for (a.children, b.children) |x, y| try expectArrayDataEqual(x.data(), y.data());
+    try std.testing.expectEqual(a.dictionary == null, b.dictionary == null);
+    if (a.dictionary) |d| try expectArrayDataEqual(d.data(), b.dictionary.?.data());
+}
+
+/// Reads `bytes` with the copying reader and with `initZeroCopy`, and requires every batch to
+/// be equal. `expect_shared` asserts that at least one buffer really aliases the source.
+fn expectZeroCopyMatchesCopy(allocator: std.mem.Allocator, bytes: []const u8, expect_shared: bool) !void {
+    var copy_stream: std.Io.Reader = .fixed(bytes);
+    var copy_reader = StreamReader.init(allocator, &copy_stream);
+    defer copy_reader.deinit();
+    _ = try copy_reader.readSchema();
+
+    var owned = try OwnedBuffer.initUninit(allocator, bytes.len);
+    @memcpy(owned.data[0..bytes.len], bytes);
+    var source = try owned.toShared(bytes.len);
+    defer source.release();
+    var zc_stream: std.Io.Reader = .fixed(source.data);
+    var zc_reader = StreamReader.initZeroCopy(allocator, &zc_stream, source);
+    defer zc_reader.deinit();
+    _ = try zc_reader.readSchema();
+
+    var batches: usize = 0;
+    var shared_seen = false;
+    while (true) {
+        const copy_opt = try copy_reader.nextRecordBatch();
+        var zc_opt = try zc_reader.nextRecordBatch();
+        if (copy_opt == null) {
+            if (zc_opt) |*extra| {
+                extra.deinit();
+                return error.TestUnexpectedResult;
+            }
+            break;
+        }
+        var copy_batch = copy_opt.?;
+        defer copy_batch.deinit();
+        try std.testing.expect(zc_opt != null);
+        var zc_batch = zc_opt.?;
+        defer zc_batch.deinit();
+
+        try std.testing.expectEqual(copy_batch.numRows(), zc_batch.numRows());
+        try std.testing.expectEqual(copy_batch.columns.len, zc_batch.columns.len);
+        for (copy_batch.columns, zc_batch.columns) |c, z| {
+            try expectArrayDataEqual(c.data(), z.data());
+            for (z.data().buffers) |buf| {
+                if (buf.storage != null and buf.storage == source.storage) shared_seen = true;
+            }
+        }
+        batches += 1;
+    }
+    try std.testing.expect(batches > 0);
+    if (expect_shared) try std.testing.expect(shared_seen);
+}
+
+test "stream reader zero-copy read equals copying read on pyarrow fixtures" {
+    const allocator = std.testing.allocator;
+    try expectZeroCopyMatchesCopy(allocator, @embedFile("testdata/pyarrow_simple_stream.arrow"), true);
+    try expectZeroCopyMatchesCopy(allocator, @embedFile("testdata/pyarrow_multi_batch_stream.arrow"), true);
+}
+
+test "stream reader zero-copy read equals copying read for nested, dictionary and compressed streams" {
+    const allocator = std.testing.allocator;
+
+    const int_type = DataType{ .int32 = {} };
+    const string_type = DataType{ .string = {} };
+    const list_value_field = Field{ .name = "item", .data_type = &int_type, .nullable = true };
+    const list_type = DataType{ .list = .{ .value_field = list_value_field } };
+    const struct_fields = [_]Field{
+        .{ .name = "id", .data_type = &int_type, .nullable = false },
+        .{ .name = "name", .data_type = &string_type, .nullable = true },
+    };
+    const struct_type = DataType{ .struct_ = .{ .fields = struct_fields[0..] } };
+    const dict_type = DataType{
+        .dictionary = .{
+            .index_type = .{ .bit_width = 32, .signed = true },
+            .value_type = &string_type,
+            .ordered = false,
+        },
+    };
+    const fields = [_]Field{
+        .{ .name = "list_i32", .data_type = &list_type, .nullable = true },
+        .{ .name = "struct_pair", .data_type = &struct_type, .nullable = true },
+        .{ .name = "color", .data_type = &dict_type, .nullable = true },
+    };
+    const schema = Schema{ .fields = fields[0..] };
+
+    var list_values_builder = try @import("../array/primitive_array.zig").PrimitiveBuilder(i32, int_type).init(allocator, 3);
+    defer list_values_builder.deinit();
+    try list_values_builder.append(1);
+    try list_values_builder.append(2);
+    try list_values_builder.append(3);
+    var list_values = try list_values_builder.finish();
+    defer list_values.release();
+    var list_builder = try @import("../array/list_array.zig").ListBuilder.init(allocator, 3, list_value_field);
+    defer list_builder.deinit();
+    try list_builder.appendLen(2);
+    try list_builder.appendNull();
+    try list_builder.appendLen(1);
+    var list_col = try list_builder.finish(list_values);
+    defer list_col.release();
+
+    var ids_builder = try @import("../array/primitive_array.zig").PrimitiveBuilder(i32, int_type).init(allocator, 3);
+    defer ids_builder.deinit();
+    try ids_builder.append(10);
+    try ids_builder.append(20);
+    try ids_builder.append(30);
+    var ids = try ids_builder.finish();
+    defer ids.release();
+    var names_builder = try @import("../array/string_array.zig").StringBuilder.init(allocator, 3, 6);
+    defer names_builder.deinit();
+    try names_builder.append("aa");
+    try names_builder.appendNull();
+    try names_builder.append("cc");
+    var names = try names_builder.finish();
+    defer names.release();
+    var struct_builder = @import("../array/struct_array.zig").StructBuilder.init(allocator, struct_fields[0..]);
+    defer struct_builder.deinit();
+    try struct_builder.appendValid();
+    try struct_builder.appendNull();
+    try struct_builder.appendValid();
+    var struct_col = try struct_builder.finish(&[_]ArrayRef{ ids, names });
+    defer struct_col.release();
+
+    var dict_values_builder = try @import("../array/string_array.zig").StringBuilder.init(allocator, 2, 8);
+    defer dict_values_builder.deinit();
+    try dict_values_builder.append("red");
+    try dict_values_builder.append("blue");
+    var dict_values = try dict_values_builder.finish();
+    defer dict_values.release();
+    var dict_builder = try @import("../array/dictionary_array.zig").DictionaryBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &string_type, 3);
+    defer dict_builder.deinit();
+    try dict_builder.appendIndex(1);
+    try dict_builder.appendNull();
+    try dict_builder.appendIndex(0);
+    var dict_col = try dict_builder.finish(dict_values);
+    defer dict_col.release();
+
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{ list_col, struct_col, dict_col });
+    defer batch.deinit();
+
+    // Plain stream with two batches: buffers must alias the source.
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+        defer writer.deinit();
+        try writer.writeSchema(schema);
+        try writer.writeRecordBatch(batch);
+        try writer.writeRecordBatch(batch);
+        try writer.writeEnd();
+        try expectZeroCopyMatchesCopy(allocator, out.written(), true);
+    }
+
+    // Compressed bodies are decompressed into fresh buffers on both paths; values must still match.
+    const codecs = [_]stream_writer.BodyCompressionCodec{ .zstd, .lz4_frame };
+    for (codecs) |codec| {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var writer = stream_writer.StreamWriter.initWithBodyCompression(allocator, &out.writer, codec);
+        defer writer.deinit();
+        try writer.writeSchema(schema);
+        try writer.writeRecordBatch(batch);
+        try writer.writeEnd();
+        try expectZeroCopyMatchesCopy(allocator, out.written(), false);
+    }
+}
+
 fn readMessage(self: *StreamReader) (StreamError || fbs_lite_builder.PackError || std.Io.Reader.Error || error{ EndOfStream, OutOfMemory })!MessageWithBody {
     const msg_opt = try readMessageOptional(self);
     if (msg_opt == null) return StreamError.InvalidMessage;
