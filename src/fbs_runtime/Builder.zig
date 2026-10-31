@@ -92,8 +92,10 @@ fn debug(b: Builder, comptime fmt: []const u8, args: anytype) void {
     //     fmt ++ "bytes={any}, minalign={}, vtable={any}, bject_end=={}, vtables={any}, head={}, nested={}, finished={}",
     //     args ++ .{ b.bytes.items, b.minalign, b.vtable.items, b.object_end, b.vtables.items, b.head, b.nested, b.finished },
     // );
+    // Tracing off: std.log.debug here floods stderr in Debug builds (and breaks the `benchmark-ci` CSV).
     _ = b;
-    std.log.debug(fmt, args);
+    _ = fmt;
+    _ = args;
 }
 
 /// Reset truncates the underlying Builder buffer, facilitating alloc-free

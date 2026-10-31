@@ -24,6 +24,9 @@ pub fn concatArrayRefs(
         if (!datatype.dataTypeEql(part.data().data_type, data_type)) return error.InvalidInput;
     }
 
+    // Flat layouts: allocate each output buffer once and copy every part once (O(total_len)).
+    if (try concatManyFlat(allocator, data_type, parts)) |out| return out;
+
     if (parts.len == 1) {
         // Single part still returns a fresh, compacted copy (offset 0), as before.
         var empty = try parts[0].slice(0, 0);
@@ -31,9 +34,8 @@ pub fn concatArrayRefs(
         return concatTwoArrayRefs(allocator, empty, parts[0]);
     }
 
-    // Balanced pairwise merge: O(total_len * log(parts.len)) instead of the
-    // O(total_len * parts.len) left fold (take/filter concat one piece per row).
-    // ponytail: an N-ary concat (allocate output once) would be O(total_len).
+    // Nested/view types: balanced pairwise merge, O(total_len * log(parts.len)).
+    // ponytail: N-ary list/struct concat (concat children once) if nested concat gets hot.
     var level = try mergePairs(allocator, parts);
     while (level.items.len > 1) {
         const next = mergePairs(allocator, level.items) catch |err| {
@@ -72,23 +74,11 @@ fn concatTwoArrayRefs(
 ) Error!ArrayRef {
     if (!datatype.dataTypeEql(left.data().data_type, right.data().data_type)) return error.InvalidInput;
 
+    if (try concatManyFlat(allocator, left.data().data_type, &[_]ArrayRef{ left, right })) |out| return out;
+
     const dt = left.data().data_type;
     const layout_dt = storageDataType(dt);
     var merged_storage = try switch (layout_dt) {
-        .null => try concatNullArray(allocator, layout_dt, left.data(), right.data()),
-        .bool => try concatBooleanArray(allocator, layout_dt, left.data(), right.data()),
-        .uint8, .int8 => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 1),
-        .uint16, .int16, .half_float => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 2),
-        .uint32, .int32, .float, .date32, .time32, .interval_months, .decimal32 => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 4),
-        .uint64, .int64, .double, .date64, .time64, .timestamp, .duration, .interval_day_time, .decimal64 => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 8),
-        .decimal128, .interval_month_day_nano => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 16),
-        .decimal256 => try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), 32),
-        .fixed_size_binary => |fsb| blk: {
-            const byte_width = std.math.cast(usize, fsb.byte_width) orelse return error.InvalidInput;
-            break :blk try concatFixedWidthArray(allocator, layout_dt, left.data(), right.data(), byte_width);
-        },
-        .string, .binary => try concatVariableBinaryArrayI32(allocator, layout_dt, left.data(), right.data()),
-        .large_string, .large_binary => try concatVariableBinaryArrayI64(allocator, layout_dt, left.data(), right.data()),
         .string_view => try concatStringViewArray(allocator, left.data(), right.data()),
         .binary_view => try concatBinaryViewArray(allocator, left.data(), right.data()),
         .list, .map => try concatListLikeArrayI32(allocator, layout_dt, left.data(), right.data()),
@@ -497,287 +487,157 @@ fn sliceStructChildRef(child_ref: ArrayRef, parent: *const ArrayData) Error!Arra
     return error.InvalidInput;
 }
 
-fn concatNullArray(
-    allocator: std.mem.Allocator,
-    dt: DataType,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const buffers = try allocator.alloc(array_data.SharedBuffer, 0);
-    const children = try allocator.alloc(ArrayRef, 0);
-    const data = ArrayData{
-        .data_type = dt,
-        .length = total_len,
-        .null_count = total_len,
-        .buffers = buffers,
-        .children = children,
-        .dictionary = null,
+const FlatKind = union(enum) {
+    null_type,
+    boolean,
+    fixed: usize,
+    binary32,
+    binary64,
+};
+
+fn flatKind(layout_dt: DataType) Error!?FlatKind {
+    return switch (layout_dt) {
+        .null => .null_type,
+        .bool => .boolean,
+        .uint8, .int8 => .{ .fixed = 1 },
+        .uint16, .int16, .half_float => .{ .fixed = 2 },
+        .uint32, .int32, .float, .date32, .time32, .interval_months, .decimal32 => .{ .fixed = 4 },
+        .uint64, .int64, .double, .date64, .time64, .timestamp, .duration, .interval_day_time, .decimal64 => .{ .fixed = 8 },
+        .decimal128, .interval_month_day_nano => .{ .fixed = 16 },
+        .decimal256 => .{ .fixed = 32 },
+        .fixed_size_binary => |fsb| .{ .fixed = std.math.cast(usize, fsb.byte_width) orelse return error.InvalidInput },
+        .string, .binary => .binary32,
+        .large_string, .large_binary => .binary64,
+        else => null,
     };
-    try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
 }
 
-fn concatBooleanArray(
-    allocator: std.mem.Allocator,
-    dt: DataType,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    try requireBufferCount(left, 2);
-    try requireBufferCount(right, 2);
-    try requireBitmapBits(left.buffers[1], left.offset + left.length);
-    try requireBitmapBits(right.buffers[1], right.offset + right.length);
+/// N-ary concat for flat layouts (null, bool, fixed-width, binary/string): each output buffer
+/// is allocated once and every part is copied once. Returns null for nested and view types,
+/// which use the pairwise merge.
+fn concatManyFlat(allocator: std.mem.Allocator, dt: DataType, parts: []const ArrayRef) Error!?ArrayRef {
+    const kind = (try flatKind(storageDataType(dt))) orelse return null;
 
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const null_count = std.math.add(usize, try nullCountForArray(left), try nullCountForArray(right)) catch return error.InvalidInput;
-    const validity = try concatValidityBuffer(allocator, left, right, total_len, null_count);
-    errdefer if (!validity.isEmpty()) {
-        var owned = validity;
-        owned.release();
-    };
-
-    var values_owned = try buffer.OwnedBuffer.init(allocator, bitmap.byteLength(total_len));
-    const values_bytes = values_owned.data[0..bitmap.byteLength(total_len)];
-    @memset(values_bytes, 0);
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        if (bitAt(left.buffers[1], left.offset + i)) bitmap.setBit(values_bytes, i);
+    var total_len: usize = 0;
+    var total_nulls: usize = 0;
+    for (parts) |part| {
+        total_len = std.math.add(usize, total_len, part.data().length) catch return error.InvalidInput;
+        if (kind != .null_type) {
+            total_nulls = std.math.add(usize, total_nulls, try nullCountForArray(part.data())) catch return error.InvalidInput;
+        }
     }
-    i = 0;
-    while (i < right.length) : (i += 1) {
-        if (bitAt(right.buffers[1], right.offset + i)) bitmap.setBit(values_bytes, left.length + i);
+
+    var bufs: [3]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+    var buf_count: usize = 0;
+    errdefer for (bufs[0..buf_count]) |*b| b.release();
+
+    if (kind != .null_type) {
+        bufs[0] = try concatValidityMany(allocator, parts, total_len, total_nulls);
+        buf_count = 1;
     }
-    var values = try values_owned.toShared(values_bytes.len);
-    errdefer values.release();
-
-    const buffers = try allocator.alloc(array_data.SharedBuffer, 2);
-    errdefer allocator.free(buffers);
-    buffers[0] = validity;
-    buffers[1] = values;
-    const children = try allocator.alloc(ArrayRef, 0);
-    errdefer allocator.free(children);
-
-    const data = ArrayData{
-        .data_type = dt,
-        .length = total_len,
-        .null_count = null_count,
-        .buffers = buffers,
-        .children = children,
-        .dictionary = null,
-    };
-    try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
-}
-
-fn concatFixedWidthArray(
-    allocator: std.mem.Allocator,
-    dt: DataType,
-    left: *const ArrayData,
-    right: *const ArrayData,
-    byte_width: usize,
-) Error!ArrayRef {
-    try requireBufferCount(left, 2);
-    try requireBufferCount(right, 2);
-
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const null_count = std.math.add(usize, try nullCountForArray(left), try nullCountForArray(right)) catch return error.InvalidInput;
-    const validity = try concatValidityBuffer(allocator, left, right, total_len, null_count);
-    errdefer if (!validity.isEmpty()) {
-        var owned = validity;
-        owned.release();
-    };
-
-    const left_bytes = try dataBytesForFixedWidth(left, byte_width);
-    const right_bytes = try dataBytesForFixedWidth(right, byte_width);
-    const total_data_len = std.math.add(usize, left_bytes.len, right_bytes.len) catch return error.InvalidInput;
-    var values_owned = try buffer.OwnedBuffer.init(allocator, total_data_len);
-    @memcpy(values_owned.data[0..left_bytes.len], left_bytes);
-    @memcpy(values_owned.data[left_bytes.len .. left_bytes.len + right_bytes.len], right_bytes);
-    var values = try values_owned.toShared(total_data_len);
-    errdefer values.release();
-
-    const buffers = try allocator.alloc(array_data.SharedBuffer, 2);
-    errdefer allocator.free(buffers);
-    buffers[0] = validity;
-    buffers[1] = values;
-    const children = try allocator.alloc(ArrayRef, 0);
-    errdefer allocator.free(children);
+    switch (kind) {
+        .null_type => total_nulls = total_len,
+        .boolean => {
+            const used = bitmap.byteLength(total_len);
+            var values = try buffer.OwnedBuffer.init(allocator, used);
+            errdefer values.deinit();
+            var pos: usize = 0;
+            for (parts) |part| {
+                const d = part.data();
+                try requireBufferCount(d, 2);
+                try requireBitmapBits(d.buffers[1], d.offset + d.length);
+                bitmap.copyBits(values.data, pos, d.buffers[1].data, d.offset, d.length);
+                pos += d.length;
+            }
+            bufs[1] = try values.toShared(used);
+            buf_count = 2;
+        },
+        .fixed => |byte_width| {
+            const total_bytes = std.math.mul(usize, total_len, byte_width) catch return error.InvalidInput;
+            var values = try buffer.OwnedBuffer.initUninit(allocator, total_bytes);
+            errdefer values.deinit();
+            var pos: usize = 0;
+            for (parts) |part| {
+                try requireBufferCount(part.data(), 2);
+                const bytes = try dataBytesForFixedWidth(part.data(), byte_width);
+                @memcpy(values.data[pos..][0..bytes.len], bytes);
+                pos += bytes.len;
+            }
+            bufs[1] = try values.toShared(total_bytes);
+            buf_count = 2;
+        },
+        .binary32 => {
+            try concatManyBinary(i32, allocator, parts, total_len, &bufs);
+            buf_count = 3;
+        },
+        .binary64 => {
+            try concatManyBinary(i64, allocator, parts, total_len, &bufs);
+            buf_count = 3;
+        },
+    }
 
     const data = ArrayData{
         .data_type = dt,
         .length = total_len,
-        .null_count = null_count,
-        .buffers = buffers,
-        .children = children,
-        .dictionary = null,
+        .null_count = total_nulls,
+        .buffers = bufs[0..buf_count],
     };
     try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
+    return try ArrayRef.fromOwnedInlineBuffers(allocator, data);
 }
 
-fn concatVariableBinaryArrayI32(
+/// Fills `bufs[1]` (offsets) and `bufs[2]` (values) for an N-ary string/binary concat.
+fn concatManyBinary(
+    comptime T: type,
     allocator: std.mem.Allocator,
-    dt: DataType,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    try requireBufferCount(left, 3);
-    try requireBufferCount(right, 3);
+    parts: []const ArrayRef,
+    total_len: usize,
+    bufs: *[3]array_data.SharedBuffer,
+) Error!void {
+    var total_data: usize = 0;
+    for (parts) |part| {
+        const r = try binaryDataRange(T, part.data());
+        total_data = std.math.add(usize, total_data, r.end - r.start) catch return error.InvalidInput;
+    }
+    if (total_data > std.math.maxInt(T)) return error.InvalidInput;
 
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const null_count = std.math.add(usize, try nullCountForArray(left), try nullCountForArray(right)) catch return error.InvalidInput;
-    const validity = try concatValidityBuffer(allocator, left, right, total_len, null_count);
-    errdefer if (!validity.isEmpty()) {
-        var owned = validity;
-        owned.release();
-    };
+    const offsets_len = total_len + 1;
+    var offsets_owned = try buffer.OwnedBuffer.initUninit(allocator, offsets_len * @sizeOf(T));
+    errdefer offsets_owned.deinit();
+    var values_owned = try buffer.OwnedBuffer.initUninit(allocator, total_data);
+    errdefer values_owned.deinit();
 
-    const left_offsets = left.buffers[1].typedSlice(i32) catch return error.InvalidInput;
-    const right_offsets = right.buffers[1].typedSlice(i32) catch return error.InvalidInput;
-    const left_last_index = std.math.add(usize, left.offset, left.length) catch return error.InvalidInput;
-    const right_last_index = std.math.add(usize, right.offset, right.length) catch return error.InvalidInput;
-    if (left_last_index >= left_offsets.len or right_last_index >= right_offsets.len) return error.InvalidInput;
-
-    const left_start = std.math.cast(usize, left_offsets[left.offset]) orelse return error.InvalidInput;
-    const left_end = std.math.cast(usize, left_offsets[left_last_index]) orelse return error.InvalidInput;
-    const right_start = std.math.cast(usize, right_offsets[right.offset]) orelse return error.InvalidInput;
-    const right_end = std.math.cast(usize, right_offsets[right_last_index]) orelse return error.InvalidInput;
-    if (left_end < left_start or right_end < right_start) return error.InvalidInput;
-    if (left_end > left.buffers[2].len() or right_end > right.buffers[2].len()) return error.InvalidInput;
-
-    const left_data_len = std.math.sub(usize, left_end, left_start) catch return error.InvalidInput;
-    const right_data_len = std.math.sub(usize, right_end, right_start) catch return error.InvalidInput;
-    const total_data_len = std.math.add(usize, left_data_len, right_data_len) catch return error.InvalidInput;
-
-    const offsets_len = std.math.add(usize, total_len, 1) catch return error.InvalidInput;
-    var offsets_owned = try buffer.OwnedBuffer.init(allocator, offsets_len * @sizeOf(i32));
-    var out_offsets = offsets_owned.typedSlice(i32)[0..offsets_len];
+    const out_offsets = offsets_owned.typedSlice(T)[0..offsets_len];
     out_offsets[0] = 0;
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        const cur = std.math.sub(i32, left_offsets[left.offset + i + 1], left_offsets[left.offset]) catch return error.InvalidInput;
-        out_offsets[i + 1] = cur;
+    var row: usize = 0;
+    var byte_pos: usize = 0;
+    for (parts) |part| {
+        const d = part.data();
+        const r = try binaryDataRange(T, d);
+        const src = (d.buffers[1].typedSlice(T) catch unreachable)[d.offset .. d.offset + d.length + 1];
+        // Wrapping math: malformed (non-monotonic) input yields offsets that validateLayout rejects.
+        const shift: T = @as(T, @intCast(byte_pos)) -% src[0];
+        for (src[1..], out_offsets[row + 1 ..][0..d.length]) |o, *out| out.* = o +% shift;
+        @memcpy(values_owned.data[byte_pos..][0 .. r.end - r.start], d.buffers[2].data[r.start..r.end]);
+        row += d.length;
+        byte_pos += r.end - r.start;
     }
-    const left_prefix = out_offsets[left.length];
-    while (i < total_len) : (i += 1) {
-        const right_idx = i - left.length;
-        const delta_off = std.math.sub(i32, right_offsets[right.offset + right_idx + 1], right_offsets[right.offset]) catch return error.InvalidInput;
-        out_offsets[i + 1] = std.math.add(i32, left_prefix, delta_off) catch return error.InvalidInput;
-    }
-    var offsets = try offsets_owned.toShared(offsets_len * @sizeOf(i32));
-    errdefer offsets.release();
-
-    var values_owned = try buffer.OwnedBuffer.init(allocator, total_data_len);
-    if (left_data_len > 0) {
-        @memcpy(values_owned.data[0..left_data_len], left.buffers[2].data[left_start..left_end]);
-    }
-    if (right_data_len > 0) {
-        @memcpy(values_owned.data[left_data_len .. left_data_len + right_data_len], right.buffers[2].data[right_start..right_end]);
-    }
-    var values = try values_owned.toShared(total_data_len);
-    errdefer values.release();
-
-    const buffers = try allocator.alloc(array_data.SharedBuffer, 3);
-    errdefer allocator.free(buffers);
-    buffers[0] = validity;
-    buffers[1] = offsets;
-    buffers[2] = values;
-    const children = try allocator.alloc(ArrayRef, 0);
-    errdefer allocator.free(children);
-
-    const data = ArrayData{
-        .data_type = dt,
-        .length = total_len,
-        .null_count = null_count,
-        .buffers = buffers,
-        .children = children,
-        .dictionary = null,
-    };
-    try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
+    bufs[1] = try offsets_owned.toShared(offsets_len * @sizeOf(T));
+    errdefer bufs[1].release();
+    bufs[2] = try values_owned.toShared(total_data);
 }
 
-fn concatVariableBinaryArrayI64(
-    allocator: std.mem.Allocator,
-    dt: DataType,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    try requireBufferCount(left, 3);
-    try requireBufferCount(right, 3);
+const ByteRange = struct { start: usize, end: usize };
 
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const null_count = std.math.add(usize, try nullCountForArray(left), try nullCountForArray(right)) catch return error.InvalidInput;
-    const validity = try concatValidityBuffer(allocator, left, right, total_len, null_count);
-    errdefer if (!validity.isEmpty()) {
-        var owned = validity;
-        owned.release();
-    };
-
-    const left_offsets = left.buffers[1].typedSlice(i64) catch return error.InvalidInput;
-    const right_offsets = right.buffers[1].typedSlice(i64) catch return error.InvalidInput;
-    const left_last_index = std.math.add(usize, left.offset, left.length) catch return error.InvalidInput;
-    const right_last_index = std.math.add(usize, right.offset, right.length) catch return error.InvalidInput;
-    if (left_last_index >= left_offsets.len or right_last_index >= right_offsets.len) return error.InvalidInput;
-
-    const left_start = std.math.cast(usize, left_offsets[left.offset]) orelse return error.InvalidInput;
-    const left_end = std.math.cast(usize, left_offsets[left_last_index]) orelse return error.InvalidInput;
-    const right_start = std.math.cast(usize, right_offsets[right.offset]) orelse return error.InvalidInput;
-    const right_end = std.math.cast(usize, right_offsets[right_last_index]) orelse return error.InvalidInput;
-    if (left_end < left_start or right_end < right_start) return error.InvalidInput;
-    if (left_end > left.buffers[2].len() or right_end > right.buffers[2].len()) return error.InvalidInput;
-
-    const left_data_len = std.math.sub(usize, left_end, left_start) catch return error.InvalidInput;
-    const right_data_len = std.math.sub(usize, right_end, right_start) catch return error.InvalidInput;
-    const total_data_len = std.math.add(usize, left_data_len, right_data_len) catch return error.InvalidInput;
-
-    const offsets_len = std.math.add(usize, total_len, 1) catch return error.InvalidInput;
-    var offsets_owned = try buffer.OwnedBuffer.init(allocator, offsets_len * @sizeOf(i64));
-    var out_offsets = offsets_owned.typedSlice(i64)[0..offsets_len];
-    out_offsets[0] = 0;
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        const cur = std.math.sub(i64, left_offsets[left.offset + i + 1], left_offsets[left.offset]) catch return error.InvalidInput;
-        out_offsets[i + 1] = cur;
-    }
-    const left_prefix = out_offsets[left.length];
-    while (i < total_len) : (i += 1) {
-        const right_idx = i - left.length;
-        const delta_off = std.math.sub(i64, right_offsets[right.offset + right_idx + 1], right_offsets[right.offset]) catch return error.InvalidInput;
-        out_offsets[i + 1] = std.math.add(i64, left_prefix, delta_off) catch return error.InvalidInput;
-    }
-    var offsets = try offsets_owned.toShared(offsets_len * @sizeOf(i64));
-    errdefer offsets.release();
-
-    var values_owned = try buffer.OwnedBuffer.init(allocator, total_data_len);
-    if (left_data_len > 0) {
-        @memcpy(values_owned.data[0..left_data_len], left.buffers[2].data[left_start..left_end]);
-    }
-    if (right_data_len > 0) {
-        @memcpy(values_owned.data[left_data_len .. left_data_len + right_data_len], right.buffers[2].data[right_start..right_end]);
-    }
-    var values = try values_owned.toShared(total_data_len);
-    errdefer values.release();
-
-    const buffers = try allocator.alloc(array_data.SharedBuffer, 3);
-    errdefer allocator.free(buffers);
-    buffers[0] = validity;
-    buffers[1] = offsets;
-    buffers[2] = values;
-    const children = try allocator.alloc(ArrayRef, 0);
-    errdefer allocator.free(children);
-
-    const data = ArrayData{
-        .data_type = dt,
-        .length = total_len,
-        .null_count = null_count,
-        .buffers = buffers,
-        .children = children,
-        .dictionary = null,
-    };
-    try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
+fn binaryDataRange(comptime T: type, d: *const ArrayData) Error!ByteRange {
+    try requireBufferCount(d, 3);
+    const offsets = d.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const last = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+    if (last >= offsets.len) return error.InvalidInput;
+    const start = std.math.cast(usize, offsets[d.offset]) orelse return error.InvalidInput;
+    const end = std.math.cast(usize, offsets[last]) orelse return error.InvalidInput;
+    if (end < start or end > d.buffers[2].len()) return error.InvalidInput;
+    return .{ .start = start, .end = end };
 }
 
 fn nullCountForArray(data: *const ArrayData) ConcatArrayError!usize {
@@ -796,34 +656,44 @@ fn concatValidityBuffer(
     right: *const ArrayData,
     total_len: usize,
     total_nulls: usize,
-) error{OutOfMemory}!array_data.SharedBuffer {
+) ConcatArrayError!array_data.SharedBuffer {
     if (total_nulls == 0) return array_data.SharedBuffer.empty;
     const used = bitmap.byteLength(total_len);
     var owned = try buffer.OwnedBuffer.init(allocator, used);
-    const bytes = owned.data[0..used];
-    @memset(bytes, 0);
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        if (isValidAt(left, i)) bitmap.setBit(bytes, i);
-    }
-    i = 0;
-    while (i < right.length) : (i += 1) {
-        if (isValidAt(right, i)) bitmap.setBit(bytes, left.length + i);
+    errdefer owned.deinit();
+    try appendValidityBits(owned.data, 0, left);
+    try appendValidityBits(owned.data, left.length, right);
+    return owned.toShared(used);
+}
+
+fn concatValidityMany(
+    allocator: std.mem.Allocator,
+    parts: []const ArrayRef,
+    total_len: usize,
+    total_nulls: usize,
+) ConcatArrayError!array_data.SharedBuffer {
+    if (total_nulls == 0) return array_data.SharedBuffer.empty;
+    const used = bitmap.byteLength(total_len);
+    var owned = try buffer.OwnedBuffer.init(allocator, used);
+    errdefer owned.deinit();
+    var pos: usize = 0;
+    for (parts) |part| {
+        try appendValidityBits(owned.data, pos, part.data());
+        pos += part.data().length;
     }
     return owned.toShared(used);
 }
 
-fn isValidAt(data: *const ArrayData, index: usize) bool {
+/// Writes `data`'s validity bits into zeroed `dst` at bit `dst_off` (all-null parts stay zero).
+fn appendValidityBits(dst: []u8, dst_off: usize, data: *const ArrayData) ConcatArrayError!void {
+    if (data.length == 0) return;
     if (data.null_count) |count| {
-        if (count == 0) return true;
-        if (count == data.length) return false;
+        if (count == data.length) return;
+        if (count == 0) return bitmap.setBits(dst, dst_off, data.length);
     }
-    const validity = data.validity() orelse return true;
-    return validity.isValid(data.offset + index) catch false;
-}
-
-fn bitAt(buf: array_data.SharedBuffer, bit_index: usize) bool {
-    return bitmap.bitIsSet(buf.data, bit_index);
+    const validity = data.validity() orelse return bitmap.setBits(dst, dst_off, data.length);
+    if (bitmap.byteLength(data.offset + data.length) > validity.data.len) return error.InvalidInput;
+    bitmap.copyBits(dst, dst_off, validity.data, data.offset, data.length);
 }
 
 fn dataBytesForFixedWidth(data: *const ArrayData, byte_width: usize) ConcatArrayError![]const u8 {
@@ -1441,5 +1311,67 @@ test "concatArrayRefs merges many sliced parts in order" {
     for (0..14) |i| {
         try std.testing.expectEqual(i % 3 == 0, view.isNull(i));
         if (i % 3 != 0) try std.testing.expectEqual(@as(i32, @intCast(i)), try view.value(i));
+    }
+}
+
+test "concatArrayRefs N-ary path matches per-row values for int32, string and bool parts" {
+    const allocator = std.testing.allocator;
+
+    var ib = try array_mod.Int32Builder.init(allocator, 0);
+    defer ib.deinit();
+    var sb = try array_mod.StringBuilder.init(allocator, 0, 0);
+    defer sb.deinit();
+    var bb = try array_mod.BooleanBuilder.init(allocator, 0);
+    defer bb.deinit();
+    const n = 67;
+    for (0..n) |i| {
+        if (i % 5 == 2) {
+            try ib.appendNull();
+            try sb.appendNull();
+            try bb.appendNull();
+        } else {
+            try ib.append(@intCast(i));
+            try sb.append(if (i % 3 == 0) "xy" else "z");
+            try bb.append(i % 4 == 1);
+        }
+    }
+    var ints = try ib.finish();
+    defer ints.release();
+    var strs = try sb.finish();
+    defer strs.release();
+    var bools = try bb.finish();
+    defer bools.release();
+
+    // Uneven cuts so parts start at every bit phase; part [0, 2) has no nulls.
+    const cuts = [_]usize{ 0, 2, 9, 10, 11, 30, 33, 34, 50, 67 };
+    const sources = [_]ArrayRef{ ints, strs, bools };
+    for (sources) |src| {
+        var parts: [cuts.len - 1]ArrayRef = undefined;
+        for (&parts, 0..) |*p, k| p.* = try src.slice(cuts[k], cuts[k + 1] - cuts[k]);
+        defer for (&parts) |*p| p.release();
+
+        var out = try concatArrayRefs(allocator, src.data().data_type, parts[0..]);
+        defer out.release();
+        try std.testing.expectEqual(@as(usize, n), out.data().length);
+        try std.testing.expectEqual(@as(?usize, 13), out.data().null_count);
+        for (0..n) |i| {
+            try std.testing.expectEqual(src.data().isNull(i), out.data().isNull(i));
+            if (out.data().isNull(i)) continue;
+            switch (src.data().data_type) {
+                .int32 => try std.testing.expectEqual(
+                    try (array_mod.Int32Array{ .data = src.data() }).value(i),
+                    try (array_mod.Int32Array{ .data = out.data() }).value(i),
+                ),
+                .string => try std.testing.expectEqualStrings(
+                    try (array_mod.StringArray{ .data = src.data() }).value(i),
+                    try (array_mod.StringArray{ .data = out.data() }).value(i),
+                ),
+                .bool => try std.testing.expectEqual(
+                    try (array_mod.BooleanArray{ .data = src.data() }).value(i),
+                    try (array_mod.BooleanArray{ .data = out.data() }).value(i),
+                ),
+                else => unreachable,
+            }
+        }
     }
 }

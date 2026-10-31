@@ -168,6 +168,49 @@ pub fn countUnsetBitsInRange(data: []const u8, start_bit: usize, end_bit: usize)
     return (end_bit - start_bit) - countSetBitsInRange(data, start_bit, end_bit);
 }
 
+// Copy `len` bits from `src` (starting at bit `src_off`) into `dst` (starting at bit `dst_off`).
+// Bits of `dst` outside [dst_off, dst_off + len) are preserved. One destination byte per step
+// instead of one bit, so validity/boolean concat and gather run at near-memcpy speed.
+pub fn copyBits(dst: []u8, dst_off: usize, src: []const u8, src_off: usize, len: usize) void {
+    var d = dst_off;
+    var s = src_off;
+    const end = dst_off + len;
+    while (d < end and (d & 7) != 0) : ({
+        d += 1;
+        s += 1;
+    }) writeBit(dst, d, bitIsSet(src, s));
+    const full = (end - d) >> 3;
+    if (full > 0) {
+        const di = d >> 3;
+        const si = s >> 3;
+        const shift: u3 = @intCast(s & 7);
+        if (shift == 0) {
+            @memcpy(dst[di..][0..full], src[si..][0..full]);
+        } else {
+            // Bits s .. s+8*full-1 are in range, so src[si + k + 1] is always readable here.
+            const back: u3 = @intCast(8 - @as(u4, shift));
+            for (0..full) |k| dst[di + k] = (src[si + k] >> shift) | (src[si + k + 1] << back);
+        }
+        d += full * 8;
+        s += full * 8;
+    }
+    while (d < end) : ({
+        d += 1;
+        s += 1;
+    }) writeBit(dst, d, bitIsSet(src, s));
+}
+
+// Set bits [off, off + len) of `dst` to 1.
+pub fn setBits(dst: []u8, off: usize, len: usize) void {
+    var d = off;
+    const end = off + len;
+    while (d < end and (d & 7) != 0) : (d += 1) setBit(dst, d);
+    const full = (end - d) >> 3;
+    @memset(dst[d >> 3 ..][0..full], 0xFF);
+    d += full * 8;
+    while (d < end) : (d += 1) setBit(dst, d);
+}
+
 fn clearTrailingBits(bytes: []u8, len: usize, valid: bool) void {
     if (len == 0 or bytes.len == 0) return;
 
@@ -381,4 +424,26 @@ test "mutable validity bitmap clears trailing bits" {
     try std.testing.expectEqual(@as(usize, 2), buf.len());
     try std.testing.expectEqual(@as(u8, 0b0000_0011), buf.data[1]);
     try std.testing.expectEqual(@as(usize, 10), bitmap.countValid());
+}
+
+test "copyBits and setBits match a bit-by-bit reference" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    var src: [40]u8 = undefined;
+    rand.bytes(&src);
+    var trial: usize = 0;
+    while (trial < 500) : (trial += 1) {
+        const src_off = rand.uintLessThan(usize, 64);
+        const dst_off = rand.uintLessThan(usize, 64);
+        const len = rand.uintLessThan(usize, 200);
+        var fast: [40]u8 = undefined;
+        rand.bytes(&fast);
+        var slow = fast;
+        copyBits(&fast, dst_off, &src, src_off, len);
+        for (0..len) |i| writeBit(&slow, dst_off + i, bitIsSet(&src, src_off + i));
+        try std.testing.expectEqualSlices(u8, &slow, &fast);
+        setBits(&fast, dst_off, len);
+        for (0..len) |i| setBit(&slow, dst_off + i);
+        try std.testing.expectEqualSlices(u8, &slow, &fast);
+    }
 }
