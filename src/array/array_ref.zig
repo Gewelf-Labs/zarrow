@@ -19,7 +19,19 @@ const ArrayNode = struct {
     owner_ctx: ?*anyopaque = null,
     owner_retain: ?*const fn (?*anyopaque) void = null,
     owner_release: ?*const fn (?*anyopaque) void = null,
+    // True when `data.buffers` lives in this node's own allocation (see `fromOwnedInlineBuffers`).
+    inline_buffers: bool = false,
 };
+
+fn inlineBufferBlockSize(count: usize) usize {
+    return @sizeOf(ArrayNode) + count * @sizeOf(SharedBuffer);
+}
+
+fn inlineBuffers(node: *ArrayNode, count: usize) []SharedBuffer {
+    const base: [*]u8 = @ptrCast(node);
+    const ptr: [*]SharedBuffer = @ptrCast(@alignCast(base + @sizeOf(ArrayNode)));
+    return ptr[0..count];
+}
 
 pub const ArrayRef = struct {
     // Pointer to shared array node.
@@ -40,7 +52,7 @@ pub const ArrayRef = struct {
             var owned = buf;
             owned.release();
         }
-        allocator.free(self.node.data.buffers);
+        if (!self.node.inline_buffers) allocator.free(self.node.data.buffers);
 
         for (self.node.data.children) |child| {
             var owned = child;
@@ -56,7 +68,12 @@ pub const ArrayRef = struct {
         if (self.node.owner_release) |owner_release| {
             owner_release(self.node.owner_ctx);
         }
-        allocator.destroy(self.node);
+        if (self.node.inline_buffers) {
+            const block: [*]align(@alignOf(ArrayNode)) u8 = @ptrCast(self.node);
+            allocator.free(block[0..inlineBufferBlockSize(self.node.data.buffers.len)]);
+        } else {
+            allocator.destroy(self.node);
+        }
     }
 
     /// Borrow immutable access to the underlying array layout.
@@ -73,18 +90,6 @@ pub const ArrayRef = struct {
     pub fn slice(self: ArrayRef, offset: usize, length: usize) !ArrayRef {
         var sliced = self.node.data.slice(offset, length);
         const allocator = self.node.allocator;
-
-        const buffers = try allocator.alloc(SharedBuffer, sliced.buffers.len);
-        errdefer {
-            for (buffers) |buf| {
-                var owned = buf;
-                owned.release();
-            }
-            allocator.free(buffers);
-        }
-        for (sliced.buffers, 0..) |buf, i| {
-            buffers[i] = buf.retain();
-        }
 
         const children = try allocator.alloc(ArrayRef, sliced.children.len);
         var child_count: usize = 0;
@@ -133,17 +138,54 @@ pub const ArrayRef = struct {
             },
         }
 
-        sliced.buffers = buffers;
         sliced.children = children;
         sliced.dictionary = dict_ref;
 
-        return ArrayRef.fromOwnedWithOwner(
+        // Buffers are copied into the node allocation and retained afterwards (nothing below can fail).
+        const out = try ArrayRef.fromOwnedInlineBuffersWithOwner(
             allocator,
             sliced,
             self.node.owner_ctx,
             self.node.owner_retain,
             self.node.owner_release,
         );
+        for (out.node.data.buffers) |buf| _ = buf.retain();
+        return out;
+    }
+
+    /// Like `fromOwnedUnsafe`, but `layout.buffers` is copied into the node's
+    /// own allocation (the caller keeps ownership of the slice, the node owns
+    /// the buffer references), saving one allocation per array.
+    pub fn fromOwnedInlineBuffers(allocator: std.mem.Allocator, layout: ArrayData) !ArrayRef {
+        return fromOwnedInlineBuffersWithOwner(allocator, layout, null, null, null);
+    }
+
+    pub fn fromOwnedInlineBuffersWithOwner(
+        allocator: std.mem.Allocator,
+        layout: ArrayData,
+        owner_ctx: ?*anyopaque,
+        owner_retain: ?*const fn (?*anyopaque) void,
+        owner_release: ?*const fn (?*anyopaque) void,
+    ) !ArrayRef {
+        if (owner_retain) |retain_fn| retain_fn(owner_ctx);
+        errdefer if (owner_release) |release_fn| release_fn(owner_ctx);
+
+        const block = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(@alignOf(ArrayNode)), inlineBufferBlockSize(layout.buffers.len));
+        const node: *ArrayNode = @ptrCast(block.ptr);
+        const buffers = inlineBuffers(node, layout.buffers.len);
+        @memcpy(buffers, layout.buffers);
+        var owned = layout;
+        owned.buffers = buffers;
+        node.* = .{
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(u32).init(1),
+            .data = owned,
+            .owner_ctx = owner_ctx,
+            .owner_retain = owner_retain,
+            .owner_release = owner_release,
+            .inline_buffers = true,
+        };
+        return .{ .node = node };
     }
 
     /// Create an ArrayRef by wrapping an owned ArrayData layout.

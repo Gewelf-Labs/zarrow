@@ -155,19 +155,15 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
             self.buffers[0] = validity_buf;
             self.buffers[1] = try self.values.toShared(self.len * @sizeOf(T));
 
-            const buffers = try self.allocator.alloc(SharedBuffer, 2);
-            buffers[0] = self.buffers[0];
-            buffers[1] = self.buffers[1];
-
             const data = ArrayData{
                 .data_type = TYPE,
                 .length = self.len,
                 .null_count = self.null_count,
-                .buffers = buffers,
+                .buffers = self.buffers[0..],
             };
 
             self.state = .finished;
-            return ArrayRef.fromOwnedUnsafe(self.allocator, data);
+            return ArrayRef.fromOwnedInlineBuffers(self.allocator, data);
         }
 
         /// Finalize output and then reset builder state for reuse.

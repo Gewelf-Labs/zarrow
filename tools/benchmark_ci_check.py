@@ -20,6 +20,7 @@ EXPECTED_BENCHES = {
     "primitive_builder",
     "record_batch_builder",
     "struct_builder",
+    "take",
 }
 
 
