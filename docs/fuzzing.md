@@ -128,6 +128,23 @@ If an input is valid Arrow that zarrow rejects (an Arrow writer produced it), th
 compatibility gap, not a fuzz bug: open an issue, do not add it as a regression seed that
 expects rejection.
 
+## Docker (the Linux campaign from any host)
+
+`--fuzz` is Linux-only and Linux builds the vendored codecs with UBSan, so the complete campaign
+runs in a container. The image holds just Debian, Python and a sha256-checked Zig release; the
+checkout is mounted, so findings land in `.fuzz-out` on the host; Zig's caches live in a named
+Docker volume (`zarrow-fuzz-cache-<version>`), because Zig renames cache directories and a bind
+mount of a Windows checkout refuses that:
+
+```sh
+sh tools/fuzz_docker.sh 600 2M               # 10 min mutation per target, then 2M coverage-guided iterations
+ZIG_VERSION=0.16.0 sh tools/fuzz_docker.sh   # same on the other compiler
+```
+
+It replays the corpus, runs `tools/fuzz.py` on every target, runs `zig build fuzz-test --fuzz`,
+prints the triage report and exits 1 if anything was found. Reproduce a Linux-only finding the
+same way: `docker run --rm -v "$PWD:/work" -v zarrow-fuzz-cache-0.17.0:/cache --entrypoint zig zarrow-fuzz:0.17.0 build fuzz -- <target> replay <file>`.
+
 ## Coverage-guided fuzzing (Zig's built-in fuzzer)
 
 Each target is also a `std.testing.fuzz` test in `fuzz/fuzz.zig`. Plain `zig build test` runs
