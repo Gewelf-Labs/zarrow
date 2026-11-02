@@ -98,8 +98,8 @@ fn takeChunked(
     pieces: *std.ArrayList(ArrayRef),
 ) KernelError!void {
     const n = chunks.numChunks();
-    if (n == 0 or !hasTakeKernel(out_type)) {
-        // Per-row path: one 1-row slice (or null row) per index.
+    if (n == 0) {
+        // No chunks: only null indices are valid (one null row each).
         try pieces.ensureUnusedCapacity(allocator, indices.len);
         for (indices) |m| pieces.appendAssumeCapacity(if (@as(?usize, m)) |idx|
             try accessors.datumElementArrayAt(allocator, Datum.fromChunked(chunks), idx)
@@ -714,19 +714,240 @@ fn takeListViewArray(comptime T: type, allocator: std.mem.Allocator, src: *const
     return out;
 }
 
-/// Layouts with a direct take kernel; the rest (views, dense unions, run-end encoded) take row
-/// by row (slice + concat).
-fn hasTakeKernel(dt: DataType) bool {
-    return switch (storageDataType(dt)) {
-        .string_view, .binary_view, .dense_union, .run_end_encoded => false,
-        else => true,
+/// Direct take for string_view/binary_view: gathers the 16-byte views (null index: zeroed view)
+/// and shares the variadic data buffers, so long views keep their buffer index and offset.
+fn takeByteViewArray(allocator: std.mem.Allocator, src: *const array_mod.ArrayData, indices: anytype) KernelError!ArrayRef {
+    if (src.buffers.len < 2) return error.InvalidInput;
+    const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    const views = src.buffers[1].data;
+    if (views.len / 16 < src_end) return error.InvalidInput;
+    const src_validity = try validityBytes(src, src_end);
+    try checkIndices(indices, src.length);
+    const out_len = indices.len;
+
+    var out_views = buffer.OwnedBuffer.initUninit(allocator, out_len * 16) catch return error.OutOfMemory;
+    errdefer out_views.deinit();
+    const s = std.mem.bytesAsSlice([16]u8, views[src.offset * 16 ..][0 .. src.length * 16]);
+    for (indices, std.mem.bytesAsSlice([16]u8, out_views.data[0 .. out_len * 16])) |m, *o| o.* = if (@as(?usize, m)) |j| s[j] else @splat(0);
+    var validity = buffer.OwnedBuffer.init(allocator, bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer validity.deinit();
+    const null_count = out_len - gatherBits(validity.data, src_validity, src.offset, indices);
+
+    const buffers = allocator.alloc(buffer.SharedBuffer, src.buffers.len) catch return error.OutOfMemory;
+    defer allocator.free(buffers);
+    @memcpy(buffers[2..], src.buffers[2..]);
+    buffers[0] = if (null_count == 0) blk: {
+        validity.deinit();
+        break :blk buffer.SharedBuffer.empty;
+    } else validity.toShared(bitmap.byteLength(out_len)) catch return error.OutOfMemory;
+    errdefer buffers[0].release();
+    buffers[1] = out_views.toShared(out_len * 16) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+
+    const out = ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = null_count,
+        .buffers = buffers,
+    }) catch return error.OutOfMemory;
+    for (buffers[2..]) |b| _ = b.retain();
+    return out;
+}
+
+/// Direct take for dense unions: gathers type ids (null index: the first declared type id with a
+/// null row of that child) and gives every child the list of its rows in output order; the new
+/// offsets are the running count per child. Children are indexed by the offsets, not by row.
+fn takeDenseUnionArray(allocator: std.mem.Allocator, src: *const array_mod.ArrayData, indices: anytype) KernelError!ArrayRef {
+    const uni = storageDataType(src.data_type).dense_union;
+    const nchildren = src.children.len;
+    if (src.buffers.len < 2 or nchildren != uni.fields.len or nchildren > 128) return error.InvalidInput;
+    const src_end = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    const ids = src.buffers[0].data;
+    const offsets = src.buffers[1].typedSlice(i32) catch return error.InvalidInput;
+    if (ids.len < src_end or offsets.len < src_end) return error.InvalidInput;
+    try checkIndices(indices, src.length);
+    const out_len = indices.len;
+
+    // Type id -> child index (0xFF: undeclared); without declared ids the id is the child index.
+    var child_of: [256]u8 = @splat(0xFF);
+    if (uni.type_ids.len == 0) {
+        for (0..nchildren) |c| child_of[c] = @intCast(c);
+    } else {
+        if (uni.type_ids.len != nchildren) return error.InvalidInput;
+        var c = nchildren;
+        while (c > 0) : (c -= 1) child_of[@as(u8, @bitCast(uni.type_ids[c - 1]))] = @intCast(c - 1); // first id wins
+    }
+    const first: u8 = if (uni.type_ids.len > 0) @bitCast(uni.type_ids[0]) else 0;
+
+    var out_ids = buffer.OwnedBuffer.initUninit(allocator, out_len) catch return error.OutOfMemory;
+    errdefer out_ids.deinit();
+    var out_offsets = buffer.OwnedBuffer.initUninit(allocator, out_len * 4) catch return error.OutOfMemory;
+    errdefer out_offsets.deinit();
+    const o = out_offsets.typedSlice(i32)[0..out_len];
+    var starts: [129]usize = @splat(0); // rows per child, then (prefix sums) where its rows start
+    for (indices, out_ids.data[0..out_len], o) |m, *id, *off| {
+        id.* = if (@as(?usize, m)) |j| ids[src.offset + j] else first;
+        const c = child_of[id.*];
+        if (c == 0xFF) return error.InvalidInput;
+        if (@as(?usize, m)) |j| {
+            const row = std.math.cast(usize, offsets[src.offset + j]) orelse return error.InvalidInput;
+            if (row >= src.children[c].data().length) return error.InvalidInput;
+        }
+        off.* = @intCast(starts[c + 1]);
+        starts[c + 1] += 1;
+    }
+    for (1..nchildren + 1) |c| starts[c] += starts[c - 1];
+
+    // Dense indices: child rows are i32 offsets, so u32 holds them.
+    const E = if (comptime isDense(@TypeOf(indices))) u32 else ?usize;
+    const rows = allocator.alloc(E, out_len) catch return error.OutOfMemory;
+    defer allocator.free(rows);
+    for (indices, out_ids.data[0..out_len], o) |m, id, off| {
+        const row: E = if (@as(?usize, m)) |j| @intCast(offsets[src.offset + j]) else if (comptime E == u32) unreachable else null;
+        rows[starts[child_of[id]] + @as(usize, @intCast(off))] = row;
+    }
+
+    const children = allocator.alloc(ArrayRef, nchildren) catch return error.OutOfMemory;
+    var built: usize = 0;
+    errdefer {
+        for (children[0..built]) |*child| child.release();
+        allocator.free(children);
+    }
+    for (src.children, children, 0..) |child, *out, c| {
+        out.* = try takeChild(allocator, child, @as([]const E, rows[starts[c]..starts[c + 1]]));
+        built += 1;
+    }
+
+    var buffers: [2]buffer.SharedBuffer = undefined;
+    buffers[0] = out_ids.toShared(out_len) catch return error.OutOfMemory;
+    errdefer buffers[0].release();
+    buffers[1] = out_offsets.toShared(out_len * 4) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = 0,
+        .buffers = buffers[0..],
+        .children = children,
+    }) catch return error.OutOfMemory;
+}
+
+/// Direct take for run_end_encoded: each index finds its physical run (binary search over the
+/// run ends, or a row map for dense takes; child coordinates: row offset + idx); consecutive rows
+/// of one run (or null indices) become one output run. The values child is taken once with one
+/// index per output run.
+fn takeRunEndEncodedArray(allocator: std.mem.Allocator, src: *const array_mod.ArrayData, indices: anytype) KernelError!ArrayRef {
+    const re = storageDataType(src.data_type).run_end_encoded.run_end_type;
+    if (!re.signed) return error.InvalidInput;
+    return switch (re.bit_width) {
+        16 => takeRunEnds(i16, allocator, src, indices),
+        32 => takeRunEnds(i32, allocator, src, indices),
+        64 => takeRunEnds(i64, allocator, src, indices),
+        else => error.InvalidInput,
     };
+}
+
+fn takeRunEnds(comptime T: type, allocator: std.mem.Allocator, src: *const array_mod.ArrayData, indices: anytype) KernelError!ArrayRef {
+    if (src.children.len != 2) return error.InvalidInput;
+    const run_ends = src.children[0].data();
+    if (run_ends.buffers.len < 2) return error.InvalidInput;
+    const all = run_ends.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const ends_end = std.math.add(usize, run_ends.offset, run_ends.length) catch return error.Overflow;
+    if (all.len < ends_end) return error.InvalidInput;
+    const ends = all[run_ends.offset..ends_end];
+    if (src.children[1].data().length != ends.len) return error.InvalidInput;
+    _ = std.math.add(usize, src.offset, src.length) catch return error.Overflow;
+    try checkIndices(indices, src.length);
+    const out_len = indices.len;
+    if (out_len > std.math.maxInt(T)) return error.InvalidInput;
+
+    const P = if (comptime isDense(@TypeOf(indices))) usize else ?usize;
+    const phys = allocator.alloc(P, out_len) catch return error.OutOfMemory;
+    defer allocator.free(phys);
+    var out_ends = buffer.OwnedBuffer.initUninit(allocator, out_len * @sizeOf(T)) catch return error.OutOfMemory;
+    errdefer out_ends.deinit();
+    const e = out_ends.typedSlice(T)[0..out_len];
+    // Dense takes map every window row to its run in one merge pass; sparse ones binary-search.
+    // ponytail: 1/16 is a guess at where n log(runs) loses to one pass over the window.
+    const map: ?[]u32 = if (out_len >= src.length / 16 and ends.len <= std.math.maxInt(u32)) try runMap(T, allocator, ends, src.offset, src.length) else null;
+    defer if (map) |m| allocator.free(m);
+    const none = std.math.maxInt(usize); // run of a null index
+    var runs: usize = 0;
+    var prev: usize = none;
+    for (indices, 0..) |m, i| {
+        const k: usize = if (@as(?usize, m)) |idx| (if (map) |rm| rm[idx] else try findRun(T, ends, src.offset + idx)) else none;
+        if (i == 0 or k != prev) {
+            phys[runs] = if (comptime P == usize) k else if (k == none) null else k;
+            runs += 1;
+        }
+        e[runs - 1] = @intCast(i + 1);
+        prev = k;
+    }
+
+    const children = allocator.alloc(ArrayRef, 2) catch return error.OutOfMemory;
+    errdefer allocator.free(children);
+    var ends_buffers: [2]buffer.SharedBuffer = .{ buffer.SharedBuffer.empty, out_ends.toShared(runs * @sizeOf(T)) catch return error.OutOfMemory };
+    children[0] = ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = switch (T) {
+            i16 => .{ .int16 = {} },
+            i32 => .{ .int32 = {} },
+            else => .{ .int64 = {} },
+        },
+        .length = runs,
+        .null_count = 0,
+        .buffers = ends_buffers[0..],
+    }) catch {
+        ends_buffers[1].release();
+        return error.OutOfMemory;
+    };
+    errdefer children[0].release();
+    children[1] = try takeChild(allocator, src.children[1], @as([]const P, phys[0..runs]));
+    errdefer children[1].release();
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = src.data_type,
+        .length = out_len,
+        .null_count = 0,
+        .buffers = &.{},
+        .children = children,
+    }) catch return error.OutOfMemory;
+}
+
+/// First run whose end is past `pos`. Non-monotone (hostile) run ends still give an in-bounds run.
+fn findRun(comptime T: type, ends: []const T, pos: usize) KernelError!usize {
+    const p = std.math.cast(T, pos) orelse return error.InvalidInput;
+    if (ends.len == 0) return error.InvalidInput;
+    var base: usize = 0;
+    var n = ends.len;
+    while (n > 1) {
+        const half = n / 2;
+        if (ends[base + half - 1] <= p) base += half;
+        n -= half;
+    }
+    base += @intFromBool(ends[base] <= p);
+    if (base == ends.len) return error.InvalidInput;
+    return base;
+}
+
+/// Run of every row `offset .. offset + len` (merge walk over the run ends); every row must be covered.
+fn runMap(comptime T: type, allocator: std.mem.Allocator, ends: []const T, offset: usize, len: usize) KernelError![]u32 {
+    if (len > 0 and std.math.cast(T, offset + len - 1) == null) return error.InvalidInput;
+    const map = allocator.alloc(u32, len) catch return error.OutOfMemory;
+    errdefer allocator.free(map);
+    var k: usize = 0;
+    for (map, offset..) |*r, pos| {
+        while (k < ends.len and ends[k] <= @as(T, @intCast(pos))) k += 1;
+        if (k == ends.len) return error.InvalidInput;
+        r.* = @intCast(k);
+    }
+    return map;
 }
 
 /// Direct take by layout; extension arrays take their storage layout and keep their type.
 fn takeArray(allocator: std.mem.Allocator, src: *const array_mod.ArrayData, indices: anytype) KernelError!?ArrayRef {
-    if (!hasTakeKernel(src.data_type)) return null;
     return switch (storageDataType(src.data_type)) {
+        .string_view, .binary_view => try takeByteViewArray(allocator, src, indices),
+        .dense_union => try takeDenseUnionArray(allocator, src, indices),
+        .run_end_encoded => try takeRunEndEncodedArray(allocator, src, indices),
         .null => blk: {
             try checkIndices(indices, src.length);
             break :blk ArrayRef.fromOwnedInlineBuffers(allocator, .{

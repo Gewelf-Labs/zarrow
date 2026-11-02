@@ -1194,6 +1194,17 @@ fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool 
             }
             return true;
         },
+        .string_view, .binary_view => {
+            const x = (array_mod.StringViewArray{ .data = a }).value(i) catch return false;
+            const y = (array_mod.StringViewArray{ .data = b }).value(j) catch return false;
+            return std.mem.eql(u8, x, y);
+        },
+        .dense_union, .run_end_encoded => {
+            if (dt == .dense_union and a.buffers[0].data[ai] != b.buffers[0].data[bj]) return false;
+            const x = childRow(a, i);
+            const y = childRow(b, j);
+            return rowsEqual(x[0], x[1], y[0], y[1]);
+        },
         .struct_, .sparse_union => {
             if (dt == .sparse_union and a.buffers[0].data[ai] != b.buffers[0].data[bj]) return false;
             for (a.children, b.children) |ca, cb| {
@@ -1207,19 +1218,41 @@ fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool 
     }
 }
 
+/// Child array and child row holding logical row `i` of a dense union (int32 offsets) or a
+/// run-end encoded array (int32 run ends).
+fn childRow(a: *const ArrayData, i: usize) struct { *const ArrayData, usize } {
+    const ai = a.offset + i;
+    if (a.data_type == .dense_union) {
+        const c = std.mem.indexOfScalar(i8, a.data_type.dense_union.type_ids, @bitCast(a.buffers[0].data[ai])).?;
+        return .{ a.children[c].data(), @intCast((a.buffers[1].typedSlice(i32) catch unreachable)[ai]) };
+    }
+    const re = a.children[0].data();
+    const ends = (re.buffers[1].typedSlice(i32) catch unreachable)[re.offset..][0..re.length];
+    var k: usize = 0;
+    while (ends[k] <= ai) k += 1;
+    return .{ a.children[1].data(), k };
+}
+
 fn expectRowsMatchSource(out: *const ArrayData, src: *const ArrayData, indices: []const ?usize) !void {
     try out.validateFull();
     try std.testing.expectEqual(indices.len, out.length);
     for (indices, 0..) |maybe, i| {
         if (maybe) |idx| {
             try std.testing.expect(rowsEqual(out, i, src, idx));
-        } else if (out.data_type != .sparse_union) try std.testing.expect(out.isNull(i));
+        } else switch (out.data_type) {
+            .sparse_union => {},
+            .dense_union, .run_end_encoded => {
+                const x = childRow(out, i);
+                try std.testing.expect(x[0].isNull(x[1]));
+            },
+            else => try std.testing.expect(out.isNull(i)),
+        }
     }
 }
 
 /// Six-row arrays of every layout with a take kernel, each with nulls or null children.
 const NestedSources = struct {
-    arrays: [13]ArrayRef,
+    arrays: [17]ArrayRef,
     count: usize = 0,
 
     fn add(self: *NestedSources, arr: ArrayRef) void {
@@ -1354,6 +1387,35 @@ fn buildNestedSources(allocator: std.mem.Allocator) !NestedSources {
     defer lsb.deinit();
     for ([_]?usize{ 2, null, 0, 3, 1, 0 }) |v| if (v) |n| try lsb.appendLen(n) else try lsb.appendNull();
     out.add(try lsb.finish(pair));
+
+    // string_view and binary_view: inline (<= 12 bytes) and out-of-line values.
+    const view_values = [_]?[]const u8{ "x", null, "a long string value 1", "", "another long value 22", "short12chars" };
+    var svb = try array_mod.StringViewBuilder.init(allocator, 6, 0);
+    defer svb.deinit();
+    for (view_values) |v| if (v) |x| try svb.append(x) else try svb.appendNull();
+    out.add(try svb.finish());
+    var bvb = try array_mod.BinaryViewBuilder.init(allocator, 6, 0);
+    defer bvb.deinit();
+    for (view_values) |v| if (v) |x| try bvb.append(x) else try bvb.appendNull();
+    out.add(try bvb.finish());
+
+    // dense union<a: int32 = 5, b: string = 7>, children shorter than the union and with nulls.
+    var dub = try array_mod.DenseUnionBuilder.init(allocator, .{ .type_ids = &nested_union_ids, .fields = &nested_pair_fields, .mode = .dense }, 6);
+    defer dub.deinit();
+    for ([_]i8{ 5, 7, 5, 7, 5, 7 }, [_]i32{ 0, 2, 1, 0, 3, 1 }) |id, off| try dub.append(id, off);
+    var dints = try makeInt32Array(allocator, &.{ 1, null, 3, 4 });
+    defer dints.release();
+    var dstrs = try makeStrings(allocator, &.{ "p", null, "a long dense union string" });
+    defer dstrs.release();
+    out.add(try dub.finish(&.{ dints, dstrs }));
+
+    // run_end_encoded<int32, int32>: runs of 2, 1, 2, 1 rows, the second run null.
+    var reb = try array_mod.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &nested_int32_type, 4);
+    defer reb.deinit();
+    for ([_]i64{ 2, 3, 5, 6 }) |e| try reb.appendRunEnd(e);
+    var rvals = try makeInt32Array(allocator, &.{ 10, null, 30, 40 });
+    defer rvals.release();
+    out.add(try reb.finish(rvals));
     return out;
 }
 
@@ -1396,7 +1458,7 @@ test "concatArrayRefs N-ary nested path matches the source rows for sliced parts
         var joined = concatArrayRefs(allocator, full.data().data_type, &parts) catch |err| {
             // Unions and list views have no concat (unchanged); every other layout must concat.
             const tag = full.data().data_type;
-            try std.testing.expect(err == error.UnsupportedType and (tag == .sparse_union or tag == .list_view));
+            try std.testing.expect(err == error.UnsupportedType and (tag == .sparse_union or tag == .list_view or tag == .dense_union or tag == .run_end_encoded));
             continue;
         };
         defer joined.release();
@@ -1495,4 +1557,110 @@ test "compute chunked take and filter run the array kernels per chunk and match 
         }
     }
     try std.testing.expectEqual(dict_indices.len, row);
+}
+
+test "compute take kernels for views, dense unions and run-end encoded arrays reject hostile inputs and run per chunk" {
+    const allocator = std.testing.allocator;
+    var sources = try buildNestedSources(allocator);
+    defer sources.deinit();
+    const views = sources.arrays[13];
+    const dense = sources.arrays[15];
+    const ree = sources.arrays[16];
+
+    // Chunked: two chunks per source; sorted indices give one piece per chunk (or one after concat).
+    for (sources.arrays[13..17]) |full| {
+        var chunk_parts = [_]ArrayRef{ try full.slice(0, 2), try full.slice(2, 4) };
+        defer for (&chunk_parts) |*c| c.release();
+        var chunked = try ChunkedArray.init(allocator, full.data().data_type, &chunk_parts);
+        defer chunked.release();
+        for ([_][]const ?usize{ &.{ 0, 1, null, 2, 3, 4, 5 }, &.{ 5, 0, null, 3, 1, 4, 2 } }, [_]usize{ 2, 5 }) |indices, max_pieces| {
+            var taken = try datumTakeNullable(Datum.fromChunked(chunked), indices);
+            defer taken.release();
+            try std.testing.expect(taken.chunked.numChunks() <= max_pieces);
+            var row: usize = 0;
+            for (taken.chunked.chunks()) |piece| {
+                try expectRowsMatchSource(piece.data(), full.data(), indices[row..][0..piece.data().length]);
+                row += piece.data().length;
+            }
+            try std.testing.expectEqual(indices.len, row);
+        }
+    }
+
+    const buffer_mod = @import("../buffer.zig");
+    // Views buffer shorter than the array.
+    const short_bufs = [_]buffer_mod.SharedBuffer{ buffer_mod.SharedBuffer.empty, buffer_mod.SharedBuffer.fromSlice(views.data().buffers[1].data[0..80]), views.data().buffers[2] };
+    var short_views = views.data().*;
+    short_views.buffers = &short_bufs;
+    short_views.null_count = null;
+    var short_ref = try ArrayRef.fromBorrowed(allocator, short_views);
+    defer short_ref.release();
+    try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(short_ref), &.{0}));
+
+    // Dense union: undeclared type id, negative offset, offset past the child.
+    const ids_bad = [_]u8{ 5, 9, 5, 7, 5, 7 };
+    var offs_neg: [6]i32 align(buffer_mod.ALIGNMENT) = .{ 0, 2, -1, 0, 3, 1 };
+    var offs_far: [6]i32 align(buffer_mod.ALIGNMENT) = .{ 0, 2, 1, 0, 4, 1 };
+    const ids_ok = dense.data().buffers[0];
+    const offs_ok = dense.data().buffers[1];
+    for ([_][2]buffer_mod.SharedBuffer{
+        .{ buffer_mod.SharedBuffer.fromSlice(&ids_bad), offs_ok },
+        .{ ids_ok, buffer_mod.SharedBuffer.fromSlice(std.mem.sliceAsBytes(&offs_neg)) },
+        .{ ids_ok, buffer_mod.SharedBuffer.fromSlice(std.mem.sliceAsBytes(&offs_far)) },
+    }, [_]usize{ 1, 2, 4 }) |bufs, bad_row| {
+        var bad = dense.data().*;
+        bad.buffers = &bufs;
+        var bad_ref = try ArrayRef.fromBorrowed(allocator, bad);
+        defer bad_ref.release();
+        try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(bad_ref), &.{ 0, bad_row }));
+        var ok = try datumTake(Datum.fromArray(bad_ref), &.{ 0, 5 }); // the other rows still take
+        ok.release();
+    }
+
+    // Run-end encoded: run ends that do not cover the length (row map and binary search paths),
+    // and an output too long for int16.
+    for ([_]usize{ 8, 100 }) |len| {
+        var long_ree = ree.data().*;
+        long_ree.length = len;
+        var long_ref = try ArrayRef.fromBorrowed(allocator, long_ree);
+        defer long_ref.release();
+        try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(long_ref), &.{ 1, 6 }));
+    }
+    // A sparse take (binary search) and a dense one (row map) of 16 runs of 8 rows.
+    var reb32 = try array_mod.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &nested_int32_type, 16);
+    defer reb32.deinit();
+    var run_vals: [16]?i32 = undefined;
+    for (&run_vals, 0..) |*v, k| {
+        try reb32.appendRunEnd(@intCast(8 * k + 8));
+        v.* = if (k % 5 == 2) null else @intCast(k);
+    }
+    var rv = try makeInt32Array(allocator, &run_vals);
+    defer rv.release();
+    var ree128 = try reb32.finish(rv);
+    defer ree128.release();
+    var ree_sliced = try ree128.slice(3, 120);
+    defer ree_sliced.release();
+    var dense_idx: [120]?usize = undefined;
+    for (&dense_idx, 0..) |*d, k| d.* = if (k % 9 == 4) null else (k * 37) % 120;
+    for ([_]ArrayRef{ ree128, ree_sliced }) |src| {
+        for ([_][]const ?usize{ &.{ 119, 0, 1, null, 17, 18 }, &dense_idx }) |indices| {
+            var taken = try datumTakeNullable(Datum.fromArray(src), indices);
+            defer taken.release();
+            try expectRowsMatchSource(taken.array.data(), src.data(), indices);
+        }
+    }
+    var reb = try array_mod.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 16, .signed = true }, &nested_int32_type, 1);
+    defer reb.deinit();
+    try reb.appendRunEnd(3);
+    var one = try makeInt32Array(allocator, &.{7});
+    defer one.release();
+    var ree16 = try reb.finish(one);
+    defer ree16.release();
+    const many = try allocator.alloc(usize, 40_000);
+    defer allocator.free(many);
+    @memset(many, 2);
+    try std.testing.expectError(error.InvalidInput, datumTake(Datum.fromArray(ree16), many));
+    var fits = try datumTake(Datum.fromArray(ree16), many[0..30_000]);
+    defer fits.release();
+    try fits.array.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 1), fits.array.data().children[0].data().length); // one merged run
 }
