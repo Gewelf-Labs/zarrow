@@ -213,8 +213,8 @@ fn computeTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
     }
 }
 
-/// slice/take/filter/concat on an array that passed validateFull; every output must validate
-/// and have the expected length, otherwise the kernel broke an invariant (a finding).
+/// slice/take/filter/concat/dictionaryEncode on an array that passed validateFull; every output
+/// must validate and have the expected length, otherwise the kernel broke an invariant (a finding).
 fn exerciseCompute(gpa: Allocator, arr: ArrayRef, rng: std.Random) !void {
     const len = arr.data().length;
     const off = rng.uintAtMost(usize, len);
@@ -259,6 +259,19 @@ fn exerciseCompute(gpa: Allocator, arr: ArrayRef, rng: std.Random) !void {
         var out = joined;
         defer out.release();
         expectValid("concat", out, len + sub_len);
+    } else |_| {}
+
+    // dictionaryEncode, and a concat of two parts encoded apart (different dictionaries: unified).
+    const value_type = &arr.data().data_type;
+    var encoded = zarrow.dictionaryEncode(gpa, arr, value_type) catch return;
+    defer encoded.release();
+    expectValid("dictionaryEncode", encoded, len);
+    var encoded_slice = zarrow.dictionaryEncode(gpa, sliced, value_type) catch return;
+    defer encoded_slice.release();
+    if (zarrow.concatArrayRefs(gpa, encoded.data().data_type, &.{ encoded, encoded_slice })) |joined| {
+        var out = joined;
+        defer out.release();
+        expectValid("dictionary concat", out, len + sub_len);
     } else |_| {}
 }
 

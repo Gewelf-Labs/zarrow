@@ -41,11 +41,14 @@ fn timeConcat(io: std.Io, allocator: std.mem.Allocator, name: []const u8, source
         part.* = try source.slice(start, @min(part_rows, cfg.rows - start));
     }
     defer for (parts) |*part| part.release();
+    try timeParts(io, allocator, name, source.data().data_type, parts, cfg, emit_csv, meta);
+}
 
+fn timeParts(io: std.Io, allocator: std.mem.Allocator, name: []const u8, dt: zarrow.DataType, parts: []const zarrow.ArrayRef, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
     var checksum: usize = 0;
     const timer_start = std.Io.Timestamp.now(io, .awake);
     for (0..cfg.iterations) |_| {
-        var out = try zarrow.concatArrayRefs(allocator, source.data().data_type, parts);
+        var out = try zarrow.concatArrayRefs(allocator, dt, parts);
         defer out.release();
         checksum += out.data().length + (out.data().null_count orelse 0);
     }
@@ -142,6 +145,31 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var rees = try reb.finish(run_values);
     defer rees.release();
     try timeConcat(io, allocator, "concat_nested_ree", rees, cfg, emit_csv, meta);
+
+    // dictionary<int32, string>: separate 16-row parts, each with its own 16-value dictionary whose
+    // first 8 values repeat in every part (the merged dictionary gets the other 8 of each part).
+    const part_count = (cfg.rows + 15) / 16;
+    const dict_parts = try allocator.alloc(zarrow.ArrayRef, part_count);
+    defer allocator.free(dict_parts);
+    var built: usize = 0;
+    defer for (dict_parts[0..built]) |*part| part.release();
+    var tmp: [32]u8 = undefined;
+    for (dict_parts, 0..) |*part, p| {
+        var vb = try zarrow.StringBuilder.init(allocator, 16, 256);
+        defer vb.deinit();
+        for (0..16) |k| try vb.append(if (k < 8)
+            std.fmt.bufPrint(&tmp, "common-{d}", .{k}) catch unreachable
+        else
+            std.fmt.bufPrint(&tmp, "part-{d}-{d}", .{ p, k }) catch unreachable);
+        var dict = try vb.finish();
+        defer dict.release();
+        var db = try zarrow.DictionaryBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &str_type, 16);
+        defer db.deinit();
+        for (0..@min(16, cfg.rows - p * 16)) |r| if ((p * 16 + r) % 7 == 0) try db.appendNull() else try db.appendIndex(@intCast((r * 5 + p) % 16));
+        part.* = try db.finish(dict);
+        built += 1;
+    }
+    try timeParts(io, allocator, "concat_nested_dictionary", dict_parts[0].data().data_type, dict_parts, cfg, emit_csv, meta);
 }
 
 pub fn main(init: std.process.Init) !void {

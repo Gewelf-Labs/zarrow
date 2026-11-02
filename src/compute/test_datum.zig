@@ -1669,7 +1669,7 @@ test "compute chunked take and filter run the array kernels per chunk and match 
         for (0..expected.array.data().length) |i| try std.testing.expect(rowsEqual(actual.array.data(), i, expected.array.data(), i));
     }
 
-    // Chunks with different dictionaries do not concat: the scattered take falls back to per-run pieces.
+    // Chunks with different dictionaries: the scattered take uses per-run pieces (no unification).
     const dict_type = DataType{ .string = {} };
     var dicts = [_]ArrayRef{ try makeStrings(allocator, &.{ "a", "b" }), try makeStrings(allocator, &.{ "c", "d", "e" }) };
     defer for (&dicts) |*d| d.release();
@@ -1700,6 +1700,21 @@ test "compute chunked take and filter run the array kernels per chunk and match 
         }
     }
     try std.testing.expectEqual(dict_indices.len, row);
+
+    // Filters of them return one array: the per-chunk pieces concat with one merged dictionary.
+    var dict_flat = try concatArrayRefs(allocator, dict_chunks[0].data().data_type, &dict_chunks);
+    defer dict_flat.release();
+    var dict_pred = try makeBoolArray(allocator, &.{ true, null, true, false, true, true, null, true });
+    defer dict_pred.release();
+    for ([_]bool{ true, false }) |drop_nulls| {
+        var expected = try datumFilter(Datum.fromArray(dict_flat), Datum.fromArray(dict_pred), .{ .drop_nulls = drop_nulls });
+        defer expected.release();
+        var actual = try datumFilter(Datum.fromChunked(dict_chunked), Datum.fromArray(dict_pred), .{ .drop_nulls = drop_nulls });
+        defer actual.release();
+        try actual.array.data().validateFull();
+        try std.testing.expectEqual(expected.array.data().length, actual.array.data().length);
+        for (0..expected.array.data().length) |i| try std.testing.expect(rowsEqual(actual.array.data(), i, expected.array.data(), i));
+    }
 }
 
 test "compute take kernels for views, dense unions and run-end encoded arrays reject hostile inputs and run per chunk" {
@@ -1806,4 +1821,176 @@ test "compute take kernels for views, dense unions and run-end encoded arrays re
     defer fits.release();
     try fits.array.data().validateFull();
     try std.testing.expectEqual(@as(usize, 1), fits.array.data().children[0].data().length); // one merged run
+}
+
+fn makeDictArray(allocator: std.mem.Allocator, dict: ArrayRef, value_type: *const DataType, index_type: datatype.IntType, indices: []const ?i64) !ArrayRef {
+    var db = try array_mod.DictionaryBuilder.init(allocator, index_type, value_type, indices.len);
+    defer db.deinit();
+    for (indices) |v| if (v) |x| try db.appendIndex(x) else try db.appendNull();
+    return db.finish(dict);
+}
+
+fn makeNumberedStrings(allocator: std.mem.Allocator, lo: usize, hi: usize) !ArrayRef {
+    var b = try array_mod.StringBuilder.init(allocator, 0, 0);
+    defer b.deinit();
+    var tmp: [16]u8 = undefined;
+    for (lo..hi) |k| try b.append(try std.fmt.bufPrint(&tmp, "v{d}", .{k}));
+    return b.finish();
+}
+
+test "concatArrayRefs unifies parts with different dictionaries" {
+    const allocator = std.testing.allocator;
+    const i32_index: datatype.IntType = .{ .bit_width = 32, .signed = true };
+    var da = try makeStrings(allocator, &.{ "a", null, "bb", "ccc" });
+    defer da.release();
+    var db_full = try makeStrings(allocator, &.{ "x", "bb", "zz", null, "a", "q" });
+    defer db_full.release();
+    var dbs = try db_full.slice(1, 5); // a sliced dictionary: "bb", "zz", null, "a", "q"
+    defer dbs.release();
+    var x = try makeDictArray(allocator, da, &nested_string_type, i32_index, &.{ 0, null, 2, 1, 3, 0 });
+    defer x.release();
+    var y = try makeDictArray(allocator, dbs, &nested_string_type, i32_index, &.{ 4, 0, null, 2, 1, 3, 4 });
+    defer y.release();
+    // int32 values: fixed-width keys, a null value in each dictionary.
+    var ia = try makeInt32Array(allocator, &.{ 5, 7, null });
+    defer ia.release();
+    var ib = try makeInt32Array(allocator, &.{ 7, null, 9, 5 });
+    defer ib.release();
+    var u = try makeDictArray(allocator, ia, &nested_int32_type, i32_index, &.{ 0, 1, 2, null });
+    defer u.release();
+    var v = try makeDictArray(allocator, ib, &nested_int32_type, i32_index, &.{ 3, 2, 1, 0, null });
+    defer v.release();
+
+    // Merged: the first dictionary, then the new values ("zz", "q" / 9); nulls share the first null slot.
+    for ([_][2]ArrayRef{ .{ x, y }, .{ u, v } }, [_]usize{ 6, 4 }) |pair, merged_len| {
+        var parts = [_]ArrayRef{ pair[0], try pair[1].slice(1, 4), try pair[0].slice(3, 0), pair[1], try pair[0].slice(1, 3) };
+        defer for ([_]usize{ 1, 2, 4 }) |k| parts[k].release();
+        var joined = try concatArrayRefs(allocator, pair[0].data().data_type, &parts);
+        defer joined.release();
+        try joined.data().validateFull();
+        try std.testing.expectEqual(merged_len, joined.data().dictionary.?.data().length);
+        var row: usize = 0;
+        for (parts) |p| for (0..p.data().length) |k| {
+            try std.testing.expect(rowsEqual(joined.data(), row, p.data(), k));
+            row += 1;
+        };
+        try std.testing.expectEqual(row, joined.data().length);
+    }
+
+    // As struct children the dictionary parts are child windows.
+    const fields = [_]datatype.Field{.{ .name = "d", .data_type = &x.data().data_type, .nullable = true }};
+    var structs: [2]ArrayRef = undefined;
+    for (&structs, [_]ArrayRef{ x, y }) |*s, child| {
+        var sb = array_mod.StructBuilder.init(allocator, &fields);
+        defer sb.deinit();
+        for (0..child.data().length) |r| if (r == 1) try sb.appendNull() else try sb.appendValid();
+        s.* = try sb.finish(&.{child});
+    }
+    defer for (&structs) |*s| s.release();
+    var s_parts = [_]ArrayRef{ structs[0], try structs[1].slice(2, 4) };
+    defer s_parts[1].release();
+    var s_joined = try concatArrayRefs(allocator, structs[0].data().data_type, &s_parts);
+    defer s_joined.release();
+    try s_joined.data().validateFull();
+    var s_row: usize = 0;
+    for (s_parts) |p| for (0..p.data().length) |k| {
+        try std.testing.expect(rowsEqual(s_joined.data(), s_row, p.data(), k));
+        s_row += 1;
+    };
+
+    // Out-of-range and negative indices in a part are rejected (hostile IPC / C ABI data).
+    for ([_][]const ?i64{ &.{ 0, 4 }, &.{-1} }) |bad| {
+        var z = try makeDictArray(allocator, da, &nested_string_type, i32_index, bad);
+        defer z.release();
+        try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, x.data().data_type, &.{ y, z }));
+    }
+
+    // uint8 indices: 200 + 56 new values fit (256 entries), 200 + 57 do not; the type is never widened.
+    const u8_index: datatype.IntType = .{ .bit_width = 8, .signed = false };
+    var d1 = try makeNumberedStrings(allocator, 0, 200);
+    defer d1.release();
+    var p1 = try makeDictArray(allocator, d1, &nested_string_type, u8_index, &.{ 0, 199 });
+    defer p1.release();
+    for ([_]usize{ 256, 257 }) |hi| {
+        var d2 = try makeNumberedStrings(allocator, 144, hi);
+        defer d2.release();
+        var p2 = try makeDictArray(allocator, d2, &nested_string_type, u8_index, &.{ 0, @intCast(hi - 145), null });
+        defer p2.release();
+        const result = concatArrayRefs(allocator, p1.data().data_type, &.{ p1, p2 });
+        if (hi == 257) {
+            try std.testing.expectError(error.InvalidInput, result);
+            continue;
+        }
+        var ok = try result;
+        defer ok.release();
+        try ok.data().validateFull();
+        try std.testing.expectEqual(@as(usize, 256), ok.data().dictionary.?.data().length);
+        try std.testing.expectEqual(@as(u8, 255), ok.data().buffers[1].data[3]);
+    }
+    // int8: a first dictionary of 129 entries does not fit.
+    const i8_index: datatype.IntType = .{ .bit_width = 8, .signed = true };
+    for ([_]usize{ 128, 129 }, [_]bool{ true, false }) |n, fits| {
+        var big = try makeNumberedStrings(allocator, 0, n);
+        defer big.release();
+        var q1 = try makeDictArray(allocator, big, &nested_string_type, i8_index, &.{0});
+        defer q1.release();
+        var one = try makeNumberedStrings(allocator, 0, 1); // another node, a value already present
+        defer one.release();
+        var q2 = try makeDictArray(allocator, one, &nested_string_type, i8_index, &.{0});
+        defer q2.release();
+        const result = concatArrayRefs(allocator, q1.data().data_type, &.{ q1, q2 });
+        if (!fits) {
+            try std.testing.expectError(error.InvalidInput, result);
+            continue;
+        }
+        var ok = try result;
+        defer ok.release();
+        try ok.data().validateFull();
+    }
+}
+
+test "dictionaryEncode maps rows to distinct values in first-seen order; null rows stay null" {
+    const allocator = std.testing.allocator;
+    const dictionaryEncode = @import("../concat_array_refs.zig").dictionaryEncode;
+    var strs = try makeStrings(allocator, &.{ "b", null, "a", "b", "", "a", null, "c", "" });
+    defer strs.release();
+    var ints = try makeInt32Array(allocator, &.{ 7, 7, null, -1, 7, 0, -1 });
+    defer ints.release();
+    var sliced = try strs.slice(2, 6);
+    defer sliced.release();
+    const cases = [_]struct { ArrayRef, *const DataType, usize }{ .{ strs, &nested_string_type, 4 }, .{ sliced, &nested_string_type, 4 }, .{ ints, &nested_int32_type, 3 } };
+    for (cases) |c| {
+        var enc = try dictionaryEncode(allocator, c[0], c[1]);
+        defer enc.release();
+        try enc.data().validateFull();
+        const dict = enc.data().dictionary.?.data();
+        try std.testing.expectEqual(c[2], dict.length);
+        try std.testing.expectEqual(@as(usize, 0), dict.null_count.?);
+        const idx = try enc.data().buffers[1].typedSlice(i32);
+        var next: i32 = 0; // first-seen order: every new value takes the next index
+        for (0..c[0].data().length) |r| {
+            try std.testing.expectEqual(c[0].data().isNull(r), enc.data().isNull(r));
+            if (enc.data().isNull(r)) continue;
+            try std.testing.expect(idx[r] <= next);
+            if (idx[r] == next) next += 1;
+            try std.testing.expect(rowsEqual(dict, @intCast(idx[r]), c[0].data(), r));
+        }
+    }
+    try std.testing.expectError(error.InvalidInput, dictionaryEncode(allocator, strs, &nested_int32_type));
+    var bools = try makeBoolArray(allocator, &.{ true, false });
+    defer bools.release();
+    const bool_type = DataType{ .bool = {} };
+    try std.testing.expectError(error.UnsupportedType, dictionaryEncode(allocator, bools, &bool_type));
+}
+
+test "concatArrayRefs of dense unions without children (empty parts)" {
+    const allocator = std.testing.allocator;
+    const dt = DataType{ .dense_union = .{ .type_ids = &.{}, .fields = &.{}, .mode = .dense } };
+    const bufs = [_]array_mod.SharedBuffer{ array_mod.SharedBuffer.empty, array_mod.SharedBuffer.empty };
+    var part = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dt, .length = 0, .null_count = 0, .buffers = &bufs });
+    defer part.release();
+    var joined = try concatArrayRefs(allocator, dt, &.{ part, part, part });
+    defer joined.release();
+    try joined.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 0), joined.data().length);
 }
