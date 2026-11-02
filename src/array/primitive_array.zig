@@ -64,6 +64,8 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
         len: usize = 0,
         null_count: usize = 0,
         state: BuilderState = .ready,
+        // Values buffer of the last `finishReset` batch, reused by the next one (array_utils.reuseSpare).
+        spare_values: ?SharedBuffer = null,
 
         const Self = @This();
 
@@ -83,6 +85,7 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
         pub fn deinit(self: *Self) void {
             self.values.deinit();
             if (self.validity) |*valid| valid.deinit();
+            array_utils.dropSpare(&self.spare_values);
         }
 
         /// Reset state while retaining reusable capacity when possible.
@@ -99,6 +102,7 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
             self.values.deinit();
             if (self.validity) |*valid| valid.deinit();
             self.validity = null;
+            array_utils.dropSpare(&self.spare_values);
             self.len = 0;
             self.null_count = 0;
             self.state = .ready;
@@ -107,6 +111,10 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
         fn ensureValuesCapacity(self: *Self, new_len: usize) !void {
             const capacity = self.values.len() / @sizeOf(T);
             if (new_len <= capacity) return;
+            if (capacity == 0) {
+                try array_utils.reuseSpare(self.allocator, &self.values, &self.spare_values);
+                if (new_len * @sizeOf(T) <= self.values.len()) return;
+            }
             try self.values.resize(new_len * @sizeOf(T));
         }
 
@@ -144,6 +152,8 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
             if (self.state == .finished) return Error.AlreadyFinished;
             const next_len = self.len + 1;
             try self.ensureValuesCapacity(next_len);
+            // Reused memory (finishReset) is not zeroed: null slots read 0 like a fresh buffer.
+            std.mem.bytesAsSlice(T, self.values.data)[self.len] = std.mem.zeroes(T);
             try array_utils.ensureValidityForNull(self.allocator, &self.validity, &self.null_count, next_len);
             self.len = next_len;
         }
@@ -168,14 +178,11 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
 
         /// Finalize output and then reset builder state for reuse.
         pub fn finishReset(self: *Self) !ArrayRef {
-            const finished_len = self.len;
             const finished_ref = try self.finish();
             try self.reset();
-            // Batches built in a loop are usually the same size: start the next one at that capacity
-            // (one allocation instead of ~log2(len) regrowths). On OOM it just grows lazily.
-            if (finished_len > 0) {
-                if (OwnedBuffer.init(self.allocator, finished_len * @sizeOf(T))) |buf| self.values = buf else |_| {}
-            }
+            // Batches built in a loop are usually the same size: the next one starts at this one's
+            // capacity, in this one's memory once its arrays are released (array_utils.reuseSpare).
+            array_utils.keepSpare(&self.spare_values, self.buffers[1]);
             return finished_ref;
         }
     };

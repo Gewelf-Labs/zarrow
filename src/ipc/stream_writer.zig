@@ -326,8 +326,10 @@ pub const StreamWriter = struct {
 };
 
 fn writeMessage(allocator: std.mem.Allocator, writer: *std.Io.Writer, msg: fbs.MessageT, body_buffers: []const array_data.SharedBuffer) (WriterError || std.Io.Writer.Error)!void {
-    const metadata = try fbs_lite_builder.packMessageBytes(allocator, msg);
-    defer allocator.free(metadata);
+    // The flatbuffer is written straight from the builder's bytes (no dupe per message).
+    var fbs_builder = fbs_lite_builder.Builder.init(allocator);
+    defer fbs_builder.deinitAll();
+    const metadata = try fbs_lite_builder.packMessageInto(&fbs_builder, allocator, msg);
 
     // IPC stream framing stores the padded metadata length in the prefix.
     const metadata_len = format.paddedLen(metadata.len);

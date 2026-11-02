@@ -283,42 +283,17 @@ pub const StructBuilder = struct {
         const validity_buf = try array_utils.takeValidity(&self.validity, self.len);
         self.buffers[0] = validity_buf;
 
-        const buffers = try self.allocator.alloc(SharedBuffer, 1);
-        var filled: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < filled) : (i += 1) {
-                var owned = buffers[i];
-                owned.release();
-            }
-            self.allocator.free(buffers);
-        }
-        buffers[0] = self.buffers[0];
-        filled = 1;
-
-        const child_refs = try self.allocator.alloc(ArrayRef, children.len);
-        var child_count: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < child_count) : (i += 1) {
-                child_refs[i].release();
-            }
-            self.allocator.free(child_refs);
-        }
-        for (children, 0..) |child, i| {
-            child_refs[i] = child.retain();
-            child_count += 1;
-        }
-
         const data = ArrayData{
             .data_type = DataType{ .struct_ = .{ .fields = self.fields } },
             .length = self.len,
             .null_count = self.null_count,
-            .buffers = buffers,
-            .children = child_refs,
+            .buffers = self.buffers[0..],
+            .children = children,
         };
 
-        const array_ref_out = try ArrayRef.fromOwnedUnsafe(self.allocator, data);
+        // One allocation: the node owns the validity buffer and (retained below) the children.
+        const array_ref_out = try ArrayRef.fromOwnedInline(self.allocator, data);
+        for (array_ref_out.node.data.children) |child| _ = child.retain();
         self.state = .finished;
         return array_ref_out;
     }

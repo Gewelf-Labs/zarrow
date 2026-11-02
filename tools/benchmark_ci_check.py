@@ -43,6 +43,15 @@ EXPECTED_BENCHES = {
     "take_nested_string_view",
     "validate_full_string",
     "validate_full_int32_list",
+    "string_builder",
+    "string_builder_nullable",
+    "string_view_builder",
+    "compute_add_int32",
+    "compute_add_int32_nullable",
+    "compute_cmp_lt_int32",
+    "compute_sum_int64",
+    "compute_sum_float64",
+    "compute_min_max_int32",
 }
 
 

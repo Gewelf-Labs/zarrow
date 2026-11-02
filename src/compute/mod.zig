@@ -1,5 +1,6 @@
 pub const core = @import("core.zig");
 const concat_array_refs = @import("../concat_array_refs.zig");
+const dense = @import("dense.zig");
 
 pub const FunctionKind = core.FunctionKind;
 pub const OptionsTag = core.OptionsTag;
@@ -79,3 +80,6 @@ pub const datumFilter = core.datumFilter;
 pub const intCastOrInvalidCast = core.intCastOrInvalidCast;
 pub const arithmeticDivI64 = core.arithmeticDivI64;
 pub const concatArrayRefs = concat_array_refs.concatArrayRefs;
+pub const DenseBinaryOutput = dense.DenseBinaryOutput;
+pub const validityBits = dense.validityBits;
+pub const laneMask = dense.laneMask;

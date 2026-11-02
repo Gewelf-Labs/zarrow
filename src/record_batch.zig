@@ -46,8 +46,19 @@ pub const RecordBatch = struct {
         return initChecked(allocator, schema_ref, columns, false);
     }
 
-    fn initChecked(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []const ArrayRef, comptime validate_layout: bool) !Self {
-        const sc = schema_ref.schema();
+    /// `initPrevalidated` that takes ownership of `columns` (the slice and its refs) instead of
+    /// retaining copies; on error the caller still owns them.
+    pub fn initPrevalidatedOwned(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []ArrayRef) RecordBatchError!Self {
+        const num_rows = try checkColumns(schema_ref.schema(), columns, false);
+        return .{
+            .allocator = allocator,
+            .schema_ref = schema_ref,
+            .columns = columns,
+            .num_rows = num_rows,
+        };
+    }
+
+    fn checkColumns(sc: *const Schema, columns: []const ArrayRef, comptime validate_layout: bool) !usize {
         if (sc.fields.len != columns.len) return RecordBatchError.InvalidColumnCount;
 
         const num_rows = if (columns.len == 0) 0 else columns[0].data().length;
@@ -58,6 +69,11 @@ pub const RecordBatch = struct {
             if (!data.data_type.eql(sc.fields[i].data_type.*)) return RecordBatchError.InvalidColumnType;
             if (!sc.fields[i].nullable and data.hasNulls()) return RecordBatchError.NullInNonNullableField;
         }
+        return num_rows;
+    }
+
+    fn initChecked(allocator: std.mem.Allocator, schema_ref: SchemaRef, columns: []const ArrayRef, comptime validate_layout: bool) !Self {
+        const num_rows = try checkColumns(schema_ref.schema(), columns, validate_layout);
 
         const owned_columns = try allocator.alloc(ArrayRef, columns.len);
         errdefer allocator.free(owned_columns);
@@ -202,18 +218,23 @@ pub const RecordBatchBuilder = struct {
     pub fn finish(self: *Self) !RecordBatch {
         if (self.finished) return RecordBatchBuilderError.AlreadyFinished;
 
+        // The batch takes over the builder's column holds (one allocation, no retain/release pair).
         const refs = try self.allocator.alloc(ArrayRef, self.columns.len);
-        defer self.allocator.free(refs);
+        errdefer self.allocator.free(refs);
 
         for (self.columns, 0..) |slot, i| {
             const col_ref = slot orelse return RecordBatchBuilderError.MissingColumn;
             refs[i] = col_ref;
         }
+        for (refs) |col| try col.data().validateLayout();
 
-        const batch = try RecordBatch.init(self.allocator, self.schema_ref.retain(), refs);
-        // The resulting batch now owns retained column refs, so the builder
-        // should not keep additional holds after a successful finish.
-        self.releaseColumns();
+        const schema_ref = self.schema_ref.retain();
+        errdefer {
+            var owned = schema_ref;
+            owned.release();
+        }
+        const batch = try RecordBatch.initPrevalidatedOwned(self.allocator, schema_ref, refs);
+        @memset(self.columns, null);
         self.finished = true;
         return batch;
     }

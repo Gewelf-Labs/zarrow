@@ -21,15 +21,20 @@ pub fn unpackFooter(allocator: std.mem.Allocator, footer_bytes: []const u8) Pack
     return try types.FooterT.Unpack(root, opts);
 }
 
+pub const Builder = fb.Builder;
+
+/// Packs `msg` into `builder`; the returned bytes live in the builder until its next use.
+pub fn packMessageInto(builder: *fb.Builder, allocator: std.mem.Allocator, msg: types.MessageT) (PackError || error{OutOfMemory})![]u8 {
+    const opts: types.PackOptions = .{ .allocator = allocator };
+    const msg_off = try types.MessageT.Pack(msg, builder, opts);
+    try types.Message.FinishBuffer(builder, msg_off);
+    return try builder.finishedBytes();
+}
+
 pub fn packMessageBytes(allocator: std.mem.Allocator, msg: types.MessageT) (PackError || error{OutOfMemory})![]u8 {
     var builder = fb.Builder.init(allocator);
     defer builder.deinitAll();
-
-    const opts: types.PackOptions = .{ .allocator = allocator };
-    const msg_off = try types.MessageT.Pack(msg, &builder, opts);
-    try types.Message.FinishBuffer(&builder, msg_off);
-    const bytes = try builder.finishedBytes();
-    return try allocator.dupe(u8, bytes);
+    return try allocator.dupe(u8, try packMessageInto(&builder, allocator, msg));
 }
 
 pub fn packFooterBytes(allocator: std.mem.Allocator, footer: types.FooterT) (PackError || error{OutOfMemory})![]u8 {

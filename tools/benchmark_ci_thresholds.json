@@ -106,5 +106,41 @@
   "validate_full_int32_list": {
     "min_rows_per_sec": 5000.0,
     "max_ns_per_row": 2000000.0
+  },
+  "string_builder": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "string_builder_nullable": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "string_view_builder": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_add_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_add_int32_nullable": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_cmp_lt_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_sum_int64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_sum_float64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_min_max_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
   }
 }
