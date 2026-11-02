@@ -1148,3 +1148,351 @@ test "compute dense take and u32 filter kernels match the nullable path" {
         if (!want.isNull(i)) try std.testing.expectEqualStrings(try want.value(i), try got.value(i));
     }
 }
+
+const ArrayData = array_mod.ArrayData;
+const concatArrayRefs = @import("../concat_array_refs.zig").concatArrayRefs;
+
+/// Per-row oracle for the take/concat kernels: logical row `i` of `a` equals row `j` of `b`.
+fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool {
+    const dt = if (a.data_type == .extension) a.data_type.extension.storage_type.* else a.data_type;
+    if (dt == .null) return b.data_type == .null; // a sliced null array has an unknown null_count
+    if (a.isNull(i) != b.isNull(j)) return false;
+    if (a.isNull(i)) return true;
+    const ai = a.offset + i;
+    const bj = b.offset + j;
+    switch (dt) {
+        .int32, .fixed_size_binary => {
+            const w: usize = if (dt == .int32) 4 else @intCast(dt.fixed_size_binary.byte_width);
+            return std.mem.eql(u8, a.buffers[1].data[ai * w ..][0..w], b.buffers[1].data[bj * w ..][0..w]);
+        },
+        .string => {
+            const x = (array_mod.StringArray{ .data = a }).value(i) catch return false;
+            const y = (array_mod.StringArray{ .data = b }).value(j) catch return false;
+            return std.mem.eql(u8, x, y);
+        },
+        .dictionary => {
+            const x: usize = @intCast((a.buffers[1].typedSlice(i32) catch return false)[ai]);
+            const y: usize = @intCast((b.buffers[1].typedSlice(i32) catch return false)[bj]);
+            return rowsEqual(a.dictionary.?.data(), x, b.dictionary.?.data(), y);
+        },
+        .list, .map, .list_view, .fixed_size_list => {
+            var ra: [2]usize = undefined;
+            var rb: [2]usize = undefined;
+            for ([_]*const ArrayData{ a, b }, [_]usize{ ai, bj }, [_]*[2]usize{ &ra, &rb }) |d, k, r| {
+                if (dt == .fixed_size_list) {
+                    const size: usize = @intCast(dt.fixed_size_list.list_size);
+                    r.* = .{ k * size, k * size + size };
+                } else {
+                    const o = d.buffers[1].typedSlice(i32) catch return false;
+                    const lo: usize = @intCast(o[k]);
+                    r.* = if (dt == .list_view) .{ lo, lo + @as(usize, @intCast((d.buffers[2].typedSlice(i32) catch return false)[k])) } else .{ lo, @intCast(o[k + 1]) };
+                }
+            }
+            if (ra[1] - ra[0] != rb[1] - rb[0]) return false;
+            for (0..ra[1] - ra[0]) |k| {
+                if (!rowsEqual(a.children[0].data(), ra[0] + k, b.children[0].data(), rb[0] + k)) return false;
+            }
+            return true;
+        },
+        .struct_, .sparse_union => {
+            if (dt == .sparse_union and a.buffers[0].data[ai] != b.buffers[0].data[bj]) return false;
+            for (a.children, b.children) |ca, cb| {
+                const x = if (ca.data().length == a.length) i else ai;
+                const y = if (cb.data().length == b.length) j else bj;
+                if (!rowsEqual(ca.data(), x, cb.data(), y)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn expectRowsMatchSource(out: *const ArrayData, src: *const ArrayData, indices: []const ?usize) !void {
+    try out.validateFull();
+    try std.testing.expectEqual(indices.len, out.length);
+    for (indices, 0..) |maybe, i| {
+        if (maybe) |idx| {
+            try std.testing.expect(rowsEqual(out, i, src, idx));
+        } else if (out.data_type != .sparse_union) try std.testing.expect(out.isNull(i));
+    }
+}
+
+/// Six-row arrays of every layout with a take kernel, each with nulls or null children.
+const NestedSources = struct {
+    arrays: [13]ArrayRef,
+    count: usize = 0,
+
+    fn add(self: *NestedSources, arr: ArrayRef) void {
+        self.arrays[self.count] = arr;
+        self.count += 1;
+    }
+
+    fn deinit(self: *NestedSources) void {
+        for (self.arrays[0..self.count]) |*arr| arr.release();
+    }
+};
+
+const nested_int32_type = DataType{ .int32 = {} };
+const nested_string_type = DataType{ .string = {} };
+const nested_int_field = datatype.Field{ .name = "a", .data_type = &nested_int32_type, .nullable = true };
+const nested_str_field = datatype.Field{ .name = "b", .data_type = &nested_string_type, .nullable = true };
+const nested_pair_fields = [_]datatype.Field{ nested_int_field, nested_str_field };
+const nested_union_ids = [_]i8{ 5, 7 };
+
+fn makeStrings(allocator: std.mem.Allocator, values: []const ?[]const u8) !ArrayRef {
+    var b = try array_mod.StringBuilder.init(allocator, 0, 0);
+    defer b.deinit();
+    for (values) |v| if (v) |s| try b.append(s) else try b.appendNull();
+    return b.finish();
+}
+
+fn makePairStruct(allocator: std.mem.Allocator, valid: []const bool, ints: []const ?i32, strs: []const ?[]const u8) !ArrayRef {
+    var a = try makeInt32Array(allocator, ints);
+    defer a.release();
+    var b = try makeStrings(allocator, strs);
+    defer b.release();
+    var sb = array_mod.StructBuilder.init(allocator, &nested_pair_fields);
+    defer sb.deinit();
+    for (valid) |v| if (v) try sb.appendValid() else try sb.appendNull();
+    return sb.finish(&.{ a, b });
+}
+
+fn buildNestedSources(allocator: std.mem.Allocator) !NestedSources {
+    var out: NestedSources = .{ .arrays = undefined };
+    errdefer out.deinit();
+    const ints = [_]?i32{ 1, 2, 3, null, 5, 6 };
+    const strs = [_]?[]const u8{ "x", "yy", "ccc", "d", null, "ffffffffffffffffff" };
+
+    // struct{a: int32, b: string}, row 1 null.
+    const pair = try makePairStruct(allocator, &.{ true, false, true, true, true, true }, &ints, &strs);
+    out.add(pair);
+
+    // The same struct as rows 1..5 with children in parent coordinates (offset 1, children of 6 rows).
+    var view = pair.data().*;
+    view.offset = 1;
+    view.length = 5;
+    view.null_count = null;
+    out.add(try ArrayRef.fromBorrowed(allocator, view));
+
+    // dictionary<int32, string>.
+    const dict_type = DataType{ .string = {} };
+    var dict = try makeStrings(allocator, &.{ "a", "bb", "ccc" });
+    defer dict.release();
+    var db = try array_mod.DictionaryBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &dict_type, 6);
+    defer db.deinit();
+    for ([_]?i64{ 0, null, 2, 1, 0, 2 }) |v| if (v) |x| try db.appendIndex(x) else try db.appendNull();
+    out.add(try db.finish(dict));
+
+    // fixed_size_list<int32, 2>, row 2 null.
+    var fvals = try makeInt32Array(allocator, &.{ 0, 1, 2, null, 4, 5, 6, 7, 8, 9, 10, 11 });
+    defer fvals.release();
+    var fb = try array_mod.FixedSizeListBuilder.init(allocator, nested_int_field, 2);
+    defer fb.deinit();
+    for ([_]bool{ true, true, false, true, true, true }) |v| if (v) try fb.appendValid() else try fb.appendNull();
+    out.add(try fb.finish(fvals));
+
+    // fixed_size_list<string, 2>: not fixed-width, so the child is taken with expanded indices.
+    var fstrs = try makeStrings(allocator, &.{ "a", null, "cc", "d", "", "f", "g", "hh", null, "j", "k", "l" });
+    defer fstrs.release();
+    var fsb = try array_mod.FixedSizeListBuilder.init(allocator, nested_str_field, 2);
+    defer fsb.deinit();
+    for ([_]bool{ true, false, true, true, true, true }) |v| if (v) try fsb.appendValid() else try fsb.appendNull();
+    out.add(try fsb.finish(fstrs));
+
+    // fixed_size_binary(3).
+    var bb = try array_mod.FixedSizeBinaryBuilder.init(allocator, 3, 6);
+    defer bb.deinit();
+    for ([_]?[]const u8{ "abc", null, "def", "ghi", "jkl", null }) |v| if (v) |s| try bb.append(s) else try bb.appendNull();
+    out.add(try bb.finish());
+
+    // extension over int32 storage.
+    var ext_storage = try makeInt32Array(allocator, &ints);
+    defer ext_storage.release();
+    var eb = try array_mod.ExtensionBuilder.init(allocator, .{ .name = "test.ext", .storage_type = &nested_int32_type });
+    defer eb.deinit();
+    out.add(try eb.finish(ext_storage));
+
+    // map<int32, string>: rows of 2, 0, null, 1, 3, 2 entries.
+    var entries = try makePairStruct(allocator, &.{ true, true, true, true, true, true, true, true }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8" });
+    defer entries.release();
+    var mb = try array_mod.MapBuilder.init(allocator, 6, nested_int_field, nested_str_field, false);
+    defer mb.deinit();
+    for ([_]?usize{ 2, 0, null, 1, 3, 2 }) |v| if (v) |n| try mb.appendLen(n) else try mb.appendNull();
+    out.add(try mb.finish(entries));
+
+    // list_view<int32>.
+    var lvals = try makeInt32Array(allocator, &.{ 1, 2, null, 4, 5, 6, 7 });
+    defer lvals.release();
+    var lb = try array_mod.ListViewBuilder.init(allocator, 6, nested_int_field);
+    defer lb.deinit();
+    for ([_]?usize{ 1, 2, null, 0, 3, 1 }) |v| if (v) |n| try lb.appendLen(n) else try lb.appendNull();
+    out.add(try lb.finish(lvals));
+
+    // sparse union<a: int32 = 5, b: string = 7>.
+    var ub = try array_mod.SparseUnionBuilder.init(allocator, .{ .type_ids = &nested_union_ids, .fields = &nested_pair_fields, .mode = .sparse }, 6);
+    defer ub.deinit();
+    for ([_]i8{ 5, 7, 7, 5, 5, 7 }) |id| try ub.appendTypeId(id);
+    var uints = try makeInt32Array(allocator, &ints);
+    defer uints.release();
+    var ustrs = try makeStrings(allocator, &strs);
+    defer ustrs.release();
+    out.add(try ub.finish(&.{ uints, ustrs }));
+
+    // struct without fields: rows are validity only.
+    var eb0 = array_mod.StructBuilder.init(allocator, &.{});
+    defer eb0.deinit();
+    for ([_]bool{ true, false, true, true, false, true }) |v| if (v) try eb0.appendValid() else try eb0.appendNull();
+    out.add(try eb0.finish(&.{}));
+
+    // null type.
+    var nb = try array_mod.NullBuilder.init(allocator, 6);
+    try nb.appendNulls(6);
+    out.add(try nb.finish());
+
+    // list<struct{a, b}>: nested windows through list -> struct.
+    var lsb = try array_mod.ListBuilder.init(allocator, 6, .{ .name = "item", .data_type = &pair.data().data_type, .nullable = true });
+    defer lsb.deinit();
+    for ([_]?usize{ 2, null, 0, 3, 1, 0 }) |v| if (v) |n| try lsb.appendLen(n) else try lsb.appendNull();
+    out.add(try lsb.finish(pair));
+    return out;
+}
+
+test "compute datumTake nested kernels match the per-row oracle on sliced inputs with null indices" {
+    const allocator = std.testing.allocator;
+    var sources = try buildNestedSources(allocator);
+    defer sources.deinit();
+
+    for (sources.arrays[0..sources.count]) |full| {
+        var sliced = try full.slice(1, full.data().length - 1);
+        defer sliced.release();
+        for ([_]ArrayRef{ full, sliced }) |src| {
+            const last = src.data().length - 1;
+            const indices = [_]?usize{ last, null, 0, 2, 2, 1, last - 1, null, 0 };
+            var taken = try datumTakeNullable(Datum.fromArray(src), &indices);
+            defer taken.release();
+            try expectRowsMatchSource(taken.array.data(), src.data(), &indices);
+
+            const dense = [_]usize{ 1, last, 0, 0, 2 };
+            var taken_dense = try datumTake(Datum.fromArray(src), &dense);
+            defer taken_dense.release();
+            try expectRowsMatchSource(taken_dense.array.data(), src.data(), &[_]?usize{ 1, last, 0, 0, 2 });
+        }
+        try std.testing.expectError(error.InvalidInput, datumTakeNullable(Datum.fromArray(sliced), &[_]?usize{sliced.data().length}));
+    }
+}
+
+test "concatArrayRefs N-ary nested path matches the source rows for sliced parts" {
+    const allocator = std.testing.allocator;
+    var sources = try buildNestedSources(allocator);
+    defer sources.deinit();
+
+    for (sources.arrays[0..sources.count]) |full| {
+        const len = full.data().length;
+        const cuts = [_][2]usize{ .{ 0, 2 }, .{ 2, 1 }, .{ 3, 0 }, .{ 3, len - 3 }, .{ 1, len - 1 } };
+        var parts: [cuts.len]ArrayRef = undefined;
+        for (cuts, &parts) |cut, *part| part.* = try full.slice(cut[0], cut[1]);
+        defer for (&parts) |*part| part.release();
+
+        var joined = concatArrayRefs(allocator, full.data().data_type, &parts) catch |err| {
+            // Unions and list views have no concat (unchanged); every other layout must concat.
+            const tag = full.data().data_type;
+            try std.testing.expect(err == error.UnsupportedType and (tag == .sparse_union or tag == .list_view));
+            continue;
+        };
+        defer joined.release();
+        try joined.data().validateFull();
+        try std.testing.expectEqual(2 * len - 1, joined.data().length);
+        var row: usize = 0;
+        for (cuts) |cut| {
+            for (cut[0]..cut[0] + cut[1]) |src_row| {
+                try std.testing.expect(rowsEqual(joined.data(), row, full.data(), src_row));
+                row += 1;
+            }
+        }
+    }
+}
+
+fn makeSequenceChunks(allocator: std.mem.Allocator, chunks: []ArrayRef, rows_per_chunk: usize) !void {
+    const values = try allocator.alloc(?i32, rows_per_chunk);
+    defer allocator.free(values);
+    for (chunks, 0..) |*chunk, c| {
+        for (values, 0..) |*v, k| {
+            const row = c * rows_per_chunk + k;
+            v.* = if (row % 7 == 3) null else @as(i32, @intCast(row));
+        }
+        chunk.* = try makeInt32Array(allocator, values);
+    }
+}
+
+test "compute chunked take and filter run the array kernels per chunk and match the flat result" {
+    const allocator = std.testing.allocator;
+    var parts: [3]ArrayRef = undefined;
+    try makeSequenceChunks(allocator, &parts, 100);
+    defer for (&parts) |*p| p.release();
+    var chunked = try ChunkedArray.init(allocator, .{ .int32 = {} }, &parts);
+    defer chunked.release();
+    var flat = try concatArrayRefs(allocator, .{ .int32 = {} }, &parts);
+    defer flat.release();
+
+    // Sorted (one run per chunk: per-chunk kernels) and scattered (concat first) indices, with nulls.
+    var sorted: [120]?usize = undefined;
+    var scattered: [120]?usize = undefined;
+    for (&sorted, &scattered, 0..) |*s, *r, i| {
+        s.* = if (i % 13 == 5) null else i * 2 + i / 50;
+        r.* = if (i % 11 == 4) null else (i * 7919) % 300;
+    }
+    for ([_][]const ?usize{ &sorted, &scattered }) |indices| {
+        var taken = try datumTakeNullable(Datum.fromChunked(chunked), indices);
+        defer taken.release();
+        try std.testing.expect(taken.isChunked());
+        var out = try concatArrayRefs(allocator, .{ .int32 = {} }, taken.chunked.chunks());
+        defer out.release();
+        try expectRowsMatchSource(out.data(), flat.data(), indices);
+    }
+
+    var pred_values: [300]?bool = undefined;
+    for (&pred_values, 0..) |*p, i| p.* = if (i % 5 == 0) null else i % 3 != 0;
+    var pred = try makeBoolArray(allocator, &pred_values);
+    defer pred.release();
+    for ([_]bool{ true, false }) |drop_nulls| {
+        var expected = try datumFilter(Datum.fromArray(flat), Datum.fromArray(pred), .{ .drop_nulls = drop_nulls });
+        defer expected.release();
+        var actual = try datumFilter(Datum.fromChunked(chunked), Datum.fromArray(pred), .{ .drop_nulls = drop_nulls });
+        defer actual.release();
+        try actual.array.data().validateFull();
+        try std.testing.expectEqual(expected.array.data().length, actual.array.data().length);
+        for (0..expected.array.data().length) |i| try std.testing.expect(rowsEqual(actual.array.data(), i, expected.array.data(), i));
+    }
+
+    // Chunks with different dictionaries do not concat: the scattered take falls back to per-run pieces.
+    const dict_type = DataType{ .string = {} };
+    var dicts = [_]ArrayRef{ try makeStrings(allocator, &.{ "a", "b" }), try makeStrings(allocator, &.{ "c", "d", "e" }) };
+    defer for (&dicts) |*d| d.release();
+    var dict_chunks: [2]ArrayRef = undefined;
+    for (&dict_chunks, dicts, 0..) |*chunk, d, c| {
+        var db = try array_mod.DictionaryBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &dict_type, 4);
+        defer db.deinit();
+        for (0..4) |k| if (k == 2) try db.appendNull() else try db.appendIndex(@intCast((k + c) % 2));
+        chunk.* = try db.finish(d);
+    }
+    defer for (&dict_chunks) |*c| c.release();
+    var dict_chunked = try ChunkedArray.init(allocator, dict_chunks[0].data().data_type, &dict_chunks);
+    defer dict_chunked.release();
+    const dict_indices = [_]?usize{ 7, 0, null, 5, 1, 4, 3 };
+    var dict_taken = try datumTakeNullable(Datum.fromChunked(dict_chunked), &dict_indices);
+    defer dict_taken.release();
+    var row: usize = 0;
+    for (dict_taken.chunked.chunks()) |piece| {
+        try piece.data().validateFull();
+        for (0..piece.data().length) |k| {
+            const want = dict_indices[row] orelse {
+                try std.testing.expect(piece.data().isNull(k));
+                row += 1;
+                continue;
+            };
+            try std.testing.expect(rowsEqual(piece.data(), k, dict_chunks[want / 4].data(), want % 4));
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(dict_indices.len, row);
+}
