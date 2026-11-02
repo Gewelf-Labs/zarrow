@@ -317,11 +317,8 @@ pub const ArrayData = struct {
     }
 
     fn validateRunEndsSigned(comptime T: type, run_ends: []const T, total_len: usize) ValidationError!void {
-        if (total_len == 0) {
-            if (run_ends.len != 0) return error.InvalidOffsets;
-            return;
-        }
-        if (run_ends.len == 0) return error.BufferTooSmall;
+        // A zero-length array may still carry run ends (e.g. a slice(0, 0) keeps its children).
+        if (run_ends.len == 0) return if (total_len == 0) {} else error.BufferTooSmall;
         var prev: i64 = 0;
         for (run_ends) |end| {
             const val: i64 = @intCast(end);
@@ -333,11 +330,7 @@ pub const ArrayData = struct {
     }
 
     fn validateRunEndsUnsigned(comptime T: type, run_ends: []const T, total_len: usize) ValidationError!void {
-        if (total_len == 0) {
-            if (run_ends.len != 0) return error.InvalidOffsets;
-            return;
-        }
-        if (run_ends.len == 0) return error.BufferTooSmall;
+        if (run_ends.len == 0) return if (total_len == 0) {} else error.BufferTooSmall;
         var prev: u64 = 0;
         for (run_ends) |end| {
             const val: u64 = @intCast(end);
@@ -1456,6 +1449,9 @@ test "array data validateLayout accepts run_end_encoded" {
     };
 
     try data.validateLayout();
+    // Fuzz finding: a zero-length slice keeps its run ends and must still validate.
+    try data.slice(0, 0).validateLayout();
+    try data.slice(5, 0).validateLayout();
 }
 
 test "array data validateLayout bounds run ends and list offsets by the child's own data" {
