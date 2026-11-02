@@ -17,6 +17,8 @@ def run_check(csv_text: str):
 VALID_HEADER = "benchmark,rows,iterations,elapsed_ns,rows_per_sec,ns_per_row,checksum,git_sha,timestamp"
 VALID_ROWS = [
     "concat,1000,10,1000000,1000.0,1000.0,38,abc123,1700000000",
+    "concat_nested_list,1000,10,1000000,1000.0,1000.0,38,abc123,1700000000",
+    "concat_nested_struct,1000,10,1000000,1000.0,1000.0,38,abc123,1700000000",
     "filter,1000,10,1000000,1000.0,1000.0,39,abc123,1700000000",
     "ipc_compressed,1000,10,1000000,1000.0,1000.0,40,abc123,1700000000",
     "ipc_roundtrip,1000,10,1000000,1000.0,1000.0,41,abc123,1700000000",
@@ -24,6 +26,12 @@ VALID_ROWS = [
     "record_batch_builder,1000,10,1000000,1000.0,1000.0,43,abc123,1700000000",
     "struct_builder,1000,10,1000000,1000.0,1000.0,44,abc123,1700000000",
     "take,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_struct,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_dictionary,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_fixed_size_list,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_chunked_take,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_chunked_filter,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "take_nested_flat_filter,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
 ]
 
 

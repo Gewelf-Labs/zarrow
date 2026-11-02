@@ -17,6 +17,8 @@ EXPECTED_HEADER = [
 
 EXPECTED_BENCHES = {
     "concat",
+    "concat_nested_list",
+    "concat_nested_struct",
     "filter",
     "ipc_compressed",
     "ipc_roundtrip",
@@ -24,6 +26,12 @@ EXPECTED_BENCHES = {
     "record_batch_builder",
     "struct_builder",
     "take",
+    "take_nested_struct",
+    "take_nested_dictionary",
+    "take_nested_fixed_size_list",
+    "take_nested_chunked_take",
+    "take_nested_chunked_filter",
+    "take_nested_flat_filter",
 }
 
 
