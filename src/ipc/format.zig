@@ -25,15 +25,17 @@ pub fn writeMessageLength(writer: *std.Io.Writer, len: u32) std.Io.Writer.Error!
     try writeInt(writer, u32, len);
 }
 
-pub fn readMessageLength(reader: *std.Io.Reader) std.Io.Reader.Error!?u32 {
+/// Metadata length (null at end of stream) and the padding after the metadata that 8-aligns
+/// prefix + metadata. Pre-0.15 streams have a 4-byte prefix (no continuation marker).
+pub fn readMessageLength(reader: *std.Io.Reader) std.Io.Reader.Error!?struct { len: u32, pad: usize } {
     const first = try readInt(reader, u32);
     if (first == 0) return null;
     if (first == ContinuationMarker) {
         const len = try readInt(reader, u32);
         if (len == 0) return null;
-        return len;
+        return .{ .len = len, .pad = padLen(len) };
     }
-    return first;
+    return .{ .len = first, .pad = padLen(@as(usize, first) + 4) };
 }
 
 pub fn writePadding(writer: *std.Io.Writer, pad_len: usize) std.Io.Writer.Error!void {

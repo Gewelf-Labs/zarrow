@@ -79,12 +79,9 @@ pub fn rootTable(buf: []const u8) Error!Table {
     const root_off = std.math.cast(usize, root_off_u32) orelse return error.InvalidMetadata;
     if (root_off > buf.len - 4) return error.InvalidMetadata;
 
-    const vtable_rel_i32 = try readI32(buf, root_off);
-    if (vtable_rel_i32 <= 0) return error.InvalidMetadata;
-    const vtable_rel = std.math.cast(usize, vtable_rel_i32) orelse return error.InvalidMetadata;
-    if (vtable_rel > root_off) return error.InvalidMetadata;
-
-    const vtable_start = root_off - vtable_rel;
+    // FlatBuffers allows the vtable on either side of the table (negative soffset = after it).
+    const vtable_i = @as(i64, @intCast(root_off)) - try readI32(buf, root_off);
+    const vtable_start = std.math.cast(usize, vtable_i) orelse return error.InvalidMetadata;
     if (vtable_start > buf.len - 4) return error.InvalidMetadata;
 
     const vtable_len_u16 = try readU16(buf, vtable_start);
@@ -112,4 +109,14 @@ test "fbs_lite reader rejects out-of-range root" {
         0xff, 0xff, 0xff, 0xff,
     };
     try std.testing.expectError(error.InvalidMetadata, rootTable(malformed[0..]));
+}
+
+test "fbs_lite reader accepts a vtable after the table and bounds-checks it" {
+    // root -> table at 4 (soffset -8 -> vtable at 12: len 6, object 8, field 0 at +4 = 7).
+    var buf = [_]u8{ 4, 0, 0, 0, 0xf8, 0xff, 0xff, 0xff, 7, 0, 0, 0, 6, 0, 8, 0, 4, 0 };
+    const t = try rootTable(buf[0..]);
+    try std.testing.expectEqual(@as(usize, 12), t.vtable_start);
+    try std.testing.expectEqual(@as(?u8, 7), t.readFieldU8(0));
+    buf[4] = 0xf4; // soffset -12 -> vtable at 16: its 4-byte header runs past the end
+    try std.testing.expectError(error.InvalidMetadata, rootTable(buf[0..]));
 }

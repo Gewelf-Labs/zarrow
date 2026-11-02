@@ -144,6 +144,8 @@ pub const SharedBuffer = struct {
         comptime {
             if (@sizeOf(T) == 0) @compileError("typedSlice does not support zero-sized types");
         }
+        // Nothing to misread in an empty buffer (`empty` has no particular alignment).
+        if (self.data.len == 0) return &.{};
         if (!std.mem.isAligned(@intFromPtr(self.data.ptr), @alignOf(T))) {
             return Error.MisalignedPointer;
         }

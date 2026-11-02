@@ -1318,14 +1318,13 @@ fn parseGoldenHexCsv(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 fn readNextMessageForTest(allocator: std.mem.Allocator, reader: *std.Io.Reader) anyerror!?fbs.MessageT {
-    const meta_len_opt = try format.readMessageLength(reader);
-    if (meta_len_opt == null) return null;
-    const meta_len = meta_len_opt.?;
+    const prefix = try format.readMessageLength(reader) orelse return null;
+    const meta_len = prefix.len;
 
     const metadata = try allocator.alloc(u8, meta_len);
     defer allocator.free(metadata);
     if (meta_len > 0) try reader.readSliceAll(metadata);
-    try format.skipPadding(reader, format.padLen(meta_len));
+    try format.skipPadding(reader, prefix.pad);
 
     const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata) catch return StreamError.InvalidMetadata;
     if (envelope.body_length < 0) return StreamError.InvalidBody;
