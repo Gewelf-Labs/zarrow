@@ -1526,13 +1526,9 @@ fn buildRecordBatchFromFlatbuf(
     const num_rows = if (col_count == 0) 0 else columns[0].data().length;
     if (num_rows != expected_rows) return StreamError.InvalidMetadata;
 
-    const batch = try RecordBatch.initPrevalidated(allocator, mut_ref, columns);
-    // RecordBatch.initPrevalidated succeeded and owns mut_ref now; cancel the schema errdefer.
+    // The batch takes over `columns` (slice and refs); on error they are still ours to release.
+    const batch = try RecordBatch.initPrevalidatedOwned(allocator, mut_ref, columns);
     schema_taken = true;
-    // Release the temporary column refs — batch has its own retains. No error return after this.
-    var i: usize = 0;
-    while (i < col_count) : (i += 1) columns[i].release();
-    allocator.free(columns);
     return batch;
 }
 
@@ -1559,7 +1555,15 @@ fn readArrayFromMeta(
     const buffer_count = try bufferCountForType(layout_dt, variadic_buffer_counts, variadic_index, metadata_version);
     // Checked before allocating: a view type's count comes from the untrusted variadicBufferCounts.
     if (buffer_count > buffers_meta.len -| buffer_index.*) return StreamError.InvalidMetadata;
-    var buffers = try allocator.alloc(array_data.SharedBuffer, buffer_count);
+    // Buffers are staged here and copied into the node's own allocation (`fromOwnedInline`), so
+    // the usual layouts (<= 3 buffers; views with few variadic buffers) allocate once per column.
+    var stack_buffers: [8]array_data.SharedBuffer = undefined;
+    var heap_buffers: ?[]array_data.SharedBuffer = null;
+    defer if (heap_buffers) |heap| allocator.free(heap);
+    var buffers: []array_data.SharedBuffer = if (buffer_count <= stack_buffers.len) stack_buffers[0..buffer_count] else blk: {
+        heap_buffers = try allocator.alloc(array_data.SharedBuffer, buffer_count);
+        break :blk heap_buffers.?;
+    };
     var buf_count: usize = 0;
     errdefer {
         var i: usize = 0;
@@ -1567,7 +1571,6 @@ fn readArrayFromMeta(
             var owned = buffers[i];
             owned.release();
         }
-        allocator.free(buffers);
     }
 
     var i: usize = 0;
@@ -1624,18 +1627,17 @@ fn readArrayFromMeta(
             var owned = buffers[j];
             owned.release();
         }
-        allocator.free(buffers);
+        if (heap_buffers) |heap| allocator.free(heap);
 
         buffers = normalized;
+        heap_buffers = normalized;
         buf_count = normalized_len;
     }
 
     var children: []ArrayRef = &.{};
     var filled: usize = 0;
-    errdefer {
-        for (children[0..filled]) |*child| child.release();
-        if (children.len > 0) allocator.free(children);
-    }
+    defer if (children.len > 0) allocator.free(children);
+    errdefer for (children[0..filled]) |*child| child.release();
     var dictionary_ref: ?ArrayRef = null;
     errdefer if (dictionary_ref) |*dict| dict.release();
     if (layout_dt == .list or layout_dt == .large_list or layout_dt == .fixed_size_list or layout_dt == .map or layout_dt == .list_view or layout_dt == .large_list_view) {
@@ -1683,7 +1685,7 @@ fn readArrayFromMeta(
         .dictionary = dictionary_ref,
     };
     try data.validateLayout();
-    return ArrayRef.fromOwnedUnsafe(allocator, data);
+    return ArrayRef.fromOwnedInline(allocator, data);
 }
 
 fn childValueType(dt: DataType) DataType {

@@ -21,15 +21,33 @@ const ArrayNode = struct {
     owner_release: ?*const fn (?*anyopaque) void = null,
     // True when `data.buffers` lives in this node's own allocation (see `fromOwnedInlineBuffers`).
     inline_buffers: bool = false,
+    // True when `data.children` lives in this node's own allocation too (see `fromOwnedInline`).
+    inline_children: bool = false,
 };
 
+comptime {
+    // The children array follows the buffers inside the node block without padding.
+    std.debug.assert(@sizeOf(SharedBuffer) % @alignOf(ArrayRef) == 0);
+    std.debug.assert(@sizeOf(ArrayNode) % @alignOf(SharedBuffer) == 0);
+}
+
 fn inlineBufferBlockSize(count: usize) usize {
-    return @sizeOf(ArrayNode) + count * @sizeOf(SharedBuffer);
+    return inlineBlockSize(count, 0);
+}
+
+fn inlineBlockSize(buffer_count: usize, child_count: usize) usize {
+    return @sizeOf(ArrayNode) + buffer_count * @sizeOf(SharedBuffer) + child_count * @sizeOf(ArrayRef);
 }
 
 fn inlineBuffers(node: *ArrayNode, count: usize) []SharedBuffer {
     const base: [*]u8 = @ptrCast(node);
     const ptr: [*]SharedBuffer = @ptrCast(@alignCast(base + @sizeOf(ArrayNode)));
+    return ptr[0..count];
+}
+
+fn inlineChildren(node: *ArrayNode, buffer_count: usize, count: usize) []ArrayRef {
+    const base: [*]u8 = @ptrCast(node);
+    const ptr: [*]ArrayRef = @ptrCast(@alignCast(base + @sizeOf(ArrayNode) + buffer_count * @sizeOf(SharedBuffer)));
     return ptr[0..count];
 }
 
@@ -58,7 +76,7 @@ pub const ArrayRef = struct {
             var owned = child;
             owned.release();
         }
-        allocator.free(self.node.data.children);
+        if (!self.node.inline_children) allocator.free(self.node.data.children);
 
         if (self.node.data.dictionary) |dict| {
             var owned = dict;
@@ -70,7 +88,8 @@ pub const ArrayRef = struct {
         }
         if (self.node.inline_buffers) {
             const block: [*]align(@alignOf(ArrayNode)) u8 = @ptrCast(self.node);
-            allocator.free(block[0..inlineBufferBlockSize(self.node.data.buffers.len)]);
+            const child_count = if (self.node.inline_children) self.node.data.children.len else 0;
+            allocator.free(block[0..inlineBlockSize(self.node.data.buffers.len, child_count)]);
         } else {
             allocator.destroy(self.node);
         }
@@ -98,14 +117,18 @@ pub const ArrayRef = struct {
         var sliced = self.node.data.slice(offset, length);
         const allocator = self.node.allocator;
 
-        const children = try allocator.alloc(ArrayRef, sliced.children.len);
+        // One block for node, buffers and children; filled below, released on error before any
+        // ArrayRef exists (so no owner hook or buffer retain has happened yet).
+        const block = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(@alignOf(ArrayNode)), inlineBlockSize(sliced.buffers.len, sliced.children.len));
+        errdefer allocator.free(block);
+        const node: *ArrayNode = @ptrCast(block.ptr);
+        const children = inlineChildren(node, sliced.buffers.len, sliced.children.len);
         var child_count: usize = 0;
         errdefer {
             var i: usize = 0;
             while (i < child_count) : (i += 1) {
                 children[i].release();
             }
-            allocator.free(children);
         }
 
         var dict_ref: ?ArrayRef = null;
@@ -149,15 +172,45 @@ pub const ArrayRef = struct {
         sliced.dictionary = dict_ref;
 
         // Buffers are copied into the node allocation and retained afterwards (nothing below can fail).
-        const out = try ArrayRef.fromOwnedInlineBuffersWithOwner(
-            allocator,
-            sliced,
-            self.node.owner_ctx,
-            self.node.owner_retain,
-            self.node.owner_release,
-        );
-        for (out.node.data.buffers) |buf| _ = buf.retain();
-        return out;
+        const buffers = inlineBuffers(node, sliced.buffers.len);
+        @memcpy(buffers, sliced.buffers);
+        for (buffers) |buf| _ = buf.retain();
+        sliced.buffers = buffers;
+        if (self.node.owner_retain) |retain_fn| retain_fn(self.node.owner_ctx);
+        node.* = .{
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(u32).init(1),
+            .data = sliced,
+            .owner_ctx = self.node.owner_ctx,
+            .owner_retain = self.node.owner_retain,
+            .owner_release = self.node.owner_release,
+            .inline_buffers = true,
+            .inline_children = true,
+        };
+        return .{ .node = node };
+    }
+
+    /// Like `fromOwnedInlineBuffers`, but `layout.children` is copied into the node's allocation
+    /// as well (the caller keeps ownership of both slices, the node owns the buffer and child
+    /// references). One allocation per nested array.
+    pub fn fromOwnedInline(allocator: std.mem.Allocator, layout: ArrayData) !ArrayRef {
+        const block = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(@alignOf(ArrayNode)), inlineBlockSize(layout.buffers.len, layout.children.len));
+        const node: *ArrayNode = @ptrCast(block.ptr);
+        const buffers = inlineBuffers(node, layout.buffers.len);
+        @memcpy(buffers, layout.buffers);
+        const children = inlineChildren(node, layout.buffers.len, layout.children.len);
+        @memcpy(children, layout.children);
+        var owned = layout;
+        owned.buffers = buffers;
+        owned.children = children;
+        node.* = .{
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(u32).init(1),
+            .data = owned,
+            .inline_buffers = true,
+            .inline_children = true,
+        };
+        return .{ .node = node };
     }
 
     /// Like `fromOwnedUnsafe`, but `layout.buffers` is copied into the node's

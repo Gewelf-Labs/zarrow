@@ -270,6 +270,9 @@ fn ViewBuilder(comptime view_type: DataType) type {
         null_count: usize = 0,
         data_len: usize = 0,
         state: BuilderState = .ready,
+        // Buffers of the last `finishReset` batch, reused by the next one (array_utils.reuseSpare).
+        spare_views: ?SharedBuffer = null,
+        spare_data: ?SharedBuffer = null,
 
         const Self = @This();
         const BuilderError = error{ AlreadyFinished, NotFinished };
@@ -286,6 +289,8 @@ fn ViewBuilder(comptime view_type: DataType) type {
             self.views.deinit();
             self.data.deinit();
             if (self.validity) |*valid| valid.deinit();
+            array_utils.dropSpare(&self.spare_views);
+            array_utils.dropSpare(&self.spare_data);
         }
 
         pub fn reset(self: *Self) BuilderError!void {
@@ -302,6 +307,8 @@ fn ViewBuilder(comptime view_type: DataType) type {
             self.data.deinit();
             if (self.validity) |*valid| valid.deinit();
             self.validity = null;
+            array_utils.dropSpare(&self.spare_views);
+            array_utils.dropSpare(&self.spare_data);
             self.len = 0;
             self.null_count = 0;
             self.data_len = 0;
@@ -311,11 +318,19 @@ fn ViewBuilder(comptime view_type: DataType) type {
         fn ensureViewsCapacity(self: *Self, needed_len: usize) !void {
             const needed_bytes = needed_len * VIEW_RECORD_SIZE;
             if (needed_bytes <= self.views.len()) return;
+            if (self.views.isEmpty()) {
+                try array_utils.reuseSpare(self.allocator, &self.views, &self.spare_views);
+                if (needed_bytes <= self.views.len()) return;
+            }
             try self.views.resize(needed_bytes);
         }
 
         fn ensureDataCapacity(self: *Self, needed_len: usize) !void {
             if (needed_len <= self.data.len()) return;
+            if (self.data.isEmpty()) {
+                try array_utils.reuseSpare(self.allocator, &self.data, &self.spare_data);
+                if (needed_len <= self.data.len()) return;
+            }
             try self.data.resize(needed_len);
         }
 
@@ -392,25 +407,23 @@ fn ViewBuilder(comptime view_type: DataType) type {
             if (has_variadic) self.buffers[2] = try self.data.toShared(self.data_len);
 
             const out_len: usize = if (has_variadic) 3 else 2;
-            const buffers = try self.allocator.alloc(SharedBuffer, out_len);
-            buffers[0] = self.buffers[0];
-            buffers[1] = self.buffers[1];
-            if (has_variadic) buffers[2] = self.buffers[2];
-
             const data = ArrayData{
                 .data_type = view_type,
                 .length = self.len,
                 .null_count = self.null_count,
-                .buffers = buffers,
+                .buffers = self.buffers[0..out_len],
             };
 
             self.state = .finished;
-            return ArrayRef.fromOwnedUnsafe(self.allocator, data);
+            return ArrayRef.fromOwnedInlineBuffers(self.allocator, data);
         }
 
         pub fn finishReset(self: *Self) !ArrayRef {
             const out = try self.finish();
             try self.reset();
+            array_utils.keepSpare(&self.spare_views, self.buffers[1]);
+            // Without variadic bytes `data` was not handed out (buffers[2] is stale): it keeps its capacity.
+            if (out.data().buffers.len == 3) array_utils.keepSpare(&self.spare_data, self.buffers[2]);
             return out;
         }
 

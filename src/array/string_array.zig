@@ -87,6 +87,9 @@ pub const StringBuilder = struct {
     null_count: usize = 0,
     data_len: usize = 0,
     state: BuilderState = .ready,
+    // Buffers of the last `finishReset` batch, reused by the next one (array_utils.reuseSpare).
+    spare_offsets: ?SharedBuffer = null,
+    spare_data: ?SharedBuffer = null,
 
     /// Initialize and return a new instance.
     pub fn init(allocator: std.mem.Allocator, capacity: usize, data_capacity: usize) !StringBuilder {
@@ -105,6 +108,8 @@ pub const StringBuilder = struct {
         self.offsets.deinit();
         self.data.deinit();
         if (self.validity) |*valid| valid.deinit();
+        array_utils.dropSpare(&self.spare_offsets);
+        array_utils.dropSpare(&self.spare_data);
     }
 
     /// Reset state while retaining reusable capacity when possible.
@@ -127,6 +132,8 @@ pub const StringBuilder = struct {
         self.data.deinit();
         if (self.validity) |*valid| valid.deinit();
         self.validity = null;
+        array_utils.dropSpare(&self.spare_offsets);
+        array_utils.dropSpare(&self.spare_data);
         self.len = 0;
         self.null_count = 0;
         self.data_len = 0;
@@ -137,7 +144,8 @@ pub const StringBuilder = struct {
         const capacity = self.offsets.len() / @sizeOf(i32);
         if (needed_len <= capacity) return;
         const was_empty = capacity == 0;
-        try self.offsets.resize(needed_len * @sizeOf(i32));
+        if (was_empty) try array_utils.reuseSpare(self.allocator, &self.offsets, &self.spare_offsets);
+        if (needed_len * @sizeOf(i32) > self.offsets.len()) try self.offsets.resize(needed_len * @sizeOf(i32));
         if (was_empty) {
             const offsets_slice = std.mem.bytesAsSlice(i32, self.offsets.data);
             offsets_slice[0] = 0;
@@ -146,6 +154,10 @@ pub const StringBuilder = struct {
 
     fn ensureDataCapacity(self: *StringBuilder, needed_len: usize) !void {
         if (needed_len <= self.data.len()) return;
+        if (self.data.isEmpty()) {
+            try array_utils.reuseSpare(self.allocator, &self.data, &self.spare_data);
+            if (needed_len <= self.data.len()) return;
+        }
         try self.data.resize(needed_len);
     }
 
@@ -187,26 +199,23 @@ pub const StringBuilder = struct {
         self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(i32));
         self.buffers[2] = try self.data.toShared(self.data_len);
 
-        const buffers = try self.allocator.alloc(SharedBuffer, 3);
-        buffers[0] = self.buffers[0];
-        buffers[1] = self.buffers[1];
-        buffers[2] = self.buffers[2];
-
         const data = ArrayData{
             .data_type = STRING_TYPE,
             .length = self.len,
             .null_count = self.null_count,
-            .buffers = buffers,
+            .buffers = self.buffers[0..],
         };
 
         self.state = .finished;
-        return ArrayRef.fromOwnedUnsafe(self.allocator, data);
+        return ArrayRef.fromOwnedInlineBuffers(self.allocator, data);
     }
 
     /// Finalize output and then reset builder state for reuse.
     pub fn finishReset(self: *StringBuilder) !ArrayRef {
         const finished_ref = try self.finish();
         try self.reset();
+        array_utils.keepSpare(&self.spare_offsets, self.buffers[1]);
+        array_utils.keepSpare(&self.spare_data, self.buffers[2]);
         return finished_ref;
     }
 
@@ -228,6 +237,9 @@ pub const LargeStringBuilder = struct {
     null_count: usize = 0,
     data_len: usize = 0,
     state: BuilderState = .ready,
+    // Buffers of the last `finishReset` batch, reused by the next one (array_utils.reuseSpare).
+    spare_offsets: ?SharedBuffer = null,
+    spare_data: ?SharedBuffer = null,
 
     /// Initialize and return a new instance.
     pub fn init(allocator: std.mem.Allocator, capacity: usize, data_capacity: usize) !LargeStringBuilder {
@@ -246,6 +258,8 @@ pub const LargeStringBuilder = struct {
         self.offsets.deinit();
         self.data.deinit();
         if (self.validity) |*valid| valid.deinit();
+        array_utils.dropSpare(&self.spare_offsets);
+        array_utils.dropSpare(&self.spare_data);
     }
 
     /// Reset state while retaining reusable capacity when possible.
@@ -268,6 +282,8 @@ pub const LargeStringBuilder = struct {
         self.data.deinit();
         if (self.validity) |*valid| valid.deinit();
         self.validity = null;
+        array_utils.dropSpare(&self.spare_offsets);
+        array_utils.dropSpare(&self.spare_data);
         self.len = 0;
         self.null_count = 0;
         self.data_len = 0;
@@ -278,7 +294,8 @@ pub const LargeStringBuilder = struct {
         const capacity = self.offsets.len() / @sizeOf(i64);
         if (needed_len <= capacity) return;
         const was_empty = capacity == 0;
-        try self.offsets.resize(needed_len * @sizeOf(i64));
+        if (was_empty) try array_utils.reuseSpare(self.allocator, &self.offsets, &self.spare_offsets);
+        if (needed_len * @sizeOf(i64) > self.offsets.len()) try self.offsets.resize(needed_len * @sizeOf(i64));
         if (was_empty) {
             const offsets_slice = std.mem.bytesAsSlice(i64, self.offsets.data);
             offsets_slice[0] = 0;
@@ -287,6 +304,10 @@ pub const LargeStringBuilder = struct {
 
     fn ensureDataCapacity(self: *LargeStringBuilder, needed_len: usize) !void {
         if (needed_len <= self.data.len()) return;
+        if (self.data.isEmpty()) {
+            try array_utils.reuseSpare(self.allocator, &self.data, &self.spare_data);
+            if (needed_len <= self.data.len()) return;
+        }
         try self.data.resize(needed_len);
     }
 
@@ -328,26 +349,23 @@ pub const LargeStringBuilder = struct {
         self.buffers[1] = try self.offsets.toShared((self.len + 1) * @sizeOf(i64));
         self.buffers[2] = try self.data.toShared(self.data_len);
 
-        const buffers = try self.allocator.alloc(SharedBuffer, 3);
-        buffers[0] = self.buffers[0];
-        buffers[1] = self.buffers[1];
-        buffers[2] = self.buffers[2];
-
         const data = ArrayData{
             .data_type = LARGE_STRING_TYPE,
             .length = self.len,
             .null_count = self.null_count,
-            .buffers = buffers,
+            .buffers = self.buffers[0..],
         };
 
         self.state = .finished;
-        return ArrayRef.fromOwnedUnsafe(self.allocator, data);
+        return ArrayRef.fromOwnedInlineBuffers(self.allocator, data);
     }
 
     /// Finalize output and then reset builder state for reuse.
     pub fn finishReset(self: *LargeStringBuilder) !ArrayRef {
         const finished_ref = try self.finish();
         try self.reset();
+        array_utils.keepSpare(&self.spare_offsets, self.buffers[1]);
+        array_utils.keepSpare(&self.spare_data, self.buffers[2]);
         return finished_ref;
     }
 

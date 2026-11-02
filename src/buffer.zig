@@ -225,8 +225,14 @@ pub const OwnedBuffer = struct {
     /// `used` is the number of bytes to expose through the returned view;
     /// it must be ≤ `self.data.len`.  After the call `self.data` is reset to
     /// the empty sentinel — any previously held pointer into `self.data` must
-    /// not be dereferenced.
+    /// not be dereferenced. An already emptied buffer (no allocation, no header slot) yields
+    /// `SharedBuffer.empty` for `used == 0`, else `used` fresh zeroed bytes (e.g. the single 0
+    /// offset of a builder's empty batch after `finishReset`).
     pub fn toShared(self: *Self, used: usize) !SharedBuffer {
+        if (self.data.len == 0) {
+            if (used == 0) return SharedBuffer.empty;
+            self.* = try init(self.allocator, used);
+        }
         const storage: *BufferStorage = @ptrCast(self.raw().ptr);
         storage.* = .{
             .allocator = self.allocator,

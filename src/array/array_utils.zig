@@ -56,6 +56,35 @@ pub fn takeValidity(validity: *?OwnedBuffer, len: usize) !buffer.SharedBuffer {
     return shared;
 }
 
+/// `finishReset` helper: holds one reference to a buffer `finish` just handed to an array, so the
+/// next batch can take its memory back (`reuseSpare`). Replaces (releases) the previous spare.
+pub fn keepSpare(spare: *?buffer.SharedBuffer, finished: buffer.SharedBuffer) void {
+    if (spare.*) |*old| old.release();
+    spare.* = if (finished.storage != null) finished.retain() else null;
+}
+
+/// Gives an emptied builder buffer (`owned`, handed out by `finish`) the capacity of the previous
+/// batch: the spare's own memory when every array using it has been released (`reclaim`: the
+/// builder then holds the only reference, so nothing live aliases it), else a fresh zeroed
+/// allocation of the spare's length. Reclaimed bytes are stale; builders expose only bytes they write.
+pub fn reuseSpare(allocator: std.mem.Allocator, owned: *OwnedBuffer, spare: *?buffer.SharedBuffer) !void {
+    var held = spare.* orelse return;
+    spare.* = null;
+    if (held.reclaim()) |reclaimed| {
+        owned.* = reclaimed;
+        return;
+    }
+    const capacity = held.len();
+    held.release();
+    owned.* = try OwnedBuffer.init(allocator, capacity);
+}
+
+/// Releases a spare kept by `keepSpare` (builder deinit/clear).
+pub fn dropSpare(spare: *?buffer.SharedBuffer) void {
+    if (spare.*) |*held| held.release();
+    spare.* = null;
+}
+
 /// Mark an existing appended slot as valid if a validity bitmap has been allocated.
 pub fn setValidBit(validity: *?OwnedBuffer, index: usize) !void {
     if (validity.* == null) return;
