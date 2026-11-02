@@ -96,6 +96,7 @@ pub const AccessorError = array.AccessorError;
 pub const ArrayRef = array.ArrayRef;
 pub const ConcatArrayError = concat_array_refs.ConcatArrayError;
 pub const concatArrayRefs = concat_array_refs.concatArrayRefs;
+pub const dictionaryEncode = concat_array_refs.dictionaryEncode;
 pub const NullArray = array.NullArray;
 pub const NullBuilder = array.NullBuilder;
 pub const ExtensionArray = array.ExtensionArray;

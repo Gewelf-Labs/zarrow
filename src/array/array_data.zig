@@ -21,6 +21,9 @@ pub const ValidationError = error{
     InvalidChildren,
 };
 
+/// validateFull also checks the UTF-8 of string values.
+pub const FullValidationError = ValidationError || error{InvalidUtf8};
+
 pub const AccessorError = ValidationError || error{
     IndexOutOfBounds,
     OutOfMemory,
@@ -667,7 +670,73 @@ pub const ArrayData = struct {
         }
     }
 
-    pub fn validateFull(self: Self) ValidationError!void {
+    /// std.unicode.utf8ValidateSlice with an ASCII fast path per 32-byte block (std only skips
+    /// an ASCII prefix): a block holding a non-ASCII byte is handed to std up to the next
+    /// character boundary. Pieces cut at boundaries are valid exactly when the whole is.
+    fn utf8Valid(s: []const u8) bool {
+        const L = 32;
+        var i: usize = 0;
+        while (i < s.len) {
+            if (i + L <= s.len) {
+                const v: @Vector(L, u8) = s[i..][0..L].*;
+                if (@reduce(.Max, v) < 0x80) {
+                    i += L;
+                    continue;
+                }
+            }
+            var j = @min(i + L, s.len);
+            while (j < s.len and s[j] & 0xC0 == 0x80) j += 1;
+            if (!std.unicode.utf8ValidateSlice(s[i..j])) return false;
+            i = j;
+        }
+        return true;
+    }
+
+    /// UTF-8 of the non-null values of a string / large_string (after validateLayout).
+    /// Fast path: the bytes of the whole window are valid and no non-null value starts or ends
+    /// inside a character (one byte load per offset), so every value is valid. Otherwise (bytes
+    /// of null slots are not checked, as in Arrow C++) each non-null value is checked alone.
+    fn validateUtf8Offsets(self: Self, comptime T: type) FullValidationError!void {
+        if (self.length == 0) return;
+        const all = self.buffers[1].typedSlice(T) catch return error.InvalidOffsetBuffer;
+        const offsets = all[self.offset..][0 .. self.length + 1];
+        const data = self.buffers[2].data;
+        const start: usize = @intCast(offsets[0]);
+        const bytes = data[start..@intCast(offsets[self.length])];
+        const bits: ?[]const u8 = if (self.null_count != 0 and !self.buffers[0].isEmpty()) self.buffers[0].data else null;
+        if (utf8Valid(bytes)) {
+            var mid_char = false; // an offset of a non-null value points at a continuation byte
+            for (offsets[0..self.length], offsets[1..], 0..) |a, b, r| {
+                if (bits) |v| if (!bitmap.bitIsSet(v, self.offset + r)) continue;
+                for ([_]usize{ @as(usize, @intCast(a)) - start, @as(usize, @intCast(b)) - start }) |p| {
+                    mid_char = mid_char or (p < bytes.len and bytes[p] & 0xC0 == 0x80);
+                }
+            }
+            if (!mid_char) return;
+        }
+        for (offsets[0..self.length], offsets[1..], 0..) |a, b, r| {
+            if (bits) |v| if (!bitmap.bitIsSet(v, self.offset + r)) continue;
+            if (!utf8Valid(data[@intCast(a)..@intCast(b)])) return error.InvalidUtf8;
+        }
+    }
+
+    /// UTF-8 of the non-null values of a string_view (after validateLayout checked the views).
+    fn validateUtf8Views(self: Self) FullValidationError!void {
+        const views = self.buffers[1].data[self.offset * 16 ..][0 .. self.length * 16];
+        const bits: ?[]const u8 = if (self.null_count != 0 and !self.buffers[0].isEmpty()) self.buffers[0].data else null;
+        for (0..self.length) |r| {
+            if (bits) |v| if (!bitmap.bitIsSet(v, self.offset + r)) continue;
+            const view = views[r * 16 ..][0..16];
+            const len = std.mem.readInt(u32, view[0..4], .little);
+            const value = if (len <= 12) view[4..][0..len] else blk: {
+                const buf = self.buffers[2 + std.mem.readInt(u32, view[8..12], .little)].data;
+                break :blk buf[std.mem.readInt(u32, view[12..16], .little)..][0..len];
+            };
+            if (!utf8Valid(value)) return error.InvalidUtf8;
+        }
+    }
+
+    pub fn validateFull(self: Self) FullValidationError!void {
         try self.validateLayout();
         const dt = layoutDataType(self.data_type);
         const total_len = std.math.add(usize, self.offset, self.length) catch return error.InvalidOffsets;
@@ -688,6 +757,9 @@ pub const ArrayData = struct {
             .struct_ => |st| try self.validateStructChildren(st.fields, total_len),
             .map => |map_type| try self.validateMapChild(map_type),
             .dictionary => |dict| try self.validateDictionaryIndices(dict, self.offset, total_len),
+            .string => try self.validateUtf8Offsets(i32),
+            .large_string => try self.validateUtf8Offsets(i64),
+            .string_view => try self.validateUtf8Views(),
             else => {},
         }
 
@@ -1768,5 +1840,73 @@ test "array data validateLayout finds a decreasing offset in the vector body and
         const bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(std.mem.sliceAsBytes(o[0..])), SharedBuffer.fromSlice(bytes[0..]) };
         const data = ArrayData{ .data_type = .{ .string = {} }, .length = 40, .null_count = 0, .buffers = bufs[0..] };
         try std.testing.expectError(error.InvalidOffsets, data.validateLayout());
+    }
+}
+
+/// validateFull of `values` as string, large_string and string_view arrays with validity
+/// `valid_bits` (bytes behind null rows stay in the data) and window [off, off + len).
+fn expectUtf8Validation(values: []const []const u8, valid_bits: []const u8, off: usize, len: usize, expect_ok: bool) !void {
+    const allocator = std.testing.allocator;
+    const string_array = @import("string_array.zig");
+    const view_array = @import("view_array.zig");
+    var sb = try string_array.StringBuilder.init(allocator, values.len, 0);
+    defer sb.deinit();
+    var lb = try string_array.LargeStringBuilder.init(allocator, values.len, 0);
+    defer lb.deinit();
+    var vb = try view_array.StringViewBuilder.init(allocator, values.len, 0);
+    defer vb.deinit();
+    for (values) |v| {
+        try sb.append(v);
+        try lb.append(v);
+        try vb.append(v);
+    }
+    var arrays = [_]ArrayRef{ try sb.finish(), try lb.finish(), try vb.finish() };
+    defer for (&arrays) |*a| a.release();
+    for (arrays) |a| {
+        var bufs: [8]SharedBuffer = undefined;
+        const src = a.data().buffers;
+        @memcpy(bufs[0..src.len], src);
+        bufs[0] = SharedBuffer.fromSlice(valid_bits);
+        var d = a.data().*;
+        d.buffers = bufs[0..src.len];
+        d.offset = off;
+        d.length = len;
+        d.null_count = null;
+        if (expect_ok) try d.validateFull() else try std.testing.expectError(error.InvalidUtf8, d.validateFull());
+    }
+}
+
+test "array data validateFull checks UTF-8 of non-null string values like a per-value check" {
+    // A character split between two values: the window's bytes are valid UTF-8, the values are not.
+    const split = [_][]const u8{ "a\xc3", "\xa9b", "c" };
+    try expectUtf8Validation(&split, &.{0b111}, 0, 3, false);
+    try expectUtf8Validation(&split, &.{0b110}, 0, 3, false); // "\xa9b" alone is invalid
+    try expectUtf8Validation(&split, &.{0b100}, 0, 3, true); // both halves null
+    try expectUtf8Validation(&split, &.{0b111}, 2, 1, true); // outside the window
+
+    // Random values from pieces: ASCII runs (crossing 32-byte blocks), 2/3/4-byte characters, a
+    // lone lead byte, a lone continuation byte, an overlong encoding and a surrogate; random
+    // validity and window. Expected: every non-null value of the window passes std.
+    const pieces = [_][]const u8{ "a", "0123456789abcdefghijklmnopqrstuvwxyz", "\u{e9}", "\u{20ac}", "\u{1f600}", "\xc3", "\xa9", "\xc0\x80", "\xed\xa0\x80" };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    var bytes: [8]std.ArrayList(u8) = @splat(.empty);
+    defer for (&bytes) |*v| v.deinit(std.testing.allocator);
+    var values: [8][]const u8 = undefined;
+    for (0..1500) |_| {
+        const n = rng.uintAtMost(usize, values.len);
+        const valid_bits = [1]u8{rng.int(u8)};
+        for (bytes[0..n], values[0..n]) |*b, *v| {
+            b.clearRetainingCapacity();
+            for (0..rng.uintAtMost(usize, 4)) |_| try b.appendSlice(std.testing.allocator, pieces[rng.uintLessThan(usize, if (rng.uintLessThan(u8, 4) == 0) pieces.len else 5)]);
+            v.* = b.items;
+        }
+        const off = rng.uintAtMost(usize, n);
+        const len = rng.uintAtMost(usize, n - off);
+        var expect_ok = true;
+        for (off..off + len) |r| {
+            if (bitmap.bitIsSet(&valid_bits, r) and !std.unicode.utf8ValidateSlice(values[r])) expect_ok = false;
+        }
+        try expectUtf8Validation(values[0..n], &valid_bits, off, len, expect_ok);
     }
 }

@@ -22,6 +22,9 @@ EXPECTED_BENCHES = {
     "concat_nested_string_view",
     "concat_nested_dense_union",
     "concat_nested_ree",
+    "concat_nested_dictionary",
+    "dictionary_encode_string",
+    "dictionary_encode_int32",
     "filter",
     "ipc_compressed",
     "ipc_roundtrip",
@@ -38,6 +41,8 @@ EXPECTED_BENCHES = {
     "take_nested_dense_union",
     "take_nested_ree",
     "take_nested_string_view",
+    "validate_full_string",
+    "validate_full_int32_list",
 }
 
 

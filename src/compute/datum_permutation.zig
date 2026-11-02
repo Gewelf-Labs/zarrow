@@ -90,7 +90,7 @@ fn chunkOf(starts: []const usize, hint: usize, idx: usize) usize {
 /// Take from a chunked datum, appending the output pieces in order. Indices are split into runs
 /// that stay inside one chunk: few runs (filters, sorted or clustered takes) take each run from
 /// its chunk with the array kernels; many runs (random takes) concat the chunks once and take
-/// from that, unless the chunks do not concat (e.g. different dictionaries).
+/// from that, unless the chunks have different dictionaries or do not concat.
 fn takeChunked(
     allocator: std.mem.Allocator,
     chunks: ChunkedArray,
@@ -126,7 +126,13 @@ fn takeChunked(
         cur = c;
         have = true;
     }
-    if (n > 1 and runs > max_runs) concat_first: {
+    // Chunks with different dictionaries take per run instead (no dictionary unification here;
+    // array-output callers unify once when they concat the pieces).
+    const d0 = dictionaryNode(chunks.chunk(0).*);
+    const one_dictionary = for (chunks.chunks()[1..]) |c| {
+        if (dictionaryNode(c) != d0) break false;
+    } else true;
+    if (n > 1 and runs > max_runs and one_dictionary) concat_first: {
         var flat = concat_array_refs.concatArrayRefs(allocator, out_type, chunks.chunks()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => break :concat_first,
@@ -154,6 +160,10 @@ fn takeChunked(
         } else l.* = m;
     }
     try appendPiece(allocator, pieces, try takeChild(allocator, chunks.chunk(cur).*, @as([]const E, local[run_start..])));
+}
+
+fn dictionaryNode(c: ArrayRef) usize {
+    return if (c.data().dictionary) |d| @intFromPtr(d.node) else 0;
 }
 
 fn appendPiece(allocator: std.mem.Allocator, pieces: *std.ArrayList(ArrayRef), piece: ArrayRef) KernelError!void {

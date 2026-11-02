@@ -14,7 +14,8 @@ pub const ConcatArrayError = error{ OutOfMemory, InvalidInput, UnsupportedType }
 pub const Error = ConcatArrayError || array_data.ValidationError;
 
 /// Concatenates `parts` (all of type `data_type`) into one fresh array at offset 0, N-ary for
-/// every layout. Fails with UnsupportedType only for dictionaries that do not share one dictionary.
+/// every layout. Dictionary parts with different dictionaries get one merged dictionary
+/// (UnsupportedType for value types other than fixed-width and string/binary).
 pub fn concatArrayRefs(
     allocator: std.mem.Allocator,
     data_type: DataType,
@@ -29,7 +30,13 @@ fn concatParts(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error
     if (try concatManyFlat(allocator, dt, parts)) |out| return out;
     return switch (storageDataType(dt)) {
         .string_view, .binary_view => concatManyViews(allocator, dt, parts),
-        .dictionary => error.UnsupportedType, // parts with different dictionaries
+        .dictionary => |d| switch (d.index_type.bit_width) { // parts with different dictionaries
+            8 => if (d.index_type.signed) concatDictionaries(i8, allocator, dt, parts) else concatDictionaries(u8, allocator, dt, parts),
+            16 => if (d.index_type.signed) concatDictionaries(i16, allocator, dt, parts) else concatDictionaries(u16, allocator, dt, parts),
+            32 => if (d.index_type.signed) concatDictionaries(i32, allocator, dt, parts) else concatDictionaries(u32, allocator, dt, parts),
+            64 => if (d.index_type.signed) concatDictionaries(i64, allocator, dt, parts) else concatDictionaries(u64, allocator, dt, parts),
+            else => error.InvalidInput,
+        },
         else => concatManyNested(allocator, dt, parts),
     };
 }
@@ -293,6 +300,326 @@ fn concatManyFlat(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Er
     return out;
 }
 
+/// Concat of dictionary parts that do not share one dictionary (index type T). The merged
+/// dictionary holds the first dictionary as is, then each new distinct value of the next ones in
+/// first-seen order (null entries share one slot). Each distinct dictionary is read once, when a
+/// part first refers to it: its values are hashed into an old -> new index table (per value, not
+/// per row) and new values are appended to the merged values; then each part's indices are
+/// gathered through its table. The merged dictionary must fit T, and every non-null index must
+/// lie in its part's dictionary (InvalidInput otherwise).
+fn concatDictionaries(comptime T: type, allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error!ArrayRef {
+    const value_type = storageDataType(dt).dictionary.value_type.*;
+    const kind = (try flatKind(storageDataType(value_type))) orelse return error.UnsupportedType;
+    if (kind == .null_type or kind == .boolean or storageDataType(value_type) == .dictionary) return error.UnsupportedType;
+    if (kind == .fixed and kind.fixed == 0) return error.UnsupportedType;
+
+    // Pass 1: types, rows, and each distinct dictionary (by node) with its rows in `remap`.
+    const Table = struct { base: usize, len: usize, merged: bool = false };
+    var tables: std.AutoHashMapUnmanaged(usize, Table) = .empty; // dictionary node -> remap rows
+    defer tables.deinit(allocator);
+    var remap_len: usize = 0;
+    var total_len: usize = 0;
+    var maybe_nulls = false;
+    var view: ArrayData = undefined;
+    var last_node: usize = 0;
+    const width: usize = switch (kind) {
+        .fixed => |w| w,
+        .binary32 => 4,
+        else => 8,
+    };
+    for (parts) |*part| {
+        const d = partData(part, &view);
+        try checkPartType(d, dt);
+        const dict = d.dictionary orelse return error.InvalidInput;
+        total_len = std.math.add(usize, total_len, d.length) catch return error.InvalidInput;
+        maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and d.buffers.len > 0 and !d.buffers[0].isEmpty());
+        if (@intFromPtr(dict.node) == last_node) continue;
+        last_node = @intFromPtr(dict.node);
+        const gop = try tables.getOrPut(allocator, last_node);
+        if (gop.found_existing) continue;
+        // The values buffer bounds the length before anything is sized by it (checked fully when merged).
+        const vd = dict.data();
+        if (!datatype.dataTypeEql(vd.data_type, value_type)) return error.InvalidInput; // the dictionary must have the declared value type
+        const end = std.math.add(usize, vd.offset, vd.length) catch return error.InvalidInput;
+        if (vd.buffers.len < 2 or vd.buffers[1].len() / width < end) return error.InvalidInput;
+        gop.value_ptr.* = .{ .base = remap_len, .len = vd.length };
+        remap_len = std.math.add(usize, remap_len, vd.length) catch return error.InvalidInput;
+    }
+    const used = bitmap.byteLength(total_len);
+    var validity = try buffer.OwnedBuffer.init(allocator, if (maybe_nulls) used else 0);
+    errdefer validity.deinit();
+    const values_len = std.math.mul(usize, total_len, @sizeOf(T)) catch return error.InvalidInput;
+    var values = try buffer.OwnedBuffer.initUninit(allocator, values_len);
+    errdefer values.deinit();
+
+    var merged: MergedValues = .{ .width = if (kind == .fixed) kind.fixed else 0 };
+    defer merged.deinit(allocator);
+    // Every scratch array is sized once (growing them costs more than the hashing on Windows).
+    if (remap_len > std.math.maxInt(u32)) return error.InvalidInput;
+    var keys: KeyMap = .empty;
+    defer keys.deinit(allocator);
+    try keys.ensureTotalCapacityContext(allocator, @intCast(remap_len), EntryContext{ .v = &merged });
+    if (kind == .fixed) try merged.data.ensureTotalCapacity(allocator, std.math.mul(usize, remap_len, width) catch return error.InvalidInput) else try merged.ends.ensureTotalCapacity(allocator, remap_len);
+    var null_slot: ?u32 = null;
+    const remap = try allocator.alloc(T, remap_len);
+    defer allocator.free(remap);
+    var any_merged = false;
+    var table: Table = undefined;
+    last_node = 0;
+
+    const out = values.typedSlice(T);
+    var row: usize = 0;
+    for (parts) |*part| {
+        const d = partData(part, &view);
+        if (maybe_nulls) try appendValidityBits(validity.data, row, d);
+        const dict = d.dictionary.?;
+        if (@intFromPtr(dict.node) != last_node) {
+            last_node = @intFromPtr(dict.node);
+            const t = tables.getPtr(last_node).?;
+            if (!t.merged) {
+                try mergeDictionary(T, allocator, kind, dict.data(), &merged, &keys, &null_slot, !any_merged, remap[t.base..][0..t.len]);
+                t.merged = true;
+                any_merged = true;
+            }
+            table = t.*;
+        }
+        const map = remap[table.base..][0..table.len];
+
+        try requireBufferCount(d, 2);
+        const idx = d.buffers[1].typedSlice(T) catch return error.InvalidInput;
+        const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+        if (end > idx.len) return error.InvalidInput;
+        for (idx[d.offset..end], out[row..][0..d.length], row..) |x, *o, r| {
+            if (maybe_nulls and !bitmap.bitIsSet(validity.data, r)) {
+                o.* = 0; // null rows: index 0, whatever the part held
+                continue;
+            }
+            const ix = std.math.cast(usize, x) orelse return error.InvalidInput;
+            if (ix >= map.len) return error.InvalidInput;
+            o.* = map[ix];
+        }
+        row += d.length;
+    }
+    const null_count = if (maybe_nulls) total_len - bitmap.countSetBit(validity.data, total_len) else 0;
+
+    var dictionary = try merged.finish(allocator, value_type, kind);
+    errdefer dictionary.release();
+    var bufs: [2]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+    errdefer for (&bufs) |*b| b.release();
+    if (null_count == 0) validity.deinit() else bufs[0] = try validity.toShared(used);
+    bufs[1] = try values.toShared(values_len);
+    const data = ArrayData{ .data_type = dt, .length = total_len, .null_count = null_count, .buffers = &bufs, .dictionary = dictionary };
+    try data.validateLayout();
+    return try ArrayRef.fromOwnedInlineBuffers(allocator, data);
+}
+
+/// Hashes the values of `vd` into `keys`, writing old index -> merged index to `remap`. The
+/// first dictionary is appended as is (duplicates keep their own index); later ones only add
+/// values not seen before. Null values share one entry (`null_slot`) or, without it, get none.
+fn mergeDictionary(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    kind: FlatKind,
+    vd: *const ArrayData,
+    merged: *MergedValues,
+    keys: *KeyMap,
+    null_slot: ?*?u32, // null: null values get no entry (index 0)
+    first: bool,
+    remap: []T,
+) Error!void {
+    const end = std.math.add(usize, vd.offset, vd.length) catch return error.InvalidInput;
+    if (vd.buffers.len > 0 and !vd.buffers[0].isEmpty()) try requireBitmapBits(vd.buffers[0], end); // for isNull
+    switch (kind) {
+        .binary32 => _ = try binaryDataRange(i32, vd), // buffer count and the offsets window
+        .binary64 => _ = try binaryDataRange(i64, vd),
+        else => {},
+    }
+    const fixed: []const u8 = if (kind == .fixed) try dataBytesForFixedWidth(vd, kind.fixed) else &.{};
+    for (remap, 0..) |*slot, i| {
+        const bytes: ?[]const u8 = if (vd.isNull(i)) null else switch (kind) {
+            .fixed => |w| fixed[i * w ..][0..w],
+            .binary32 => try binaryValue(i32, vd, i),
+            else => try binaryValue(i64, vd, i),
+        };
+        var m: u32 = undefined;
+        if (bytes) |b| {
+            const gop = try keys.getOrPutContextAdapted(allocator, b, BytesProbe{ .v = merged }, EntryContext{ .v = merged });
+            if (!gop.found_existing) gop.key_ptr.* = @intCast(merged.count);
+            if (first or !gop.found_existing) try merged.append(allocator, b);
+            m = if (first) @intCast(merged.count - 1) else gop.key_ptr.*;
+        } else if (null_slot) |ns| {
+            if (first or ns.* == null) try merged.append(allocator, null);
+            if (ns.* == null) ns.* = @intCast(merged.count - 1);
+            m = if (first) @intCast(merged.count - 1) else ns.*.?;
+        } else m = 0; // masked: the row stays null, no dictionary entry
+        if (m > std.math.maxInt(T)) return error.InvalidInput; // the merged dictionary does not fit T
+        slot.* = @intCast(m);
+    }
+}
+
+/// Distinct values of a merged dictionary: entry numbers, hashed through their bytes.
+const KeyMap = std.HashMapUnmanaged(u32, void, EntryContext, std.hash_map.default_max_load_percentage);
+
+/// Map context (rehash on growth): an entry number's bytes.
+const EntryContext = struct {
+    v: *const MergedValues,
+
+    pub fn hash(c: EntryContext, m: u32) u64 {
+        return std.hash.Wyhash.hash(0, c.v.at(m));
+    }
+    pub fn eql(_: EntryContext, a: u32, b: u32) bool {
+        return a == b;
+    }
+};
+
+/// Lookup of a value's bytes among the entries.
+const BytesProbe = struct {
+    v: *const MergedValues,
+
+    pub fn hash(_: BytesProbe, b: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, b);
+    }
+    pub fn eql(p: BytesProbe, b: []const u8, m: u32) bool {
+        return std.mem.eql(u8, b, p.v.at(m));
+    }
+};
+
+/// Values of a merged dictionary (fixed-width or string/binary bytes) as they are appended.
+const MergedValues = struct {
+    width: usize, // fixed width, 0 for string/binary
+    data: std.ArrayList(u8) = .empty,
+    ends: std.ArrayList(usize) = .empty, // string/binary: end offset of each entry
+    count: usize = 0,
+    nulls: std.ArrayList(usize) = .empty, // entries that are null
+
+    fn deinit(self: *MergedValues, allocator: std.mem.Allocator) void {
+        self.data.deinit(allocator);
+        self.ends.deinit(allocator);
+        self.nulls.deinit(allocator);
+    }
+
+    fn at(self: MergedValues, m: u32) []const u8 {
+        if (self.width != 0) return self.data.items[m * self.width ..][0..self.width];
+        return self.data.items[if (m == 0) 0 else self.ends.items[m - 1]..self.ends.items[m]];
+    }
+
+    fn append(self: *MergedValues, allocator: std.mem.Allocator, bytes: ?[]const u8) Error!void {
+        if (self.count >= std.math.maxInt(u32)) return error.InvalidInput;
+        if (bytes) |b| try self.data.appendSlice(allocator, b) else {
+            try self.nulls.append(allocator, self.count);
+            if (self.width != 0) try self.data.appendNTimes(allocator, 0, self.width);
+        }
+        if (self.width == 0) try self.ends.append(allocator, self.data.items.len);
+        self.count += 1;
+    }
+
+    fn finish(self: *MergedValues, allocator: std.mem.Allocator, value_type: DataType, kind: FlatKind) Error!ArrayRef {
+        const n = self.count;
+        const used = bitmap.byteLength(n);
+        var validity = try buffer.OwnedBuffer.init(allocator, if (self.nulls.items.len > 0) used else 0);
+        errdefer validity.deinit();
+        if (self.nulls.items.len > 0) {
+            bitmap.setBits(validity.data, 0, n);
+            for (self.nulls.items) |k| bitmap.clearBit(validity.data, k);
+        }
+        const ow: usize = if (kind == .binary32) 4 else 8;
+        const offsets_len = if (self.width == 0) (n + 1) * ow else 0;
+        if (kind == .binary32 and self.data.items.len > std.math.maxInt(i32)) return error.InvalidInput;
+        var offsets = try buffer.OwnedBuffer.initUninit(allocator, offsets_len);
+        errdefer offsets.deinit();
+        if (self.width == 0) {
+            if (ow == 4) {
+                const o = offsets.typedSlice(i32);
+                o[0] = 0;
+                for (o[1..][0..n], self.ends.items) |*x, e| x.* = @intCast(e);
+            } else {
+                const o = offsets.typedSlice(i64);
+                o[0] = 0;
+                for (o[1..][0..n], self.ends.items) |*x, e| x.* = @intCast(e);
+            }
+        }
+        var bytes = try buffer.OwnedBuffer.initUninit(allocator, self.data.items.len);
+        errdefer bytes.deinit();
+        @memcpy(bytes.data[0..self.data.items.len], self.data.items);
+
+        var bufs: [3]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+        errdefer for (&bufs) |*b| b.release();
+        if (self.nulls.items.len > 0) bufs[0] = try validity.toShared(used) else validity.deinit();
+        if (self.width == 0) {
+            bufs[1] = try offsets.toShared(offsets_len);
+            bufs[2] = try bytes.toShared(self.data.items.len);
+        } else {
+            offsets.deinit();
+            bufs[1] = try bytes.toShared(self.data.items.len);
+        }
+        const data = ArrayData{
+            .data_type = value_type,
+            .length = n,
+            .null_count = self.nulls.items.len,
+            .buffers = bufs[0..if (self.width == 0) 3 else 2],
+        };
+        try data.validateLayout();
+        return try ArrayRef.fromOwnedInlineBuffers(allocator, data);
+    }
+};
+
+/// Dictionary-encodes a fixed-width or string/binary array: int32 indices into its distinct
+/// values in first-seen order (each row hashed once); null rows stay null and add no entry.
+/// `value_type` must equal the array's type and outlive the result (as for DictionaryBuilder).
+pub fn dictionaryEncode(allocator: std.mem.Allocator, array: ArrayRef, value_type: *const DataType) Error!ArrayRef {
+    const d = array.data();
+    if (!datatype.dataTypeEql(value_type.*, d.data_type)) return error.InvalidInput;
+    const kind = (try flatKind(storageDataType(d.data_type))) orelse return error.UnsupportedType;
+    if (kind == .null_type or kind == .boolean or storageDataType(d.data_type) == .dictionary) return error.UnsupportedType;
+    if (kind == .fixed and kind.fixed == 0) return error.UnsupportedType;
+    const width: usize = switch (kind) {
+        .fixed => |w| w,
+        .binary32 => 4,
+        else => 8,
+    };
+    const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+    if (d.buffers.len < 2 or d.buffers[1].len() / width < end) return error.InvalidInput; // bounds the sizes below
+
+    const maybe_nulls = (d.null_count orelse 1) != 0 and !d.buffers[0].isEmpty();
+    const used = bitmap.byteLength(d.length);
+    var validity = try buffer.OwnedBuffer.init(allocator, if (maybe_nulls) used else 0);
+    errdefer validity.deinit();
+    if (maybe_nulls) try appendValidityBits(validity.data, 0, d);
+    var indices = try buffer.OwnedBuffer.initUninit(allocator, d.length * @sizeOf(i32));
+    errdefer indices.deinit();
+    var merged: MergedValues = .{ .width = if (kind == .fixed) kind.fixed else 0 };
+    defer merged.deinit(allocator);
+    var keys: KeyMap = .empty; // grows with the distinct values (a reserved table would be cold)
+    defer keys.deinit(allocator);
+    try mergeDictionary(i32, allocator, kind, d, &merged, &keys, null, false, indices.typedSlice(i32)[0..d.length]);
+    const null_count = if (maybe_nulls) d.length - bitmap.countSetBit(validity.data, d.length) else 0;
+
+    var dictionary = try merged.finish(allocator, value_type.*, kind);
+    errdefer dictionary.release();
+    var bufs: [2]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+    errdefer for (&bufs) |*b| b.release();
+    if (null_count == 0) validity.deinit() else bufs[0] = try validity.toShared(used);
+    bufs[1] = try indices.toShared(d.length * @sizeOf(i32));
+    const out = ArrayData{
+        .data_type = .{ .dictionary = .{ .index_type = .{ .bit_width = 32, .signed = true }, .value_type = value_type } },
+        .length = d.length,
+        .null_count = null_count,
+        .buffers = &bufs,
+        .dictionary = dictionary,
+    };
+    try out.validateLayout();
+    return try ArrayRef.fromOwnedInlineBuffers(allocator, out);
+}
+
+/// Row `i` of a string/binary array whose offsets passed binaryDataRange (each value checked).
+fn binaryValue(comptime O: type, d: *const ArrayData, i: usize) Error![]const u8 {
+    const offsets = d.buffers[1].typedSlice(O) catch return error.InvalidInput;
+    const start = std.math.cast(usize, offsets[d.offset + i]) orelse return error.InvalidInput;
+    const end = std.math.cast(usize, offsets[d.offset + i + 1]) orelse return error.InvalidInput;
+    if (end < start or end > d.buffers[2].len()) return error.InvalidInput;
+    return d.buffers[2].data[start..end];
+}
+
 /// Rows [start, start + len) of `ref`: nested concat records every part's child windows in one
 /// pass over the parts and hands them down instead of allocating an ArrayRef slice per window.
 const Part = struct { ref: ArrayRef, start: usize, len: usize };
@@ -359,7 +686,7 @@ fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) 
         total_len = std.math.add(usize, total_len, d.length) catch return error.InvalidInput;
         if (has_validity) maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and !d.buffers[0].isEmpty());
         if (layout == .dense_union) {
-            try unionWindows(d, &child_of, windows[p..], n);
+            try unionWindows(d, &child_of, windows, n, p);
         } else for (0..n_children) |c| {
             windows[c * n + p] = if (layout == .run_end_encoded and c == 1)
                 .{ .ref = d.children[1], .start = windows[p].start, .len = windows[p].len } // runRange checked the lengths
@@ -405,7 +732,7 @@ fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) 
                 .large_list => rebaseOffsets(i64, offsets.typedSlice(i64), row, pos[0], d),
                 .list_view => rebaseViews(i32, offsets.typedSlice(i32), sizes.typedSlice(i32), row, pos[0], windows[p].start, d),
                 .large_list_view => rebaseViews(i64, offsets.typedSlice(i64), sizes.typedSlice(i64), row, pos[0], windows[p].start, d),
-                .dense_union => try rebaseUnionOffsets(offsets.typedSlice(i32)[row..][0..d.length], &child_of, windows[p..], n, &pos, d),
+                .dense_union => try rebaseUnionOffsets(offsets.typedSlice(i32)[row..][0..d.length], &child_of, windows, n, p, &pos, d),
                 .run_end_encoded => switch (width) {
                     2 => try rebaseRunEnds(i16, offsets.typedSlice(i16)[pos[0]..][0..windows[p].len], row, windows[p], d),
                     4 => try rebaseRunEnds(i32, offsets.typedSlice(i32)[pos[0]..][0..windows[p].len], row, windows[p], d),
@@ -544,9 +871,10 @@ fn rebaseViews(comptime T: type, offsets: []T, sizes: []T, row: usize, pos: usiz
     @memcpy(sizes[row..][0..d.length], src_sizes);
 }
 
-/// Child windows of a dense union part (child k at `windows[k * n]`): [min, max + 1) of the
-/// offsets of its rows of that child. Every type id must be declared, every offset inside its child.
-fn unionWindows(d: *const ArrayData, child_of: *const [256]u8, windows: []Part, n: usize) Error!void {
+/// Child windows of dense union part p (child k at `windows[k * n + p]`; a union without
+/// children has none): [min, max + 1) of the offsets of its rows of that child. Every type id
+/// must be declared, every offset inside its child.
+fn unionWindows(d: *const ArrayData, child_of: *const [256]u8, windows: []Part, n: usize, p: usize) Error!void {
     const offsets = d.buffers[1].typedSlice(i32) catch return error.InvalidInput;
     const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
     if (d.buffers[0].len() < end or offsets.len < end) return error.InvalidInput;
@@ -570,17 +898,17 @@ fn unionWindows(d: *const ArrayData, child_of: *const [256]u8, windows: []Part, 
     }
     for (d.children, lo, hi, 0..) |child, l, h, k| {
         const start = if (h == 0) 0 else l;
-        windows[k * n] = .{ .ref = child, .start = start, .len = h - start };
+        windows[k * n + p] = .{ .ref = child, .start = start, .len = h - start };
     }
 }
 
-/// Writes `d`'s dense union offsets moved from each child's window (`windows[k * n]`) to `pos[k]`.
-fn rebaseUnionOffsets(out: []i32, child_of: *const [256]u8, windows: []const Part, n: usize, pos: *const [128]usize, d: *const ArrayData) Error!void {
+/// Writes `d`'s dense union offsets moved from each child's window (`windows[k * n + p]`) to `pos[k]`.
+fn rebaseUnionOffsets(out: []i32, child_of: *const [256]u8, windows: []const Part, n: usize, p: usize, pos: *const [128]usize, d: *const ArrayData) Error!void {
     const offsets = d.buffers[1].typedSlice(i32) catch return error.InvalidInput; // bounds: unionWindows
     for (d.buffers[0].data[d.offset..][0..d.length], offsets[d.offset..][0..d.length], out) |id, o, *dst| {
         const k = child_of[id];
         if (k == 0xFF) return error.InvalidInput;
-        dst.* = o -% @as(i32, @intCast(windows[k * n].start)) +% @as(i32, @intCast(pos[k]));
+        dst.* = o -% @as(i32, @intCast(windows[k * n + p].start)) +% @as(i32, @intCast(pos[k]));
     }
 }
 
