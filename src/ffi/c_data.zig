@@ -742,10 +742,13 @@ fn importArrayRecursive(
 
         if ((layout_dt == .string or layout_dt == .binary or layout_dt == .list) and i == 1) {
             offsets_i32 = buffers[i].typedSlice(i32) catch return error.InvalidOffset;
+            // A null buffer pointer imports as empty; offsets need total_len + 1 entries.
+            if (offsets_i32.?.len <= total_len) return error.InvalidOffset;
             data_buffer_len = std.math.cast(usize, offsets_i32.?[total_len]) orelse return error.InvalidOffset;
         }
         if ((layout_dt == .large_string or layout_dt == .large_binary or layout_dt == .large_list) and i == 1) {
             offsets_i64 = buffers[i].typedSlice(i64) catch return error.InvalidOffset;
+            if (offsets_i64.?.len <= total_len) return error.InvalidOffset;
             data_buffer_len = std.math.cast(usize, offsets_i64.?[total_len]) orelse return error.InvalidOffset;
         }
     }

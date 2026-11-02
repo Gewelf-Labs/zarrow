@@ -1135,3 +1135,22 @@ test "ipc file roundtrips tensor and sparse tensor messages" {
     try std.testing.expectEqual(@as(i32, 10), std.mem.readInt(i32, s_bytes[0..4], .little));
     try std.testing.expectEqual(@as(i32, 20), std.mem.readInt(i32, s_bytes[4..8], .little));
 }
+
+test "file reader reads zero-length buffers and empty arrays without offsets" {
+    const fixtures = .{
+        .{ @embedFile("testdata/at-cpp-21.0.0-generated_union.arrow_file"), &[_]usize{ 0, 11 } },
+        .{ @embedFile("testdata/at-0.14.1-generated_primitive_zerolength.arrow_file"), &[_]usize{ 0, 0, 0 } },
+    };
+    inline for (fixtures) |fixture| {
+        var reader = FileReader.init(std.testing.allocator, fixture[0]);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        try std.testing.expectEqual(fixture[1].len, try reader.recordBatchCount());
+        for (fixture[1], 0..) |rows, i| {
+            var batch = try reader.readRecordBatchAt(i);
+            defer batch.deinit();
+            try std.testing.expectEqual(rows, batch.numRows());
+            for (batch.columns) |col| try col.data().validateFull();
+        }
+    }
+}

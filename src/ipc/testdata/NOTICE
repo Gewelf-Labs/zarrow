@@ -1,0 +1,5 @@
+Files named at-* in this directory are copied unmodified from apache/arrow-testing
+(https://github.com/apache/arrow-testing, revision 5a26d35785ff8761e56d79eebff971f6f737e18c),
+data/arrow-ipc-stream/integration/<version>/<name>, saved as at-<version>-<name>.
+They are licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0); see LICENSE.txt in that repository.

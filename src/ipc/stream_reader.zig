@@ -228,23 +228,21 @@ pub const StreamReader = struct {
 
             switch (msg.msg.header) {
                 .DictionaryBatch => {
-                    if (msg.body == null) return StreamError.InvalidBody;
                     try ingestDictionaryBatchWithMap(
                         self.allocator,
                         &self.dictionary_values,
                         schema_ref.schema().*,
                         msg.msg.header.DictionaryBatch.?,
-                        msg.body.?,
+                        msg.body orelse .empty,
                         msg.msg.version,
                     );
                 },
                 .RecordBatch => {
-                    if (msg.body == null) return StreamError.InvalidBody;
                     return try buildRecordBatchFromFlatbuf(
                         self.allocator,
                         schema_ref.retain(),
                         msg.msg.header.RecordBatch.?,
-                        msg.body.?,
+                        msg.body orelse .empty,
                         &self.dictionary_values,
                         msg.msg.version,
                         &self.spare_decoded,
@@ -347,15 +345,14 @@ fn keepSpare(spare: ?*?array_data.SharedBuffer, buf: array_data.SharedBuffer) vo
 }
 
 fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.PackError || std.Io.Reader.Error || error{ EndOfStream, OutOfMemory })!?MessageWithBody {
-    const meta_len_opt = try format.readMessageLength(self.reader);
-    if (meta_len_opt == null) return null;
-    const meta_len = meta_len_opt.?;
+    const prefix = try format.readMessageLength(self.reader) orelse return null;
+    const meta_len = prefix.len;
 
     var meta_buf_owned = try readOwned(self.allocator, self.reader, null, meta_len);
     errdefer meta_buf_owned.deinit();
     var metadata = try meta_buf_owned.toShared(meta_len);
     errdefer metadata.release();
-    try format.skipPadding(self.reader, format.padLen(meta_len));
+    try format.skipPadding(self.reader, prefix.pad);
 
     const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata.data) catch return StreamError.InvalidMetadata;
 
@@ -1583,7 +1580,12 @@ fn readArrayFromMeta(
         const end = std.math.add(usize, start, len) catch return StreamError.InvalidBody;
         if (end > body.len()) return StreamError.InvalidBody;
         if (meta.length == 0) {
-            buffers[i] = array_data.SharedBuffer.empty;
+            // Older writers send no offsets for an empty binary/list array; it gets its one 0 offset.
+            const no_offsets = i == 1 and array_len == 0 and switch (layout_dt) {
+                .string, .binary, .large_string, .large_binary, .list, .large_list, .map => true,
+                else => false,
+            };
+            buffers[i] = if (no_offsets) .fromSlice(zero_offset[0..requiredBufferAlignment(layout_dt, i, metadata_version)]) else .empty;
         } else {
             const required_alignment = requiredBufferAlignment(layout_dt, i, metadata_version);
             if (canReuseBodySlice(body, start, required_alignment)) {
@@ -1809,6 +1811,9 @@ fn requiredBufferAlignment(dt: DataType, buffer_idx: usize, metadata_version: fb
         else => @alignOf(u8),
     };
 }
+
+/// A single 0 offset (i32 or i64) for empty binary/list arrays that arrive without offsets.
+const zero_offset: [8]u8 align(8) = @splat(0);
 
 fn canReuseBodySlice(body: array_data.SharedBuffer, start: usize, required_alignment: usize) bool {
     if (body.storage == null) return false;
@@ -2074,6 +2079,8 @@ fn ingestDictionaryBatchWithMap(
 ) (StreamError || array_data.ValidationError || error{OutOfMemory})!void {
     const record_batch_t = dictionary_batch_t.data orelse return StreamError.InvalidMetadata;
     const value_type = findDictionaryValueType(schema, dictionary_batch_t.id) orelse return StreamError.InvalidMetadata;
+    // Values that reference their own id would chain each replacement to the previous dictionary.
+    if (findDictionaryValueTypeInDataType(value_type, dictionary_batch_t.id) != null) return StreamError.InvalidMetadata;
     var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, null);
     defer decoded.deinit(allocator);
 
@@ -2743,7 +2750,8 @@ fn findDictionaryValueTypeInDataType(dt: DataType, dictionary_id: i64) ?DataType
             if (dict.id) |id| {
                 if (id == dictionary_id) return dict.value_type.*;
             }
-            return null;
+            // Nested dictionary: the value type may itself contain dictionary-encoded fields.
+            return findDictionaryValueTypeInDataType(dict.value_type.*, dictionary_id);
         },
         .list => |lst| findDictionaryValueTypeInDataType(lst.value_field.data_type.*, dictionary_id),
         .large_list => |lst| findDictionaryValueTypeInDataType(lst.value_field.data_type.*, dictionary_id),
@@ -2835,6 +2843,34 @@ test "ipc reader finds dictionary value type in nested metadata layouts" {
         },
     };
     try std.testing.expect(findDictionaryValueTypeInDataType(extension_type, 99) != null);
+}
+
+test "ipc reader rejects a dictionary whose values contain its own id" {
+    const allocator = std.testing.allocator;
+    const int32_type = DataType{ .int32 = {} };
+    const index_type: datatype.IntType = .{ .bit_width = 32, .signed = true };
+    const inner = DataType{ .dictionary = .{ .id = 7, .index_type = index_type, .value_type = &int32_type, .ordered = false } };
+    const list_type = DataType{ .list = .{ .value_field = .{ .name = "item", .data_type = &inner, .nullable = true } } };
+    const outer = DataType{ .dictionary = .{ .id = 7, .index_type = index_type, .value_type = &list_type, .ordered = false } };
+    const fields = [_]Field{.{ .name = "f", .data_type = &outer, .nullable = true }};
+
+    // A current dictionary 7 and an empty list<dictionary 7> batch that would decode without the check.
+    var dictionaries = std.AutoHashMap(i64, ArrayRef).init(allocator);
+    defer {
+        var it = dictionaries.valueIterator();
+        while (it.next()) |d| d.release();
+        dictionaries.deinit();
+    }
+    var values = try @import("../array/array.zig").Int32Builder.init(allocator, 0);
+    defer values.deinit();
+    try dictionaries.put(7, try values.finish());
+    var nodes = [_]fbs.FieldNodeT{ .{}, .{} };
+    var buffers = [_]fbs.BufferT{ .{}, .{}, .{}, .{} };
+    var data: fbs.RecordBatchT = .{};
+    data.nodes.items = &nodes;
+    data.buffers.items = &buffers;
+    var batch: fbs.DictionaryBatchT = .{ .id = 7, .data = &data };
+    try std.testing.expectError(StreamError.InvalidMetadata, ingestDictionaryBatchWithMap(allocator, &dictionaries, .{ .fields = &fields }, &batch, .empty, .V5));
 }
 
 fn expectMetadataEntry(metadata: []const datatype.KeyValue, key: []const u8, value: []const u8) !void {
@@ -4669,6 +4705,33 @@ test "ipc reader reads pyarrow multi-batch stream fixture" {
 
     const done = try reader.nextRecordBatch();
     try std.testing.expect(done == null);
+}
+
+/// Reads every batch of an arrow-testing stream fixture; each column must pass validateFull.
+fn expectStreamFixtureValid(data: []const u8, expected_rows: []const usize) !void {
+    var stream: std.Io.Reader = .fixed(data);
+    var reader = StreamReader.init(std.testing.allocator, &stream);
+    defer reader.deinit();
+    _ = try reader.readSchema();
+    for (expected_rows) |rows| {
+        var batch = (try reader.nextRecordBatch()) orelse return error.TestUnexpectedResult;
+        defer batch.deinit();
+        try std.testing.expectEqual(rows, batch.numRows());
+        for (batch.columns) |col| try col.data().validateFull();
+    }
+    try std.testing.expect(try reader.nextRecordBatch() == null);
+}
+
+test "ipc reader reads a pre-0.15 stream (4-byte prefix, no continuation marker)" {
+    try expectStreamFixtureValid(@embedFile("testdata/at-0.14.1-generated_decimal.stream"), &.{7});
+}
+
+test "ipc reader reads record batches with an empty body" {
+    try expectStreamFixtureValid(@embedFile("testdata/at-cpp-21.0.0-generated_null_trivial.stream"), &.{ 0, 0 });
+}
+
+test "ipc reader reads nested dictionaries" {
+    try expectStreamFixtureValid(@embedFile("testdata/at-cpp-21.0.0-generated_nested_dictionary.stream"), &.{ 10, 13 });
 }
 
 test "ipc reader handles non-8-aligned body and still reads next real writer message" {
