@@ -32,6 +32,9 @@ EXPECTED_BENCHES = {
     "take_nested_chunked_take",
     "take_nested_chunked_filter",
     "take_nested_flat_filter",
+    "take_nested_dense_union",
+    "take_nested_ree",
+    "take_nested_string_view",
 }
 
 
