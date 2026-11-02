@@ -12,6 +12,7 @@ const common = @import("datum_common.zig");
 
 const DataType = core.DataType;
 const storageDataType = concat_array_refs.storageDataType;
+const findRun = concat_array_refs.findRun;
 const ArrayRef = core.ArrayRef;
 const ChunkedArray = core.ChunkedArray;
 const Datum = core.Datum;
@@ -768,15 +769,7 @@ fn takeDenseUnionArray(allocator: std.mem.Allocator, src: *const array_mod.Array
     try checkIndices(indices, src.length);
     const out_len = indices.len;
 
-    // Type id -> child index (0xFF: undeclared); without declared ids the id is the child index.
-    var child_of: [256]u8 = @splat(0xFF);
-    if (uni.type_ids.len == 0) {
-        for (0..nchildren) |c| child_of[c] = @intCast(c);
-    } else {
-        if (uni.type_ids.len != nchildren) return error.InvalidInput;
-        var c = nchildren;
-        while (c > 0) : (c -= 1) child_of[@as(u8, @bitCast(uni.type_ids[c - 1]))] = @intCast(c - 1); // first id wins
-    }
+    const child_of = try concat_array_refs.unionChildTable(uni);
     const first: u8 = if (uni.type_ids.len > 0) @bitCast(uni.type_ids[0]) else 0;
 
     var out_ids = buffer.OwnedBuffer.initUninit(allocator, out_len) catch return error.OutOfMemory;
@@ -910,22 +903,6 @@ fn takeRunEnds(comptime T: type, allocator: std.mem.Allocator, src: *const array
         .buffers = &.{},
         .children = children,
     }) catch return error.OutOfMemory;
-}
-
-/// First run whose end is past `pos`. Non-monotone (hostile) run ends still give an in-bounds run.
-fn findRun(comptime T: type, ends: []const T, pos: usize) KernelError!usize {
-    const p = std.math.cast(T, pos) orelse return error.InvalidInput;
-    if (ends.len == 0) return error.InvalidInput;
-    var base: usize = 0;
-    var n = ends.len;
-    while (n > 1) {
-        const half = n / 2;
-        if (ends[base + half - 1] <= p) base += half;
-        n -= half;
-    }
-    base += @intFromBool(ends[base] <= p);
-    if (base == ends.len) return error.InvalidInput;
-    return base;
 }
 
 /// Run of every row `offset .. offset + len` (merge walk over the run ends); every row must be covered.

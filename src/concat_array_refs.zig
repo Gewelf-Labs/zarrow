@@ -13,83 +13,25 @@ pub const ArrayData = array_data.ArrayData;
 pub const ConcatArrayError = error{ OutOfMemory, InvalidInput, UnsupportedType };
 pub const Error = ConcatArrayError || array_data.ValidationError;
 
+/// Concatenates `parts` (all of type `data_type`) into one fresh array at offset 0, N-ary for
+/// every layout. Fails with UnsupportedType only for dictionaries that do not share one dictionary.
 pub fn concatArrayRefs(
     allocator: std.mem.Allocator,
     data_type: DataType,
     parts: []const ArrayRef,
 ) Error!ArrayRef {
     if (parts.len == 0) return error.InvalidInput;
-
-    // Flat layouts: two passes over `parts`, each output buffer allocated once; checks part types itself.
-    if (try concatManyFlat(allocator, data_type, parts)) |out| return out;
-
-    // Nested layouts check the part types themselves, in the pass that reads the parts.
-    if (isNestedLayout(data_type)) return concatManyNested(allocator, data_type, parts);
-
-    for (parts) |part| {
-        if (!datatype.dataTypeEql(part.data().data_type, data_type)) return error.InvalidInput;
-    }
-
-    if (parts.len == 1) {
-        // Single part still returns a fresh, compacted copy (offset 0), as before.
-        var empty = try parts[0].slice(0, 0);
-        defer empty.release();
-        return concatTwoArrayRefs(allocator, empty, parts[0]);
-    }
-
-    // View types: balanced pairwise merge, O(total_len * log(parts.len)).
-    var level = try mergePairs(allocator, parts);
-    while (level.items.len > 1) {
-        const next = mergePairs(allocator, level.items) catch |err| {
-            releaseAll(allocator, &level);
-            return err;
-        };
-        releaseAll(allocator, &level);
-        level = next;
-    }
-    const out = level.items[0];
-    level.deinit(allocator);
-    return out;
+    return concatParts(allocator, data_type, parts);
 }
 
-/// Concatenates `refs` two at a time; an odd trailing ref is retained as-is.
-fn mergePairs(allocator: std.mem.Allocator, refs: []const ArrayRef) Error!std.ArrayList(ArrayRef) {
-    var out = try std.ArrayList(ArrayRef).initCapacity(allocator, (refs.len + 1) / 2);
-    errdefer releaseAll(allocator, &out);
-    var i: usize = 0;
-    while (i + 1 < refs.len) : (i += 2) {
-        out.appendAssumeCapacity(try concatTwoArrayRefs(allocator, refs[i], refs[i + 1]));
-    }
-    if (i < refs.len) out.appendAssumeCapacity(refs[i].retain());
-    return out;
-}
-
-fn releaseAll(allocator: std.mem.Allocator, list: *std.ArrayList(ArrayRef)) void {
-    for (list.items) |*ref| ref.release();
-    list.deinit(allocator);
-}
-
-fn concatTwoArrayRefs(
-    allocator: std.mem.Allocator,
-    left: ArrayRef,
-    right: ArrayRef,
-) Error!ArrayRef {
-    if (!datatype.dataTypeEql(left.data().data_type, right.data().data_type)) return error.InvalidInput;
-
-    if (try concatManyFlat(allocator, left.data().data_type, &[_]ArrayRef{ left, right })) |out| return out;
-
-    const dt = left.data().data_type;
-    const layout_dt = storageDataType(dt);
-    var merged_storage = try switch (layout_dt) {
-        .string_view => try concatStringViewArray(allocator, left.data(), right.data()),
-        .binary_view => try concatBinaryViewArray(allocator, left.data(), right.data()),
-        else => error.UnsupportedType,
+/// Concat of ArrayRefs or Part windows; every path checks the part types itself.
+fn concatParts(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error!ArrayRef {
+    if (try concatManyFlat(allocator, dt, parts)) |out| return out;
+    return switch (storageDataType(dt)) {
+        .string_view, .binary_view => concatManyViews(allocator, dt, parts),
+        .dictionary => error.UnsupportedType, // parts with different dictionaries
+        else => concatManyNested(allocator, dt, parts),
     };
-
-    if (datatype.dataTypeEql(dt, layout_dt)) return merged_storage;
-    const retagged = try retagArrayRefDataType(allocator, merged_storage, dt);
-    merged_storage.release();
-    return retagged;
 }
 
 pub fn storageDataType(dt: DataType) DataType {
@@ -99,104 +41,122 @@ pub fn storageDataType(dt: DataType) DataType {
     };
 }
 
-fn retagArrayRefDataType(allocator: std.mem.Allocator, src: ArrayRef, out_dt: DataType) error{OutOfMemory}!ArrayRef {
-    var out = src.data().*;
-    out.data_type = out_dt;
-    return ArrayRef.fromBorrowed(allocator, out);
+/// Union type id -> child index (0xFF: undeclared). Without declared ids the id is the child
+/// index; on duplicate ids the first wins (as the validator).
+pub fn unionChildTable(uni: datatype.UnionType) error{InvalidInput}![256]u8 {
+    const n = uni.fields.len;
+    if (n > 128) return error.InvalidInput;
+    var child_of: [256]u8 = @splat(0xFF);
+    if (uni.type_ids.len == 0) {
+        for (0..n) |c| child_of[c] = @intCast(c);
+    } else {
+        if (uni.type_ids.len != n) return error.InvalidInput;
+        var c = n;
+        while (c > 0) : (c -= 1) child_of[@as(u8, @bitCast(uni.type_ids[c - 1]))] = @intCast(c - 1);
+    }
+    return child_of;
 }
 
-fn viewDataCapacityHint(data: *const ArrayData) usize {
-    if (data.buffers.len >= 3) return data.buffers[2].len();
-    return 0;
+/// First run whose end is past `pos`. Non-monotone (hostile) run ends still give an in-bounds run.
+pub fn findRun(comptime T: type, ends: []const T, pos: usize) error{InvalidInput}!usize {
+    const p = std.math.cast(T, pos) orelse return error.InvalidInput;
+    if (ends.len == 0) return error.InvalidInput;
+    var base: usize = 0;
+    var n = ends.len;
+    while (n > 1) {
+        const half = n / 2;
+        if (ends[base + half - 1] <= p) base += half;
+        n -= half;
+    }
+    base += @intFromBool(ends[base] <= p);
+    if (base == ends.len) return error.InvalidInput;
+    return base;
 }
 
-fn concatStringViewArray(
-    allocator: std.mem.Allocator,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    try left.validateLayout();
-    try right.validateLayout();
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const data_capacity = std.math.add(usize, viewDataCapacityHint(left), viewDataCapacityHint(right)) catch return error.InvalidInput;
+/// std.meta.eql first: copies of one type (parts sliced from one array) share its pointers.
+inline fn checkPartType(d: *const ArrayData, dt: DataType) Error!void {
+    if (!std.meta.eql(d.data_type, dt) and !datatype.dataTypeEql(d.data_type, dt)) return error.InvalidInput;
+}
 
-    var builder = try array_mod.StringViewBuilder.init(allocator, total_len, data_capacity);
-    defer builder.deinit();
-
-    const left_view = array_mod.StringViewArray{ .data = left };
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        if (left_view.isNull(i)) {
-            builder.appendNull() catch |err| return mapViewBuilderError(err);
-        } else {
-            const value = left_view.value(i) catch return error.InvalidInput;
-            builder.append(value) catch |err| return mapViewBuilderError(err);
+/// N-ary concat for string_view/binary_view: the 16-byte views are copied and the variadic data
+/// buffers are shared (retained), each part's out-of-line views rebased onto the output index of
+/// the part's first data buffer. A part with the same data buffers as the previous one (slices
+/// of one array) reuses them instead of adding them again.
+fn concatManyViews(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error!ArrayRef {
+    const bases = try allocator.alloc(usize, parts.len);
+    defer allocator.free(bases);
+    var total_len: usize = 0;
+    var maybe_nulls = false;
+    var n_data: usize = 0;
+    var prev: []const array_data.SharedBuffer = &.{};
+    var base: usize = 0;
+    var view: ArrayData = undefined;
+    for (parts, bases) |*part, *b| {
+        const d = partData(part, &view);
+        try checkPartType(d, dt);
+        if (d.buffers.len < 2) return error.InvalidInput;
+        const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+        if (d.buffers[1].len() / 16 < end) return error.InvalidInput;
+        total_len = std.math.add(usize, total_len, d.length) catch return error.InvalidInput;
+        maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and !d.buffers[0].isEmpty());
+        const data_bufs = d.buffers[2..];
+        if (!sameBuffers(data_bufs, prev)) {
+            base = n_data;
+            n_data += data_bufs.len;
+            prev = data_bufs;
         }
+        b.* = base;
     }
+    if (n_data > std.math.maxInt(u32)) return error.InvalidInput;
 
-    const right_view = array_mod.StringViewArray{ .data = right };
-    i = 0;
-    while (i < right.length) : (i += 1) {
-        if (right_view.isNull(i)) {
-            builder.appendNull() catch |err| return mapViewBuilderError(err);
-        } else {
-            const value = right_view.value(i) catch return error.InvalidInput;
-            builder.append(value) catch |err| return mapViewBuilderError(err);
+    const used = bitmap.byteLength(total_len);
+    var validity = try buffer.OwnedBuffer.init(allocator, if (maybe_nulls) used else 0);
+    errdefer validity.deinit();
+    const views_len = std.math.mul(usize, total_len, 16) catch return error.InvalidInput;
+    var views = try buffer.OwnedBuffer.initUninit(allocator, views_len);
+    errdefer views.deinit();
+    const bufs = try allocator.alloc(array_data.SharedBuffer, 2 + n_data);
+    defer allocator.free(bufs);
+    var row: usize = 0;
+    var filled: usize = 0;
+    for (parts, bases) |*part, b| {
+        const d = partData(part, &view);
+        if (maybe_nulls) try appendValidityBits(validity.data, row, d);
+        const data_bufs = d.buffers[2..];
+        if (b == filled) { // first part with these data buffers
+            @memcpy(bufs[2 + filled ..][0..data_bufs.len], data_bufs);
+            filled += data_bufs.len;
         }
+        const src = std.mem.bytesAsSlice([16]u8, d.buffers[1].data[d.offset * 16 ..][0 .. d.length * 16]);
+        for (src, std.mem.bytesAsSlice([16]u8, views.data[row * 16 ..][0 .. d.length * 16])) |v, *o| {
+            o.* = v;
+            const len = std.mem.readInt(u32, v[0..4], .little);
+            if (len <= 12) continue;
+            const index = std.mem.readInt(u32, v[8..12], .little);
+            const start = std.mem.readInt(u32, v[12..16], .little);
+            if (index >= data_bufs.len or @as(u64, start) + len > data_bufs[index].len()) return error.InvalidInput;
+            std.mem.writeInt(u32, o[8..12], @intCast(b + index), .little);
+        }
+        row += d.length;
     }
+    const null_count = if (maybe_nulls) total_len - bitmap.countSetBit(validity.data, total_len) else 0;
 
-    var out = builder.finish() catch |err| return mapViewBuilderError(err);
-    errdefer out.release();
-    try out.data().validateLayout();
+    bufs[0] = array_data.SharedBuffer.empty;
+    bufs[1] = array_data.SharedBuffer.empty;
+    errdefer for (bufs[0..2]) |*b| b.release();
+    if (null_count == 0) validity.deinit() else bufs[0] = try validity.toShared(used);
+    bufs[1] = try views.toShared(views_len);
+    const data = ArrayData{ .data_type = dt, .length = total_len, .null_count = null_count, .buffers = bufs };
+    try data.validateLayout();
+    const out = try ArrayRef.fromOwnedInlineBuffers(allocator, data);
+    for (bufs[2..]) |b| _ = b.retain();
     return out;
 }
 
-fn concatBinaryViewArray(
-    allocator: std.mem.Allocator,
-    left: *const ArrayData,
-    right: *const ArrayData,
-) Error!ArrayRef {
-    try left.validateLayout();
-    try right.validateLayout();
-    const total_len = std.math.add(usize, left.length, right.length) catch return error.InvalidInput;
-    const data_capacity = std.math.add(usize, viewDataCapacityHint(left), viewDataCapacityHint(right)) catch return error.InvalidInput;
-
-    var builder = try array_mod.BinaryViewBuilder.init(allocator, total_len, data_capacity);
-    defer builder.deinit();
-
-    const left_view = array_mod.BinaryViewArray{ .data = left };
-    var i: usize = 0;
-    while (i < left.length) : (i += 1) {
-        if (left_view.isNull(i)) {
-            builder.appendNull() catch |err| return mapViewBuilderError(err);
-        } else {
-            const value = left_view.value(i) catch return error.InvalidInput;
-            builder.append(value) catch |err| return mapViewBuilderError(err);
-        }
-    }
-
-    const right_view = array_mod.BinaryViewArray{ .data = right };
-    i = 0;
-    while (i < right.length) : (i += 1) {
-        if (right_view.isNull(i)) {
-            builder.appendNull() catch |err| return mapViewBuilderError(err);
-        } else {
-            const value = right_view.value(i) catch return error.InvalidInput;
-            builder.append(value) catch |err| return mapViewBuilderError(err);
-        }
-    }
-
-    var out = builder.finish() catch |err| return mapViewBuilderError(err);
-    errdefer out.release();
-    try out.data().validateLayout();
-    return out;
-}
-
-fn mapViewBuilderError(err: anyerror) ConcatArrayError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.InvalidInput,
-    };
+fn sameBuffers(a: []const array_data.SharedBuffer, b: []const array_data.SharedBuffer) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x.data.ptr != y.data.ptr or x.data.len != y.data.len) return false;
+    return true;
 }
 
 const FlatKind = union(enum) {
@@ -346,43 +306,44 @@ inline fn partData(part: anytype, view: *ArrayData) *const ArrayData {
     return view;
 }
 
-fn isNestedLayout(dt: DataType) bool {
-    return switch (storageDataType(dt)) {
-        .list, .large_list, .map, .fixed_size_list, .struct_ => true,
-        else => false,
-    };
-}
-
-/// Concat of windows: flat and nested layouts N-ary, other layouts through slices + concatArrayRefs.
-fn concatParts(allocator: std.mem.Allocator, dt: DataType, parts: []const Part) Error!ArrayRef {
-    if (try concatManyFlat(allocator, dt, parts)) |out| return out;
-    if (isNestedLayout(dt)) return concatManyNested(allocator, dt, parts);
-    const refs = try allocator.alloc(ArrayRef, parts.len);
-    var made: usize = 0;
-    defer {
-        for (refs[0..made]) |*ref| ref.release();
-        allocator.free(refs);
-    }
-    for (parts, refs) |*part, *ref| {
-        ref.* = try part.ref.slice(part.start, part.len);
-        made += 1;
-    }
-    return concatArrayRefs(allocator, dt, refs);
-}
-
-/// N-ary concat for list/large_list/map/fixed_size_list/struct (`parts`: ArrayRefs or Parts).
-/// Pass 1 checks the parts and records every child's window, pass 2 writes validity and rebased
-/// list offsets, then each child is concatenated once from its windows.
+/// N-ary concat for the nested layouts (`parts`: ArrayRefs or Parts): list, large_list, map,
+/// fixed_size_list, struct, list_view, large_list_view, sparse/dense union and run_end_encoded.
+/// Pass 1 checks the parts and records every child's window, pass 2 writes validity (unions:
+/// type ids) and the offsets, view offsets or run ends rebased onto the output, then each child
+/// is concatenated once from its windows (REE: the run ends child is the one pass 2 wrote).
 fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error!ArrayRef {
     const layout = storageDataType(dt);
-    const n_children: usize = if (layout == .struct_) layout.struct_.fields.len else 1;
-    const offset_width: usize = switch (layout) {
-        .list, .map => @sizeOf(i32),
-        .large_list => @sizeOf(i64),
+    const n_children: usize = switch (layout) {
+        .list, .large_list, .map, .fixed_size_list, .list_view, .large_list_view => 1,
+        .struct_ => |s| s.fields.len,
+        .sparse_union, .dense_union => |u| u.fields.len,
+        .run_end_encoded => 2,
+        else => return error.UnsupportedType,
+    };
+    // Width of what pass 2 writes: list / list_view / dense union offsets, or run ends.
+    const width: usize = switch (layout) {
+        .list, .map, .list_view, .dense_union => 4,
+        .large_list, .large_list_view => 8,
+        .run_end_encoded => |ree| switch (ree.run_end_type.bit_width) {
+            16, 32, 64 => |bits| if (ree.run_end_type.signed) bits / 8 else return error.InvalidInput,
+            else => return error.InvalidInput,
+        },
         else => 0,
     };
-    const max_child: usize = if (offset_width == 4) std.math.maxInt(i32) else std.math.maxInt(i64);
-    const buf_count: usize = if (offset_width > 0) 2 else 1;
+    const max_pos: usize = switch (width) {
+        2 => std.math.maxInt(i16),
+        4 => std.math.maxInt(i32),
+        else => std.math.maxInt(i64),
+    };
+    const buf_count: usize = switch (layout) {
+        .fixed_size_list, .struct_, .sparse_union => 1,
+        .list_view, .large_list_view => 3,
+        .run_end_encoded => 0,
+        else => 2,
+    };
+    const is_union = layout == .sparse_union or layout == .dense_union;
+    const has_validity = buf_count > 0 and !is_union;
+    const child_of: [256]u8 = if (layout == .dense_union) try unionChildTable(layout.dense_union) else undefined;
     const n = parts.len;
 
     // windows[c * n + p]: the rows of child c that part p covers.
@@ -393,37 +354,77 @@ fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) 
     var view: ArrayData = undefined;
     for (parts, 0..) |*part, p| {
         const d = partData(part, &view);
-        // std.meta.eql first: copies of one type (parts sliced from one array) share its pointers.
-        if (!std.meta.eql(d.data_type, dt) and !datatype.dataTypeEql(d.data_type, dt)) return error.InvalidInput;
+        try checkPartType(d, dt);
         if (d.buffers.len < buf_count or d.children.len != n_children) return error.InvalidInput;
         total_len = std.math.add(usize, total_len, d.length) catch return error.InvalidInput;
-        maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and !d.buffers[0].isEmpty());
-        for (0..n_children) |c| windows[c * n + p] = try childWindow(layout, part, d, c);
+        if (has_validity) maybe_nulls = maybe_nulls or ((d.null_count orelse 1) != 0 and !d.buffers[0].isEmpty());
+        if (layout == .dense_union) {
+            try unionWindows(d, &child_of, windows[p..], n);
+        } else for (0..n_children) |c| {
+            windows[c * n + p] = if (layout == .run_end_encoded and c == 1)
+                .{ .ref = d.children[1], .start = windows[p].start, .len = windows[p].len } // runRange checked the lengths
+            else
+                try childWindow(layout, part, d, c);
+        }
+    }
+    var runs: usize = 0; // REE: one output run per values window row (<= rows, see runRange)
+    if (layout == .run_end_encoded) {
+        if (total_len > max_pos) return error.InvalidInput;
+        for (windows[0..n]) |w| runs += w.len;
     }
 
     const used = bitmap.byteLength(total_len);
     var validity = try buffer.OwnedBuffer.init(allocator, if (maybe_nulls) used else 0);
     errdefer validity.deinit();
-    const offsets_len = if (offset_width > 0) (total_len + 1) * offset_width else 0;
+    var ids = try buffer.OwnedBuffer.initUninit(allocator, if (is_union) total_len else 0);
+    errdefer ids.deinit();
+    const offsets_count: usize = switch (layout) {
+        .list, .large_list, .map => std.math.add(usize, total_len, 1) catch return error.InvalidInput,
+        .run_end_encoded => runs,
+        else => if (width > 0) total_len else 0,
+    };
+    // Parts without buffers to bound their length (unions without children) may claim any length.
+    const offsets_len = std.math.mul(usize, offsets_count, width) catch return error.InvalidInput;
     var offsets = try buffer.OwnedBuffer.initUninit(allocator, offsets_len);
     errdefer offsets.deinit();
-    if (maybe_nulls or offset_width > 0) {
+    var sizes = try buffer.OwnedBuffer.initUninit(allocator, if (buf_count == 3) offsets_len else 0);
+    errdefer sizes.deinit();
+    if (maybe_nulls or width > 0 or is_union) {
         var row: usize = 0;
-        var pos: usize = 0;
+        var pos: [128]usize = @splat(0); // output rows so far of each offset-indexed child (REE: runs)
         for (parts, 0..) |*part, p| {
             const d = partData(part, &view);
             if (maybe_nulls) try appendValidityBits(validity.data, row, d);
-            if (offset_width > 0) { // lists: one child, windows[p] is its range
-                if (windows[p].len > max_child - pos) return error.InvalidInput;
-                if (offset_width == 4) rebaseOffsets(i32, offsets.typedSlice(i32), row, pos, d) else rebaseOffsets(i64, offsets.typedSlice(i64), row, pos, d);
-                pos += windows[p].len;
+            if (is_union) {
+                const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+                if (d.buffers[0].len() < end) return error.InvalidInput;
+                @memcpy(ids.data[row..][0..d.length], d.buffers[0].data[d.offset..end]);
             }
+            switch (layout) {
+                .list, .map => rebaseOffsets(i32, offsets.typedSlice(i32), row, pos[0], d),
+                .large_list => rebaseOffsets(i64, offsets.typedSlice(i64), row, pos[0], d),
+                .list_view => rebaseViews(i32, offsets.typedSlice(i32), sizes.typedSlice(i32), row, pos[0], windows[p].start, d),
+                .large_list_view => rebaseViews(i64, offsets.typedSlice(i64), sizes.typedSlice(i64), row, pos[0], windows[p].start, d),
+                .dense_union => try rebaseUnionOffsets(offsets.typedSlice(i32)[row..][0..d.length], &child_of, windows[p..], n, &pos, d),
+                .run_end_encoded => switch (width) {
+                    2 => try rebaseRunEnds(i16, offsets.typedSlice(i16)[pos[0]..][0..windows[p].len], row, windows[p], d),
+                    4 => try rebaseRunEnds(i32, offsets.typedSlice(i32)[pos[0]..][0..windows[p].len], row, windows[p], d),
+                    else => try rebaseRunEnds(i64, offsets.typedSlice(i64)[pos[0]..][0..windows[p].len], row, windows[p], d),
+                },
+                else => {},
+            }
+            // Offsets are checked against the output type after the part (the rebase wraps).
+            if (width > 0) for (0..if (layout == .dense_union) n_children else 1) |c| {
+                const len = windows[c * n + p].len;
+                if (len > max_pos - pos[c]) return error.InvalidInput;
+                pos[c] += len;
+            };
             row += d.length;
         }
     }
-    switch (offset_width) {
-        4 => offsets.typedSlice(i32)[0] = 0,
-        8 => offsets.typedSlice(i64)[0] = 0,
+    switch (layout) {
+        .list, .map => offsets.typedSlice(i32)[0] = 0,
+        .large_list => offsets.typedSlice(i64)[0] = 0,
         else => {},
     }
     const null_count = if (maybe_nulls) total_len - bitmap.countSetBit(validity.data, total_len) else 0;
@@ -435,15 +436,38 @@ fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) 
         allocator.free(children);
     }
     for (children, 0..) |*child, c| {
-        const child_windows = windows[c * n ..][0..n];
-        child.* = try concatParts(allocator, child_windows[0].ref.data().data_type, child_windows);
+        if (layout == .run_end_encoded and c == 0) {
+            var ends_bufs = [2]array_data.SharedBuffer{ array_data.SharedBuffer.empty, try offsets.toShared(offsets_len) };
+            child.* = ArrayRef.fromOwnedInlineBuffers(allocator, .{
+                .data_type = switch (width) {
+                    2 => .{ .int16 = {} },
+                    4 => .{ .int32 = {} },
+                    else => .{ .int64 = {} },
+                },
+                .length = runs,
+                .null_count = 0,
+                .buffers = &ends_bufs,
+            }) catch |err| {
+                ends_bufs[1].release();
+                return err;
+            };
+        } else {
+            const child_windows = windows[c * n ..][0..n];
+            child.* = try concatParts(allocator, child_windows[0].ref.data().data_type, child_windows);
+        }
         built += 1;
     }
 
-    var bufs: [2]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
+    var bufs: [3]array_data.SharedBuffer = .{ array_data.SharedBuffer.empty, array_data.SharedBuffer.empty, array_data.SharedBuffer.empty };
     errdefer for (&bufs) |*b| b.release();
-    if (null_count == 0) validity.deinit() else bufs[0] = try validity.toShared(used);
-    if (offset_width > 0) bufs[1] = try offsets.toShared(offsets_len) else offsets.deinit();
+    if (is_union) bufs[0] = try ids.toShared(total_len) else if (null_count != 0) bufs[0] = try validity.toShared(used);
+    if (buf_count >= 2) bufs[1] = try offsets.toShared(offsets_len);
+    if (buf_count == 3) bufs[2] = try sizes.toShared(offsets_len);
+    // Whatever was not handed to a buffer above is unused (deinit of a handed-over buffer is a no-op).
+    validity.deinit();
+    ids.deinit();
+    offsets.deinit();
+    sizes.deinit();
 
     const data = ArrayData{
         .data_type = dt,
@@ -456,14 +480,23 @@ fn concatManyNested(allocator: std.mem.Allocator, dt: DataType, parts: anytype) 
     return try ArrayRef.fromOwnedInlineBuffers(allocator, data);
 }
 
-/// Rows of child `c` that `part` (rows `d`) covers: the list offsets range, the fixed_size_list
-/// rows times list_size, or the struct rows (row-aligned or parent coordinates).
+/// Rows of child `c` that `part` (rows `d`) covers: the list offsets range, the [min, max) of the
+/// list views, the runs overlapping the part (REE),
+/// the fixed_size_list rows times list_size, or the struct / sparse union rows (row-aligned or
+/// parent coordinates).
 fn childWindow(layout: DataType, part: anytype, d: *const ArrayData, c: usize) Error!Part {
     const child = d.children[c];
     const cd = child.data();
     const r: ByteRange = switch (layout) {
         .list, .map => try offsetsRange(i32, d, cd.length),
         .large_list => try offsetsRange(i64, d, cd.length),
+        .list_view => try viewsRange(i32, d, cd.length),
+        .large_list_view => try viewsRange(i64, d, cd.length),
+        .run_end_encoded => |ree| switch (ree.run_end_type.bit_width) {
+            16 => try runRange(i16, d),
+            32 => try runRange(i32, d),
+            else => try runRange(i64, d),
+        },
         .fixed_size_list => |f| blk: {
             const size = std.math.cast(usize, f.list_size) orelse return error.InvalidInput;
             const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
@@ -472,7 +505,7 @@ fn childWindow(layout: DataType, part: anytype, d: *const ArrayData, c: usize) E
                 .end = std.math.mul(usize, end, size) catch return error.InvalidInput,
             };
         },
-        .struct_ => blk: {
+        .struct_, .sparse_union => blk: {
             // Like ArrayRef.slice: a child as long as the struct node is row-aligned with it.
             const node = if (@TypeOf(part) == *const ArrayRef) d else part.ref.data();
             const start = if (cd.length == node.length) d.offset - node.offset else d.offset;
@@ -482,6 +515,105 @@ fn childWindow(layout: DataType, part: anytype, d: *const ArrayData, c: usize) E
     };
     if (r.end > cd.length) return error.InvalidInput;
     return .{ .ref = child, .start = r.start, .len = r.end - r.start };
+}
+
+/// [min offset, max offset + size) of a list view part; every view must lie inside the child.
+fn viewsRange(comptime T: type, d: *const ArrayData, limit: usize) Error!ByteRange {
+    const offsets = d.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const sizes = d.buffers[2].typedSlice(T) catch return error.InvalidInput;
+    const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+    if (offsets.len < end or sizes.len < end) return error.InvalidInput;
+    var lo: usize = std.math.maxInt(usize);
+    var hi: usize = 0;
+    for (offsets[d.offset..end], sizes[d.offset..end]) |o, s| {
+        const start = std.math.cast(usize, o) orelse return error.InvalidInput;
+        const size = std.math.cast(usize, s) orelse return error.InvalidInput;
+        if (size > limit or start > limit - size) return error.InvalidInput;
+        lo = @min(lo, start);
+        hi = @max(hi, start + size);
+    }
+    return if (d.length == 0) .{ .start = 0, .end = 0 } else .{ .start = lo, .end = hi };
+}
+
+/// Writes `d`'s list views moved from their child window (starting at `start`) to `pos`.
+fn rebaseViews(comptime T: type, offsets: []T, sizes: []T, row: usize, pos: usize, start: usize, d: *const ArrayData) void {
+    const src_offsets = (d.buffers[1].typedSlice(T) catch unreachable)[d.offset..][0..d.length];
+    const src_sizes = (d.buffers[2].typedSlice(T) catch unreachable)[d.offset..][0..d.length];
+    const shift: T = @as(T, @intCast(pos)) - @as(T, @intCast(start));
+    for (src_offsets, offsets[row..][0..d.length]) |o, *dst| dst.* = o +% shift;
+    @memcpy(sizes[row..][0..d.length], src_sizes);
+}
+
+/// Child windows of a dense union part (child k at `windows[k * n]`): [min, max + 1) of the
+/// offsets of its rows of that child. Every type id must be declared, every offset inside its child.
+fn unionWindows(d: *const ArrayData, child_of: *const [256]u8, windows: []Part, n: usize) Error!void {
+    const offsets = d.buffers[1].typedSlice(i32) catch return error.InvalidInput;
+    const end = std.math.add(usize, d.offset, d.length) catch return error.InvalidInput;
+    if (d.buffers[0].len() < end or offsets.len < end) return error.InvalidInput;
+    const nc = d.children.len;
+    var lo_buf: [128]usize = undefined;
+    var hi_buf: [128]usize = undefined;
+    var limit_buf: [128]usize = undefined;
+    const lo = lo_buf[0..nc];
+    const hi = hi_buf[0..nc];
+    const limit = limit_buf[0..nc];
+    @memset(lo, std.math.maxInt(usize));
+    @memset(hi, 0);
+    for (d.children, limit) |child, *l| l.* = child.data().length;
+    for (d.buffers[0].data[d.offset..end], offsets[d.offset..end]) |id, o| {
+        const k = child_of[id];
+        if (k == 0xFF) return error.InvalidInput;
+        const r = std.math.cast(usize, o) orelse return error.InvalidInput;
+        if (r >= limit[k]) return error.InvalidInput;
+        lo[k] = @min(lo[k], r);
+        hi[k] = @max(hi[k], r + 1);
+    }
+    for (d.children, lo, hi, 0..) |child, l, h, k| {
+        const start = if (h == 0) 0 else l;
+        windows[k * n] = .{ .ref = child, .start = start, .len = h - start };
+    }
+}
+
+/// Writes `d`'s dense union offsets moved from each child's window (`windows[k * n]`) to `pos[k]`.
+fn rebaseUnionOffsets(out: []i32, child_of: *const [256]u8, windows: []const Part, n: usize, pos: *const [128]usize, d: *const ArrayData) Error!void {
+    const offsets = d.buffers[1].typedSlice(i32) catch return error.InvalidInput; // bounds: unionWindows
+    for (d.buffers[0].data[d.offset..][0..d.length], offsets[d.offset..][0..d.length], out) |id, o, *dst| {
+        const k = child_of[id];
+        if (k == 0xFF) return error.InvalidInput;
+        dst.* = o -% @as(i32, @intCast(windows[k * n].start)) +% @as(i32, @intCast(pos[k]));
+    }
+}
+
+/// Runs [k0, k1) of a run-end encoded part: the runs overlapping rows [offset, offset + length).
+/// Strictly increasing run ends cover at least one row each, so k1 - k0 <= length.
+fn runRange(comptime T: type, d: *const ArrayData) Error!ByteRange {
+    const run_ends = d.children[0].data();
+    if (run_ends.buffers.len < 2 or d.children[1].data().length != run_ends.length) return error.InvalidInput;
+    const all = run_ends.buffers[1].typedSlice(T) catch return error.InvalidInput;
+    const ends_end = std.math.add(usize, run_ends.offset, run_ends.length) catch return error.InvalidInput;
+    if (all.len < ends_end) return error.InvalidInput;
+    if (d.length == 0) return .{ .start = 0, .end = 0 };
+    const ends = all[run_ends.offset..ends_end];
+    const last = std.math.add(usize, d.offset, d.length - 1) catch return error.InvalidInput;
+    const k0 = try findRun(T, ends, d.offset);
+    const k1 = try findRun(T, ends, last) + 1;
+    if (k1 <= k0 or k1 - k0 > d.length) return error.InvalidInput;
+    return .{ .start = k0, .end = k1 };
+}
+
+/// Writes the run ends of `d`'s runs (window `w` of its run ends child) in output rows: clamped
+/// to the part's rows and shifted to `row`. They must increase strictly inside the part.
+fn rebaseRunEnds(comptime T: type, out: []T, row: usize, w: Part, d: *const ArrayData) Error!void {
+    const run_ends = w.ref.data();
+    const ends = (run_ends.buffers[1].typedSlice(T) catch unreachable)[run_ends.offset + w.start ..][0..w.len];
+    const stop = d.offset + d.length;
+    var prev = d.offset;
+    for (ends, out, 1..) |e, *o, k| {
+        const v = if (k == ends.len) stop else std.math.cast(usize, e) orelse return error.InvalidInput;
+        if (v <= prev or v > stop) return error.InvalidInput;
+        o.* = @intCast(v - d.offset + row);
+        prev = v;
+    }
 }
 
 /// Copies `src[lo..][0..n]` to the front of `dst` in 16-byte chunks when both sides have room

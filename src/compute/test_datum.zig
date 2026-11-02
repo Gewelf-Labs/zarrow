@@ -1443,33 +1443,176 @@ test "compute datumTake nested kernels match the per-row oracle on sliced inputs
     }
 }
 
-test "concatArrayRefs N-ary nested path matches the source rows for sliced parts" {
+/// Concats `full` cut into a full, sliced, empty and one-row parts; checks every row, validateFull
+/// and that one part still gives a fresh array at offset 0.
+fn expectConcatMatchesSource(allocator: std.mem.Allocator, full: ArrayRef) !void {
+    const len = full.data().length;
+    const cuts = [_][2]usize{ .{ 0, len }, .{ 0, 1 }, .{ 1, 3 }, .{ 3, 0 }, .{ 4, len - 4 }, .{ 1, len - 1 } };
+    var parts: [cuts.len]ArrayRef = undefined;
+    for (cuts, &parts) |cut, *part| part.* = try full.slice(cut[0], cut[1]);
+    defer for (&parts) |*part| part.release();
+
+    var joined = try concatArrayRefs(allocator, full.data().data_type, &parts);
+    defer joined.release();
+    try joined.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 0), joined.data().offset);
+    var row: usize = 0;
+    for (cuts) |cut| for (cut[0]..cut[0] + cut[1]) |src_row| {
+        try std.testing.expect(rowsEqual(joined.data(), row, full.data(), src_row));
+        row += 1;
+    };
+    try std.testing.expectEqual(row, joined.data().length);
+
+    var single = try concatArrayRefs(allocator, full.data().data_type, parts[5..6]);
+    defer single.release();
+    try single.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 0), single.data().offset);
+    for (0..len - 1) |k| try std.testing.expect(rowsEqual(single.data(), k, full.data(), k + 1));
+}
+
+test "concatArrayRefs N-ary path matches the source rows for every layout, sliced parts and child windows" {
     const allocator = std.testing.allocator;
     var sources = try buildNestedSources(allocator);
     defer sources.deinit();
+    for (sources.arrays[0..sources.count]) |full| try expectConcatMatchesSource(allocator, full);
 
-    for (sources.arrays[0..sources.count]) |full| {
-        const len = full.data().length;
-        const cuts = [_][2]usize{ .{ 0, 2 }, .{ 2, 1 }, .{ 3, 0 }, .{ 3, len - 3 }, .{ 1, len - 1 } };
-        var parts: [cuts.len]ArrayRef = undefined;
-        for (cuts, &parts) |cut, *part| part.* = try full.slice(cut[0], cut[1]);
-        defer for (&parts) |*part| part.release();
+    // list_view, sparse union, string_view, dense union and REE as struct children: their parts
+    // are then child windows of the struct parts, not ArrayRefs.
+    const kids = [_]ArrayRef{ sources.arrays[8], sources.arrays[9], sources.arrays[13], sources.arrays[15], sources.arrays[16] };
+    var fields: [kids.len]datatype.Field = undefined;
+    for (&fields, kids) |*f, k| f.* = .{ .name = "f", .data_type = &k.data().data_type, .nullable = true };
+    var sb = array_mod.StructBuilder.init(allocator, &fields);
+    defer sb.deinit();
+    for (0..6) |r| if (r == 4) try sb.appendNull() else try sb.appendValid();
+    var wrapped = try sb.finish(&kids);
+    defer wrapped.release();
+    try expectConcatMatchesSource(allocator, wrapped);
 
-        var joined = concatArrayRefs(allocator, full.data().data_type, &parts) catch |err| {
-            // Unions and list views have no concat (unchanged); every other layout must concat.
-            const tag = full.data().data_type;
-            try std.testing.expect(err == error.UnsupportedType and (tag == .sparse_union or tag == .list_view or tag == .dense_union or tag == .run_end_encoded));
-            continue;
-        };
-        defer joined.release();
-        try joined.data().validateFull();
-        try std.testing.expectEqual(2 * len - 1, joined.data().length);
-        var row: usize = 0;
-        for (cuts) |cut| {
-            for (cut[0]..cut[0] + cut[1]) |src_row| {
-                try std.testing.expect(rowsEqual(joined.data(), row, full.data(), src_row));
-                row += 1;
-            }
+    // Slices of one views array share its data buffers once.
+    const views = sources.arrays[13];
+    var slices = [_]ArrayRef{ try views.slice(0, 3), try views.slice(3, 3), try views.slice(1, 4) };
+    defer for (&slices) |*s| s.release();
+    var shared = try concatArrayRefs(allocator, views.data().data_type, &slices);
+    defer shared.release();
+    try std.testing.expectEqual(views.data().buffers.len, shared.data().buffers.len);
+
+    // Arrays with their own data buffers: out-of-line views are rebased onto the buffer list.
+    var svb = try array_mod.StringViewBuilder.init(allocator, 3, 0);
+    defer svb.deinit();
+    for ([_]?[]const u8{ "yet another long string value", null, "s" }) |v| if (v) |x| try svb.append(x) else try svb.appendNull();
+    var other = try svb.finish();
+    defer other.release();
+    const mixed = [_]ArrayRef{ views, other, slices[2] };
+    var rebased = try concatArrayRefs(allocator, views.data().data_type, &mixed);
+    defer rebased.release();
+    try rebased.data().validateFull();
+    var out_row: usize = 0;
+    for (mixed) |m| for (0..m.data().length) |k| {
+        try std.testing.expect(rowsEqual(rebased.data(), out_row, m.data(), k));
+        out_row += 1;
+    };
+}
+
+test "concatArrayRefs rejects hostile views, dense unions and run ends; chunked filters of them concat" {
+    const allocator = std.testing.allocator;
+    const buffer_mod = @import("../buffer.zig");
+    var sources = try buildNestedSources(allocator);
+    defer sources.deinit();
+    const views = sources.arrays[13];
+    const dense = sources.arrays[15];
+    const ree = sources.arrays[16];
+
+    // Views: the out-of-line view of row 2 with a data buffer index past the buffers, or an
+    // offset past the end of its buffer.
+    for ([_][2]u32{ .{ 8, 7 }, .{ 12, 1000 } }) |bad| {
+        var bytes: [96]u8 align(buffer_mod.ALIGNMENT) = views.data().buffers[1].data[0..96].*;
+        std.mem.writeInt(u32, bytes[2 * 16 + bad[0] ..][0..4], bad[1], .little);
+        const bufs = [_]buffer_mod.SharedBuffer{ views.data().buffers[0], buffer_mod.SharedBuffer.fromSlice(&bytes), views.data().buffers[2] };
+        var d = views.data().*;
+        d.buffers = &bufs;
+        var bad_ref = try ArrayRef.fromBorrowed(allocator, d);
+        defer bad_ref.release();
+        try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, d.data_type, &.{ views, bad_ref }));
+    }
+
+    // Dense union: undeclared type id, negative offset, offset past the child.
+    const ids_bad = [_]u8{ 5, 9, 5, 7, 5, 7 };
+    var offs_neg: [6]i32 align(buffer_mod.ALIGNMENT) = .{ 0, 2, -1, 0, 3, 1 };
+    var offs_far: [6]i32 align(buffer_mod.ALIGNMENT) = .{ 0, 2, 1, 0, 4, 1 };
+    for ([_][2]buffer_mod.SharedBuffer{
+        .{ buffer_mod.SharedBuffer.fromSlice(&ids_bad), dense.data().buffers[1] },
+        .{ dense.data().buffers[0], buffer_mod.SharedBuffer.fromSlice(std.mem.sliceAsBytes(&offs_neg)) },
+        .{ dense.data().buffers[0], buffer_mod.SharedBuffer.fromSlice(std.mem.sliceAsBytes(&offs_far)) },
+    }) |bufs| {
+        var d = dense.data().*;
+        d.buffers = &bufs;
+        var bad_ref = try ArrayRef.fromBorrowed(allocator, d);
+        defer bad_ref.release();
+        try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, d.data_type, &.{ dense, bad_ref }));
+    }
+
+    // REE: run ends that do not cover the length, and run ends that decrease.
+    var long_ree = ree.data().*;
+    long_ree.length = 8;
+    var long_ref = try ArrayRef.fromBorrowed(allocator, long_ree);
+    defer long_ref.release();
+    try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, long_ree.data_type, &.{ ree, long_ref }));
+    var ends_bad: [4]i32 align(buffer_mod.ALIGNMENT) = .{ 3, 2, 5, 6 };
+    const ends_bufs = [_]buffer_mod.SharedBuffer{ buffer_mod.SharedBuffer.empty, buffer_mod.SharedBuffer.fromSlice(std.mem.sliceAsBytes(&ends_bad)) };
+    var ends_data = ree.data().children[0].data().*;
+    ends_data.buffers = &ends_bufs;
+    var ends_ref = try ArrayRef.fromBorrowed(allocator, ends_data);
+    defer ends_ref.release();
+    const bad_children = [_]ArrayRef{ ends_ref, ree.data().children[1] };
+    var bad_ree = ree.data().*;
+    bad_ree.children = &bad_children;
+    var bad_ree_ref = try ArrayRef.fromBorrowed(allocator, bad_ree);
+    defer bad_ree_ref.release();
+    try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, bad_ree.data_type, &.{ ree, bad_ree_ref }));
+
+    // REE<int16>: 10,000 parts of 3 rows fit, 11,000 do not.
+    var reb = try array_mod.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 16, .signed = true }, &nested_int32_type, 1);
+    defer reb.deinit();
+    try reb.appendRunEnd(3);
+    var one = try makeInt32Array(allocator, &.{7});
+    defer one.release();
+    var ree16 = try reb.finish(one);
+    defer ree16.release();
+    const many = try allocator.alloc(ArrayRef, 11_000);
+    defer allocator.free(many);
+    @memset(many, ree16);
+    try std.testing.expectError(error.InvalidInput, concatArrayRefs(allocator, ree16.data().data_type, many));
+    var fits = try concatArrayRefs(allocator, ree16.data().data_type, many[0..10_000]);
+    defer fits.release();
+    try fits.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 30_000), fits.data().length);
+
+    // A filter of a chunked datum of each layout is one array (per-chunk pieces concatenated)
+    // and matches the filter of the flat array.
+    var pred_values: [360]?bool = undefined;
+    for (&pred_values, 0..) |*p, i| p.* = if (i % 5 == 0) null else i % 3 != 0;
+    var pred = try makeBoolArray(allocator, &pred_values);
+    defer pred.release();
+    for ([_]ArrayRef{ views, dense, ree }) |full| {
+        const dt = full.data().data_type;
+        var copies: [30]ArrayRef = undefined;
+        @memset(&copies, full);
+        var chunk = try concatArrayRefs(allocator, dt, &copies);
+        defer chunk.release();
+        for (0..180) |i| try std.testing.expect(rowsEqual(chunk.data(), i, full.data(), i % 6));
+        var flat = try concatArrayRefs(allocator, dt, &.{ chunk, chunk });
+        defer flat.release();
+        var chunked = try ChunkedArray.init(allocator, dt, &.{ chunk, chunk });
+        defer chunked.release();
+        for ([_]bool{ true, false }) |drop_nulls| {
+            var expected = try datumFilter(Datum.fromArray(flat), Datum.fromArray(pred), .{ .drop_nulls = drop_nulls });
+            defer expected.release();
+            var actual = try datumFilter(Datum.fromChunked(chunked), Datum.fromArray(pred), .{ .drop_nulls = drop_nulls });
+            defer actual.release();
+            try std.testing.expect(actual == .array);
+            try actual.array.data().validateFull();
+            try std.testing.expectEqual(expected.array.data().length, actual.array.data().length);
+            for (0..expected.array.data().length) |i| try std.testing.expect(rowsEqual(actual.array.data(), i, expected.array.data(), i));
         }
     }
 }
