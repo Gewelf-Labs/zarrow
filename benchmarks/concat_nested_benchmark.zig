@@ -110,6 +110,38 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var structs = try sb.finish(&.{ ints, strs });
     defer structs.release();
     try timeConcat(io, allocator, "concat_nested_struct", structs, cfg, emit_csv, meta);
+
+    // string_view: the string column's values (one in four longer than 12 bytes, out of line).
+    var svb = try zarrow.StringViewBuilder.init(allocator, cfg.rows, cfg.rows * 4);
+    defer svb.deinit();
+    for (0..cfg.rows) |i| if (i % 7 == 0) try svb.appendNull() else try svb.append(names[i & 3]);
+    var views = try svb.finish();
+    defer views.release();
+    try timeConcat(io, allocator, "concat_nested_string_view", views, cfg, emit_csv, meta);
+
+    // dense_union<int32 = 5, string = 7>: alternating, child row i / 2.
+    const union_ids = [_]i8{ 5, 7 };
+    var ub = try zarrow.DenseUnionBuilder.init(allocator, .{ .type_ids = &union_ids, .fields = &fields, .mode = .dense }, cfg.rows);
+    defer ub.deinit();
+    for (0..cfg.rows) |i| try ub.append(union_ids[i & 1], @intCast(i / 2));
+    var unions = try ub.finish(&.{ ints, strs });
+    defer unions.release();
+    try timeConcat(io, allocator, "concat_nested_dense_union", unions, cfg, emit_csv, meta);
+
+    // run_end_encoded<int32, int32>: runs of 1-8 rows over the int32 column's values.
+    var reb = try zarrow.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &int_type, cfg.rows);
+    defer reb.deinit();
+    var end: usize = 0;
+    var runs: usize = 0;
+    while (end < cfg.rows) : (runs += 1) {
+        end = @min(cfg.rows, end + 1 + (runs * 7919) % 8);
+        try reb.appendRunEnd(@intCast(end));
+    }
+    var run_values = try ints.slice(0, runs);
+    defer run_values.release();
+    var rees = try reb.finish(run_values);
+    defer rees.release();
+    try timeConcat(io, allocator, "concat_nested_ree", rees, cfg, emit_csv, meta);
 }
 
 pub fn main(init: std.process.Init) !void {
