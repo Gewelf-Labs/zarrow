@@ -41,12 +41,7 @@ fn concatParts(allocator: std.mem.Allocator, dt: DataType, parts: anytype) Error
     };
 }
 
-pub fn storageDataType(dt: DataType) DataType {
-    return switch (dt) {
-        .extension => |ext| storageDataType(ext.storage_type.*),
-        else => dt,
-    };
-}
+pub const storageDataType = datatype.storageDataType;
 
 /// Union type id -> child index (0xFF: undeclared). Without declared ids the id is the child
 /// index; on duplicate ids the first wins (as the validator).
@@ -359,7 +354,7 @@ fn concatDictionaries(comptime T: type, allocator: std.mem.Allocator, dt: DataTy
     var keys: KeyMap = .empty;
     defer keys.deinit(allocator);
     try keys.ensureTotalCapacityContext(allocator, @intCast(remap_len), EntryContext{ .v = &merged });
-    if (kind == .fixed) try merged.data.ensureTotalCapacity(allocator, std.math.mul(usize, remap_len, width) catch return error.InvalidInput) else try merged.ends.ensureTotalCapacity(allocator, remap_len);
+    try merged.reserve(allocator, remap_len);
     var null_slot: ?u32 = null;
     const remap = try allocator.alloc(T, remap_len);
     defer allocator.free(remap);
@@ -428,74 +423,133 @@ fn mergeDictionary(
     remap: []T,
 ) Error!void {
     const end = std.math.add(usize, vd.offset, vd.length) catch return error.InvalidInput;
-    if (vd.buffers.len > 0 and !vd.buffers[0].isEmpty()) try requireBitmapBits(vd.buffers[0], end); // for isNull
+    if (vd.buffers.len > 0 and !vd.buffers[0].isEmpty()) try requireBitmapBits(vd.buffers[0], end); // for the validity bits
     switch (kind) {
         .binary32 => _ = try binaryDataRange(i32, vd), // buffer count and the offsets window
         .binary64 => _ = try binaryDataRange(i64, vd),
         else => {},
     }
     const fixed: []const u8 = if (kind == .fixed) try dataBytesForFixedWidth(vd, kind.fixed) else &.{};
-    for (remap, 0..) |*slot, i| {
-        const bytes: ?[]const u8 = if (vd.isNull(i)) null else switch (kind) {
-            .fixed => |w| fixed[i * w ..][0..w],
-            .binary32 => try binaryValue(i32, vd, i),
-            else => try binaryValue(i64, vd, i),
-        };
-        var m: u32 = undefined;
-        if (bytes) |b| {
-            const gop = try keys.getOrPutContextAdapted(allocator, b, BytesProbe{ .v = merged }, EntryContext{ .v = merged });
-            if (!gop.found_existing) gop.key_ptr.* = @intCast(merged.count);
-            if (first or !gop.found_existing) try merged.append(allocator, b);
-            m = if (first) @intCast(merged.count - 1) else gop.key_ptr.*;
-        } else if (null_slot) |ns| {
-            if (first or ns.* == null) try merged.append(allocator, null);
-            if (ns.* == null) ns.* = @intCast(merged.count - 1);
-            m = if (first) @intCast(merged.count - 1) else ns.*.?;
-        } else m = 0; // masked: the row stays null, no dictionary entry
-        if (m > std.math.maxInt(T)) return error.InvalidInput; // the merged dictionary does not fit T
-        slot.* = @intCast(m);
+    const rows: MergeRows = .{ .vd = vd, .merged = merged, .keys = keys, .null_slot = null_slot, .first = first };
+    // One loop per value layout: 1..16-byte values hash and compare as integers.
+    switch (kind) {
+        .fixed => |w| switch (w) {
+            inline 1, 2, 4, 8, 16 => |cw| try rows.run(T, @Int(.unsigned, cw * 8), void, allocator, fixed, remap),
+            else => try rows.run(T, []const u8, void, allocator, fixed, remap),
+        },
+        .binary32 => try rows.run(T, []const u8, i32, allocator, fixed, remap),
+        else => try rows.run(T, []const u8, i64, allocator, fixed, remap),
     }
+}
+
+const MergeRows = struct {
+    vd: *const ArrayData,
+    merged: *MergedValues,
+    keys: *KeyMap,
+    null_slot: ?*?u32,
+    first: bool,
+
+    /// The row loop of mergeDictionary for values read as `K` (an unsigned integer of the value's
+    /// width, or bytes) from fixed-width data (`O == void`) or string/binary offsets of type `O`.
+    fn run(self: MergeRows, comptime T: type, comptime K: type, comptime O: type, allocator: std.mem.Allocator, fixed: []const u8, remap: []T) Error!void {
+        const vd = self.vd;
+        const merged = self.merged;
+        // isNull per row re-derives the bitmap; read it once (same rules: null_count first).
+        const all_null = if (vd.null_count) |c| c != 0 and c == vd.length else false;
+        const no_null = if (vd.null_count) |c| c == 0 else false;
+        const bits: ?[]const u8 = if (all_null or no_null) null else if (vd.validity()) |v| v.data else null;
+        const offsets: []const O = if (O == void) &.{} else vd.buffers[1].typedSlice(O) catch return error.InvalidInput;
+        const data: []const u8 = if (O == void) &.{} else vd.buffers[2].data;
+        const width = merged.width;
+        for (remap, 0..) |*slot, i| {
+            const is_null = all_null or if (bits) |b| !bitmap.bitIsSet(b, vd.offset + i) else false;
+            var m: u32 = undefined;
+            if (!is_null) {
+                const b: []const u8 = if (O != void) blk: {
+                    // Each value is checked (binaryDataRange checked the offsets window).
+                    const start = std.math.cast(usize, offsets[vd.offset + i]) orelse return error.InvalidInput;
+                    const stop = std.math.cast(usize, offsets[vd.offset + i + 1]) orelse return error.InvalidInput;
+                    if (stop < start or stop > data.len) return error.InvalidInput;
+                    break :blk data[start..stop];
+                } else if (K == []const u8) fixed[i * width ..][0..width] else fixed[i * @sizeOf(K) ..][0..@sizeOf(K)];
+                const key: Probe(K).Key = if (K == []const u8)
+                    .{ .k = b, .h = std.hash.Wyhash.hash(0, b) }
+                else blk: {
+                    const k = std.mem.readInt(K, b[0..@sizeOf(K)], .little);
+                    break :blk .{ .k = k, .h = hashInt(k) };
+                };
+                const gop = try self.keys.getOrPutContextAdapted(allocator, key, Probe(K){ .v = merged }, EntryContext{ .v = merged });
+                if (!gop.found_existing) gop.key_ptr.* = @intCast(merged.count);
+                if (self.first or !gop.found_existing) try merged.append(allocator, b, key.h);
+                m = if (self.first) @intCast(merged.count - 1) else gop.key_ptr.*;
+            } else if (self.null_slot) |ns| {
+                if (self.first or ns.* == null) try merged.append(allocator, null, 0);
+                if (ns.* == null) ns.* = @intCast(merged.count - 1);
+                m = if (self.first) @intCast(merged.count - 1) else ns.*.?;
+            } else m = 0; // masked: the row stays null, no dictionary entry
+            if (m > std.math.maxInt(T)) return error.InvalidInput; // the merged dictionary does not fit T
+            slot.* = @intCast(m);
+        }
+    }
+};
+
+fn hashInt(k: anytype) u64 {
+    return @truncate(std.hash.int(@as(if (@bitSizeOf(@TypeOf(k)) > 64) u128 else u64, k)));
 }
 
 /// Distinct values of a merged dictionary: entry numbers, hashed through their bytes.
 const KeyMap = std.HashMapUnmanaged(u32, void, EntryContext, std.hash_map.default_max_load_percentage);
 
-/// Map context (rehash on growth): an entry number's bytes.
+/// Map context (rehash on growth): an entry's stored hash, so growing never rereads values.
 const EntryContext = struct {
     v: *const MergedValues,
 
     pub fn hash(c: EntryContext, m: u32) u64 {
-        return std.hash.Wyhash.hash(0, c.v.at(m));
+        return c.v.hashes.items[m];
     }
     pub fn eql(_: EntryContext, a: u32, b: u32) bool {
         return a == b;
     }
 };
 
-/// Lookup of a value's bytes among the entries.
-const BytesProbe = struct {
-    v: *const MergedValues,
+/// Lookup of a value (an integer of the value's width, or its bytes) with its precomputed hash
+/// among the entries; the hash is stored with a new entry, so it is computed once per row.
+fn Probe(comptime K: type) type {
+    return struct {
+        v: *const MergedValues,
 
-    pub fn hash(_: BytesProbe, b: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, b);
-    }
-    pub fn eql(p: BytesProbe, b: []const u8, m: u32) bool {
-        return std.mem.eql(u8, b, p.v.at(m));
-    }
-};
+        const Key = struct { k: K, h: u64 };
+
+        pub fn hash(_: @This(), key: Key) u64 {
+            return key.h;
+        }
+        pub fn eql(p: @This(), key: Key, m: u32) bool {
+            if (K == []const u8) return std.mem.eql(u8, key.k, p.v.at(m));
+            return key.k == std.mem.readInt(K, p.v.data.items[m * @sizeOf(K) ..][0..@sizeOf(K)], .little);
+        }
+    };
+}
 
 /// Values of a merged dictionary (fixed-width or string/binary bytes) as they are appended.
 const MergedValues = struct {
     width: usize, // fixed width, 0 for string/binary
     data: std.ArrayList(u8) = .empty,
     ends: std.ArrayList(usize) = .empty, // string/binary: end offset of each entry
+    hashes: std.ArrayList(u64) = .empty, // each entry's hash (0 for null entries, never looked up)
     count: usize = 0,
     nulls: std.ArrayList(usize) = .empty, // entries that are null
 
     fn deinit(self: *MergedValues, allocator: std.mem.Allocator) void {
         self.data.deinit(allocator);
         self.ends.deinit(allocator);
+        self.hashes.deinit(allocator);
         self.nulls.deinit(allocator);
+    }
+
+    /// Room for `n` entries without growing (fixed width: their bytes too).
+    fn reserve(self: *MergedValues, allocator: std.mem.Allocator, n: usize) Error!void {
+        if (self.width != 0) try self.data.ensureTotalCapacity(allocator, std.math.mul(usize, n, self.width) catch return error.InvalidInput) else try self.ends.ensureTotalCapacity(allocator, n);
+        try self.hashes.ensureTotalCapacity(allocator, n);
     }
 
     fn at(self: MergedValues, m: u32) []const u8 {
@@ -503,8 +557,9 @@ const MergedValues = struct {
         return self.data.items[if (m == 0) 0 else self.ends.items[m - 1]..self.ends.items[m]];
     }
 
-    fn append(self: *MergedValues, allocator: std.mem.Allocator, bytes: ?[]const u8) Error!void {
+    fn append(self: *MergedValues, allocator: std.mem.Allocator, bytes: ?[]const u8, hash: u64) Error!void {
         if (self.count >= std.math.maxInt(u32)) return error.InvalidInput;
+        try self.hashes.append(allocator, hash);
         if (bytes) |b| try self.data.appendSlice(allocator, b) else {
             try self.nulls.append(allocator, self.count);
             if (self.width != 0) try self.data.appendNTimes(allocator, 0, self.width);
@@ -589,8 +644,18 @@ pub fn dictionaryEncode(allocator: std.mem.Allocator, array: ArrayRef, value_typ
     errdefer indices.deinit();
     var merged: MergedValues = .{ .width = if (kind == .fixed) kind.fixed else 0 };
     defer merged.deinit(allocator);
-    var keys: KeyMap = .empty; // grows with the distinct values (a reserved table would be cold)
+    var keys: KeyMap = .empty;
     defer keys.deinit(allocator);
+    // A bounded guess: small inputs never regrow, big ones start past the costly small regrowths
+    // (entries keep their hash, so the rest of the growth never rereads values).
+    const guess: u32 = @intCast(@min(d.length, 1024));
+    try keys.ensureTotalCapacityContext(allocator, guess, EntryContext{ .v = &merged });
+    try merged.reserve(allocator, guess);
+    if (kind != .fixed and d.length > 0) {
+        // String bytes: the guessed entries' share of the input's bytes (merged never holds more).
+        const r = if (kind == .binary32) try binaryDataRange(i32, d) else try binaryDataRange(i64, d);
+        try merged.data.ensureTotalCapacity(allocator, @min(r.end - r.start, ((r.end - r.start) / d.length + 1) * guess));
+    }
     try mergeDictionary(i32, allocator, kind, d, &merged, &keys, null, false, indices.typedSlice(i32)[0..d.length]);
     const null_count = if (maybe_nulls) d.length - bitmap.countSetBit(validity.data, d.length) else 0;
 
@@ -609,15 +674,6 @@ pub fn dictionaryEncode(allocator: std.mem.Allocator, array: ArrayRef, value_typ
     };
     try out.validateLayout();
     return try ArrayRef.fromOwnedInlineBuffers(allocator, out);
-}
-
-/// Row `i` of a string/binary array whose offsets passed binaryDataRange (each value checked).
-fn binaryValue(comptime O: type, d: *const ArrayData, i: usize) Error![]const u8 {
-    const offsets = d.buffers[1].typedSlice(O) catch return error.InvalidInput;
-    const start = std.math.cast(usize, offsets[d.offset + i]) orelse return error.InvalidInput;
-    const end = std.math.cast(usize, offsets[d.offset + i + 1]) orelse return error.InvalidInput;
-    if (end < start or end > d.buffers[2].len()) return error.InvalidInput;
-    return d.buffers[2].data[start..end];
 }
 
 /// Rows [start, start + len) of `ref`: nested concat records every part's child windows in one

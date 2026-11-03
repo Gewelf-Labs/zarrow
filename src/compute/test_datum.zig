@@ -1983,6 +1983,67 @@ test "dictionaryEncode maps rows to distinct values in first-seen order; null ro
     try std.testing.expectError(error.UnsupportedType, dictionaryEncode(allocator, bools, &bool_type));
 }
 
+test "dictionaryEncode fast paths: every fixed width and large strings, past the reserved capacity" {
+    const allocator = std.testing.allocator;
+    const dictionaryEncode = @import("../concat_array_refs.zig").dictionaryEncode;
+    const n = 6000; // up to 3000 distinct values: the map and the entries grow past the 1024 reserve
+
+    // fixed_size_binary covers each fixed-width loop: 1, 2, 4, 8, 16 bytes (integer keys) and the
+    // byte-slice loop (3, 32). Row r holds value id (r * 7919) % distinct; every 11th row is null.
+    inline for (.{ 1, 2, 3, 4, 8, 16, 32 }) |w| {
+        const distinct: usize = if (w == 1) 256 else 3000;
+        const bytes = try allocator.alloc(u8, n * w);
+        defer allocator.free(bytes);
+        var validity: [(n + 7) / 8]u8 = @splat(0xFF);
+        for (0..n) |r| {
+            const id = (r * 7919) % distinct;
+            for (bytes[r * w ..][0..w], 0..) |*b, k| b.* = @truncate(if (k < 2) id >> @intCast(8 * k) else id *% (k + 3));
+            if (r % 11 == 0) validity[r / 8] &= ~(@as(u8, 1) << @intCast(r % 8));
+        }
+        const dt = DataType{ .fixed_size_binary = .{ .byte_width = w } };
+        const bufs = [_]array_mod.SharedBuffer{ array_mod.SharedBuffer.fromSlice(&validity), array_mod.SharedBuffer.fromSlice(bytes) };
+        var arr = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dt, .length = n, .buffers = &bufs });
+        defer arr.release();
+        var enc = try dictionaryEncode(allocator, arr, &dt);
+        defer enc.release();
+        try enc.data().validateFull();
+        const dict = enc.data().dictionary.?.data();
+        try std.testing.expectEqual(distinct, dict.length);
+        const idx = try enc.data().buffers[1].typedSlice(i32);
+        var next: i32 = 0;
+        for (0..n) |r| {
+            try std.testing.expectEqual(arr.data().isNull(r), enc.data().isNull(r));
+            if (enc.data().isNull(r)) continue;
+            try std.testing.expect(idx[r] <= next);
+            if (idx[r] == next) next += 1;
+            try std.testing.expect(rowsEqual(dict, @intCast(idx[r]), arr.data(), r));
+        }
+    }
+
+    // large_string: the 64-bit offsets loop.
+    var lsb = try array_mod.LargeStringBuilder.init(allocator, n, n * 8);
+    defer lsb.deinit();
+    var tmp: [16]u8 = undefined;
+    for (0..n) |r| {
+        if (r % 11 == 0) try lsb.appendNull() else try lsb.append(std.fmt.bufPrint(&tmp, "v{d}", .{(r * 7919) % 3000}) catch unreachable);
+    }
+    var lstrs = try lsb.finish();
+    defer lstrs.release();
+    const large_string_type = DataType{ .large_string = {} };
+    var enc = try dictionaryEncode(allocator, lstrs, &large_string_type);
+    defer enc.release();
+    try enc.data().validateFull();
+    const dict = array_mod.LargeStringArray{ .data = enc.data().dictionary.?.data() };
+    try std.testing.expectEqual(@as(usize, 3000), dict.len());
+    const src = array_mod.LargeStringArray{ .data = lstrs.data() };
+    const idx = try enc.data().buffers[1].typedSlice(i32);
+    for (0..n) |r| {
+        try std.testing.expectEqual(src.isNull(r), enc.data().isNull(r));
+        if (src.isNull(r)) continue;
+        try std.testing.expectEqualStrings(try src.value(r), try dict.value(@intCast(idx[r])));
+    }
+}
+
 test "concatArrayRefs of dense unions without children (empty parts)" {
     const allocator = std.testing.allocator;
     const dt = DataType{ .dense_union = .{ .type_ids = &.{}, .fields = &.{}, .mode = .dense } };

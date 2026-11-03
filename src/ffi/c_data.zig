@@ -1186,12 +1186,7 @@ fn dataTypeFromIntType(int_type: IntType) ?DataType {
     };
 }
 
-fn storageDataType(dt: DataType) DataType {
-    return switch (dt) {
-        .extension => |ext| storageDataType(ext.storage_type.*),
-        else => dt,
-    };
-}
+const storageDataType = datatype.storageDataType;
 
 fn intTypeFromDataType(dt: DataType) ?IntType {
     return IntType.fromTypeId(dt.id());
