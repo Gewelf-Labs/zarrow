@@ -62,6 +62,7 @@ pub const FileReader = struct {
     dictionary_values: std.AutoHashMap(i64, array_data.ArrayRef),
     next_record_index: usize = 0,
     decode_message_cursor: usize = 0, // points into indexed.message_order
+    decode: stream_reader.DecodeContexts = .{}, // decompression contexts reused across blocks
 
     const Self = @This();
 
@@ -85,6 +86,7 @@ pub const FileReader = struct {
         self.schema_ref = null;
         if (self.indexed) |*idx| idx.deinit(self.allocator);
         self.indexed = null;
+        self.decode.deinit(self.allocator);
     }
 
     pub fn readSchema(self: *Self) FileError!Schema {
@@ -115,6 +117,7 @@ pub const FileReader = struct {
             &self.dictionary_values,
             decoded_block.metadata,
             decoded_block.body,
+            &self.decode,
         );
 
         self.decode_message_cursor = message_pos + 1;
@@ -270,6 +273,7 @@ pub const FileReader = struct {
                 &self.dictionary_values,
                 decoded_block.metadata,
                 decoded_block.body,
+                &self.decode,
             );
         }
     }

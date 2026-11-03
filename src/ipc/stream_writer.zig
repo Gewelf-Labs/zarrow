@@ -4,7 +4,6 @@ const schema_mod = @import("../schema.zig");
 const record_batch = @import("../record_batch.zig");
 const array_ref = @import("../array/array_ref.zig");
 const array_data = @import("../array/array_data.zig");
-const buffer = @import("../buffer.zig");
 const format = @import("format.zig");
 const fbs_lite_builder = @import("fbs_lite/builder.zig");
 const fbs_lite_verify = @import("fbs_lite/verify.zig");
@@ -135,6 +134,16 @@ pub const StreamWriter = struct {
     body_compression: ?BodyCompressionCodec = null,
     endianness_mode: EndiannessMode = .strict,
     metadata_version: MetadataVersion = .v5,
+    /// Record batch scratch, cleared and reused by every batch (capacity kept until deinit):
+    /// metadata lists, the flatbuffer builder and the compressed body.
+    nodes: std.ArrayList(fbs.FieldNodeT) = .empty,
+    buffers: std.ArrayList(fbs.BufferT) = .empty,
+    variadic_buffer_counts: std.ArrayList(i64) = .empty,
+    body_buffers: std.ArrayList(array_data.SharedBuffer) = .empty,
+    compressed: std.ArrayList(u8) = .empty,
+    fbs_builder: fbs_lite_builder.Builder,
+    /// Taken on the first zstd batch; ZSTD_compress would build and free one per buffer.
+    zstd_cctx: ?*anyopaque = null,
 
     const Self = @This();
 
@@ -151,6 +160,7 @@ pub const StreamWriter = struct {
             .allocator = allocator,
             .writer = writer,
             .dictionary_values = std.AutoHashMap(i64, ArrayRef).init(allocator),
+            .fbs_builder = fbs_lite_builder.Builder.init(allocator),
             .body_compression = options.body_compression,
             .endianness_mode = options.endianness_mode,
             .metadata_version = options.metadata_version,
@@ -172,6 +182,14 @@ pub const StreamWriter = struct {
     pub fn deinit(self: *Self) void {
         self.clearDictionaryValues();
         self.dictionary_values.deinit();
+        self.nodes.deinit(self.allocator);
+        self.buffers.deinit(self.allocator);
+        self.variadic_buffer_counts.deinit(self.allocator);
+        self.body_buffers.deinit(self.allocator);
+        self.compressed.deinit(self.allocator);
+        self.fbs_builder.deinitAll();
+        if (self.zstd_cctx) |cctx| compression_dynlib.putZstdCCtx(cctx);
+        self.zstd_cctx = null;
     }
 
     fn clearDictionaryValues(self: *Self) void {
@@ -258,64 +276,103 @@ pub const StreamWriter = struct {
             }
         }
 
-        var nodes = try std.ArrayList(fbs.FieldNodeT).initCapacity(self.allocator, 0);
-        var buffers = try std.ArrayList(fbs.BufferT).initCapacity(self.allocator, 0);
-        var variadic_buffer_counts = try std.ArrayList(i64).initCapacity(self.allocator, 0);
-        var body_buffers = try std.ArrayList(array_data.SharedBuffer).initCapacity(self.allocator, 0);
-        var owns_body_buffers = false;
-        defer body_buffers.deinit(self.allocator);
-        defer if (owns_body_buffers) {
-            for (body_buffers.items) |buf| {
-                var owned = buf;
-                owned.release();
-            }
-        };
+        self.nodes.clearRetainingCapacity();
+        self.buffers.clearRetainingCapacity();
+        self.variadic_buffer_counts.clearRetainingCapacity();
+        self.body_buffers.clearRetainingCapacity();
 
         var body_offset: u64 = 0;
         for (batch.columns) |col| {
             try appendArrayMeta(
                 self.allocator,
                 col.data(),
-                &nodes,
-                &buffers,
-                &variadic_buffer_counts,
-                &body_buffers,
+                &self.nodes,
+                &self.buffers,
+                &self.variadic_buffer_counts,
+                &self.body_buffers,
                 &body_offset,
                 self.metadata_version,
             );
         }
 
-        var compression_ptr: ?*fbs.BodyCompressionT = null;
+        var compression: fbs.BodyCompressionT = undefined;
         if (self.body_compression) |codec| {
-            compression_ptr = try applyBodyCompression(
-                self.allocator,
-                codec,
-                &buffers,
-                &body_buffers,
-                &body_offset,
-            );
-            owns_body_buffers = true;
+            try self.applyBodyCompression(codec, &body_offset);
+            compression = .{
+                .codec = switch (codec) {
+                    .lz4_frame => .LZ4_FRAME,
+                    .zstd => .ZSTD,
+                },
+                .method = .BUFFER,
+            };
         }
 
-        const record_batch_ptr = try self.allocator.create(fbs.RecordBatchT);
-        errdefer self.allocator.destroy(record_batch_ptr);
-        record_batch_ptr.* = .{
+        // Borrows the scratch lists: nothing here is freed, the lists are reused next batch.
+        var record_batch_t: fbs.RecordBatchT = .{
             .length = try castI64Metadata(batch.numRows()),
-            .nodes = nodes,
-            .buffers = buffers,
-            .compression = compression_ptr,
-            .variadicBufferCounts = variadic_buffer_counts,
+            .nodes = self.nodes,
+            .buffers = self.buffers,
+            .compression = if (self.body_compression != null) &compression else null,
+            .variadicBufferCounts = self.variadic_buffer_counts,
         };
-
-        var msg = fbs.MessageT{
+        const msg = fbs.MessageT{
             .version = toFbsMetadataVersion(self.metadata_version),
-            .header = .{ .RecordBatch = record_batch_ptr },
+            .header = .{ .RecordBatch = &record_batch_t },
             .bodyLength = try castI64Metadata(body_offset),
-            .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(self.allocator, 0),
+            .custom_metadata = .empty,
         };
-        defer msg.deinit(self.allocator);
 
-        try writeMessage(self.allocator, self.writer, msg, body_buffers.items);
+        self.fbs_builder.reset();
+        try writeMessageWith(&self.fbs_builder, self.allocator, self.writer, msg, self.body_buffers.items);
+    }
+
+    /// Replaces each body buffer with its compressed form (8-byte uncompressed length + codec
+    /// bytes), or the raw bytes behind a -1 prefix when compressing does not make it smaller.
+    /// All of them live in `compressed`, sized once per batch from the codec bounds, so the
+    /// body is views into one reused allocation.
+    fn applyBodyCompression(self: *Self, codec: BodyCompressionCodec, body_offset: *u64) WriterError!void {
+        if (self.buffers.items.len != self.body_buffers.items.len) return StreamError.InvalidMetadata;
+
+        var total: usize = 0;
+        for (self.body_buffers.items) |src| {
+            if (src.len() == 0) continue;
+            const slot = std.math.add(usize, 8, try compressBound(codec, src.len())) catch return StreamError.InvalidMetadata;
+            total = std.math.add(usize, total, slot) catch return StreamError.InvalidMetadata;
+        }
+        // ponytail: keeps the largest batch's bound until deinit; shrink it if one huge batch
+        // among small ones matters.
+        try self.compressed.resize(self.allocator, total);
+        if (codec == .zstd and self.zstd_cctx == null) {
+            self.zstd_cctx = compression_dynlib.takeZstdCCtx() orelse return error.OutOfMemory;
+        }
+
+        var pos: usize = 0;
+        var cursor: u64 = 0;
+        for (self.body_buffers.items, self.buffers.items) |*body, *meta| {
+            const src = body.*;
+            if (src.len() == 0) {
+                meta.* = .{ .offset = try castI64Metadata(cursor), .length = 0 };
+                body.* = array_data.SharedBuffer.empty;
+                continue;
+            }
+            // Packed back to back: each slot still fits, since every one only needs its own bound.
+            const out = self.compressed.items[pos..][0 .. 8 + try compressBound(codec, src.len())];
+            var encoded_len = 8 + try compressInto(codec, self.zstd_cctx, out[8..], src.data);
+            if (encoded_len - 8 >= src.len()) {
+                std.mem.writeInt(i64, out[0..8], -1, .little);
+                @memcpy(out[8..][0..src.len()], src.data);
+                encoded_len = 8 + src.len();
+            } else std.mem.writeInt(i64, out[0..8], try castI64Metadata(src.len()), .little);
+
+            body.* = array_data.SharedBuffer.fromSlice(out[0..encoded_len]);
+            meta.* = .{
+                .offset = try castI64Metadata(cursor),
+                .length = try castI64Metadata(encoded_len),
+            };
+            pos += encoded_len;
+            cursor = std.math.add(u64, cursor, format.paddedLen(encoded_len)) catch return StreamError.InvalidMetadata;
+        }
+        body_offset.* = cursor;
     }
 
     pub fn writeEnd(self: *Self) std.Io.Writer.Error!void {
@@ -326,10 +383,15 @@ pub const StreamWriter = struct {
 };
 
 fn writeMessage(allocator: std.mem.Allocator, writer: *std.Io.Writer, msg: fbs.MessageT, body_buffers: []const array_data.SharedBuffer) (WriterError || std.Io.Writer.Error)!void {
-    // The flatbuffer is written straight from the builder's bytes (no dupe per message).
     var fbs_builder = fbs_lite_builder.Builder.init(allocator);
     defer fbs_builder.deinitAll();
-    const metadata = try fbs_lite_builder.packMessageInto(&fbs_builder, allocator, msg);
+    try writeMessageWith(&fbs_builder, allocator, writer, msg, body_buffers);
+}
+
+/// writeMessage packing into `fbs_builder` (fresh or `reset`).
+fn writeMessageWith(fbs_builder: *fbs_lite_builder.Builder, allocator: std.mem.Allocator, writer: *std.Io.Writer, msg: fbs.MessageT, body_buffers: []const array_data.SharedBuffer) (WriterError || std.Io.Writer.Error)!void {
+    // The flatbuffer is written straight from the builder's bytes (no dupe per message).
+    const metadata = try fbs_lite_builder.packMessageInto(fbs_builder, allocator, msg);
 
     // IPC stream framing stores the padded metadata length in the prefix.
     const metadata_len = format.paddedLen(metadata.len);
@@ -711,12 +773,7 @@ fn validateDecimalPrecision(precision: u8, max_precision: u8) WriterError!void {
     if (precision == 0 or precision > max_precision) return StreamError.InvalidMetadata;
 }
 
-fn storageDataType(dt: DataType) DataType {
-    return switch (dt) {
-        .extension => |ext| storageDataType(ext.storage_type.*),
-        else => dt,
-    };
-}
+const storageDataType = datatype.storageDataType;
 
 fn buildTypeT(allocator: std.mem.Allocator, dt: DataType) WriterError!fbs.TypeT {
     return switch (dt) {
@@ -1211,58 +1268,6 @@ fn appendArrayMeta(
     }
 }
 
-fn applyBodyCompression(
-    allocator: std.mem.Allocator,
-    codec: BodyCompressionCodec,
-    buffers: *std.ArrayList(fbs.BufferT),
-    body_buffers: *std.ArrayList(array_data.SharedBuffer),
-    body_offset: *u64,
-) WriterError!*fbs.BodyCompressionT {
-    if (buffers.items.len != body_buffers.items.len) return StreamError.InvalidMetadata;
-
-    const original = try allocator.dupe(array_data.SharedBuffer, body_buffers.items);
-    defer allocator.free(original);
-
-    body_buffers.clearRetainingCapacity();
-    var cursor: u64 = 0;
-
-    for (original, 0..) |src, i| {
-        if (src.len() == 0) {
-            buffers.items[i] = .{ .offset = try castI64Metadata(cursor), .length = 0 };
-            try body_buffers.append(allocator, array_data.SharedBuffer.empty);
-            continue;
-        }
-
-        // Compress straight into the final buffer behind its 8-byte length prefix: no staging
-        // allocation, no realloc, no copy. Pages past the compressed size are never touched.
-        const capacity = std.math.add(usize, 8, try compressBound(codec, src.len())) catch return StreamError.InvalidMetadata;
-        var encoded = try buffer.OwnedBuffer.initUninit(allocator, capacity);
-        errdefer encoded.deinit();
-        std.mem.writeInt(i64, encoded.data[0..8], try castI64Metadata(src.len()), .little);
-        const encoded_len = 8 + try compressInto(codec, encoded.data[8..capacity], src.data);
-
-        const shared = try encoded.toShared(encoded_len);
-        try body_buffers.append(allocator, shared);
-        buffers.items[i] = .{
-            .offset = try castI64Metadata(cursor),
-            .length = try castI64Metadata(encoded_len),
-        };
-        cursor = std.math.add(u64, cursor, format.paddedLen(encoded_len)) catch return StreamError.InvalidMetadata;
-    }
-
-    body_offset.* = cursor;
-
-    const compression_ptr = try allocator.create(fbs.BodyCompressionT);
-    compression_ptr.* = .{
-        .codec = switch (codec) {
-            .lz4_frame => .LZ4_FRAME,
-            .zstd => .ZSTD,
-        },
-        .method = .BUFFER,
-    };
-    return compression_ptr;
-}
-
 /// Worst-case compressed size of `len` input bytes for `codec`.
 fn compressBound(codec: BodyCompressionCodec, len: usize) WriterError!usize {
     const bound = switch (codec) {
@@ -1279,12 +1284,13 @@ fn compressBound(codec: BodyCompressionCodec, len: usize) WriterError!usize {
 }
 
 /// Compresses `input` into `out` (sized by `compressBound`) and returns the bytes written.
-fn compressInto(codec: BodyCompressionCodec, out: []u8, input: []const u8) WriterError!usize {
+/// zstd compresses with `zstd_cctx` (reused across calls; same bytes as ZSTD_compress).
+fn compressInto(codec: BodyCompressionCodec, zstd_cctx: ?*anyopaque, out: []u8, input: []const u8) WriterError!usize {
     const in_ptr: ?*const anyopaque = if (input.len == 0) null else @ptrCast(input.ptr);
     const written = switch (codec) {
         .zstd => blk: {
             const syms = compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType;
-            const n = syms.*.compress(@ptrCast(out.ptr), out.len, in_ptr, input.len, 1);
+            const n = syms.*.compress_cctx(zstd_cctx, @ptrCast(out.ptr), out.len, in_ptr, input.len, 1);
             if (syms.*.is_error(n) != 0) return StreamError.InvalidMetadata;
             break :blk n;
         },
@@ -2012,4 +2018,191 @@ test "ipc writer emits tensor message via public tensor-like api" {
     }
 
     try std.testing.expect((try reader.nextTensorLikeMessage()) == null);
+}
+
+test "zstd compression with a reused context matches one-shot ZSTD_compress" {
+    const allocator = std.testing.allocator;
+    const syms = try compression_dynlib.loadZstdSymbols();
+    const cctx = syms.*.create_cctx().?;
+    defer _ = syms.*.free_cctx(cctx);
+
+    var prng = std.Random.DefaultPrng.init(9);
+    const big = try allocator.alloc(u8, 200_000);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i / 7);
+    var noise: [5000]u8 = undefined;
+    prng.random().bytes(&noise);
+    const inputs = [_][]const u8{ big, "x", noise[0..], big[0..300], "tiny but repeated repeated repeated" };
+    for (inputs) |input| {
+        const bound = try compressBound(.zstd, input.len);
+        const one_shot = try allocator.alloc(u8, bound);
+        defer allocator.free(one_shot);
+        const reused = try allocator.alloc(u8, bound);
+        defer allocator.free(reused);
+        const n = syms.*.compress(@ptrCast(one_shot.ptr), bound, @ptrCast(input.ptr), input.len, 1);
+        try std.testing.expectEqual(@as(c_uint, 0), syms.*.is_error(n));
+        const m = try compressInto(.zstd, cctx, reused, input);
+        try std.testing.expectEqualSlices(u8, one_shot[0..n], reused[0..m]);
+    }
+}
+
+fn buildCompressionTestBatch(allocator: std.mem.Allocator, schema: Schema, rows: usize, seed: usize) !RecordBatch {
+    const arr = @import("../array/array.zig");
+    var ints = try arr.Int32Builder.init(allocator, rows);
+    defer ints.deinit();
+    var strs = try arr.StringBuilder.init(allocator, rows, rows * 8);
+    defer strs.deinit();
+    for (0..rows) |i| {
+        if (i % 7 == 3) {
+            try ints.appendNull();
+            try strs.appendNull();
+            continue;
+        }
+        try ints.append(@intCast(i * (seed + 1)));
+        try strs.append(if (i & 1 == 0) "alpha" else "beta-gamma");
+    }
+    var a = try ints.finish();
+    defer a.release();
+    var s = try strs.finish();
+    defer s.release();
+    return RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{ a, s });
+}
+
+test "ipc writer and reader reuse compression state across batches" {
+    const allocator = std.testing.allocator;
+    const arr = @import("../array/array.zig");
+    const int_type = DataType{ .int32 = {} };
+    const str_type = DataType{ .string = {} };
+    const fields = [_]Field{
+        .{ .name = "id", .data_type = &int_type, .nullable = true },
+        .{ .name = "name", .data_type = &str_type, .nullable = true },
+    };
+    const schema = Schema{ .fields = fields[0..] };
+
+    // Growing and shrinking batches: the context and the scratch see every size order.
+    const sizes = [_]usize{ 1000, 3, 200, 5000, 0, 64, 1000 };
+    var batches: [sizes.len]RecordBatch = undefined;
+    var made: usize = 0;
+    defer for (batches[0..made]) |*b| b.deinit();
+    for (sizes, 0..) |n, k| {
+        batches[k] = try buildCompressionTestBatch(allocator, schema, n, k);
+        made += 1;
+    }
+
+    for ([_]BodyCompressionCodec{ .zstd, .lz4_frame }) |codec| {
+        var reused = std.Io.Writer.Allocating.init(allocator);
+        defer reused.deinit();
+        {
+            var w = StreamWriter.initWithBodyCompression(allocator, &reused.writer, codec);
+            defer w.deinit();
+            try w.writeSchema(schema);
+            for (batches) |b| try w.writeRecordBatch(b);
+            try w.writeEnd();
+        }
+
+        // The same stream assembled from one fresh writer per batch.
+        var expected = std.Io.Writer.Allocating.init(allocator);
+        defer expected.deinit();
+        for (batches, 0..) |b, k| {
+            var one = std.Io.Writer.Allocating.init(allocator);
+            defer one.deinit();
+            var fresh = StreamWriter.initWithBodyCompression(allocator, &one.writer, codec);
+            defer fresh.deinit();
+            try fresh.writeSchema(schema);
+            const schema_len = one.written().len;
+            try fresh.writeRecordBatch(b);
+            try expected.writer.writeAll(one.written()[if (k == 0) 0 else schema_len..]);
+        }
+        try format.writeMessageLength(&expected.writer, 0);
+        try std.testing.expectEqualSlices(u8, expected.written(), reused.written());
+
+        // One reader for every batch: its decompression contexts are reused too.
+        var in: std.Io.Reader = .fixed(reused.written());
+        var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        for (batches) |b| {
+            var got = (try reader.nextRecordBatch()).?;
+            defer got.deinit();
+            try std.testing.expectEqual(b.numRows(), got.numRows());
+            const want_ints = arr.Int32Array{ .data = b.columns[0].data() };
+            const got_ints = arr.Int32Array{ .data = got.columns[0].data() };
+            const want_strs = arr.StringArray{ .data = b.columns[1].data() };
+            const got_strs = arr.StringArray{ .data = got.columns[1].data() };
+            for (0..b.numRows()) |i| {
+                try std.testing.expectEqual(want_ints.isNull(i), got_ints.isNull(i));
+                if (want_ints.isNull(i)) continue;
+                try std.testing.expectEqual(try want_ints.value(i), try got_ints.value(i));
+                try std.testing.expectEqualSlices(u8, try want_strs.value(i), try got_strs.value(i));
+            }
+        }
+        try std.testing.expect((try reader.nextRecordBatch()) == null);
+    }
+}
+
+test "ipc writer stores buffers that do not shrink raw behind a -1 prefix" {
+    const allocator = std.testing.allocator;
+    const arr = @import("../array/array.zig");
+    const int_type = DataType{ .int32 = {} };
+    const fields = [_]Field{
+        .{ .name = "noise", .data_type = &int_type, .nullable = false },
+        .{ .name = "sevens", .data_type = &int_type, .nullable = false },
+    };
+    const schema = Schema{ .fields = fields[0..] };
+
+    var prng = std.Random.DefaultPrng.init(42);
+    var noise_b = try arr.Int32Builder.init(allocator, 1024);
+    defer noise_b.deinit();
+    var sevens_b = try arr.Int32Builder.init(allocator, 1024);
+    defer sevens_b.deinit();
+    for (0..1024) |_| {
+        try noise_b.append(prng.random().int(i32));
+        try sevens_b.append(7);
+    }
+    var noise = try noise_b.finish();
+    defer noise.release();
+    var sevens = try sevens_b.finish();
+    defer sevens.release();
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{ noise, sevens });
+    defer batch.deinit();
+
+    for ([_]BodyCompressionCodec{ .zstd, .lz4_frame }) |codec| {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var writer = StreamWriter.initWithBodyCompression(allocator, &out.writer, codec);
+        defer writer.deinit();
+        try writer.writeSchema(schema);
+        try writer.writeRecordBatch(batch);
+        try writer.writeEnd();
+
+        var in: std.Io.Reader = .fixed(out.written());
+        var schema_msg = (try readNextMessageForTest(allocator, &in)).?;
+        schema_msg.deinit(allocator);
+        const prefix = (try format.readMessageLength(&in)).?;
+        const metadata = try in.take(prefix.len);
+        try format.skipPadding(&in, prefix.pad);
+        var msg = try fbs_lite_builder.unpackMessage(allocator, metadata);
+        defer msg.deinit(allocator);
+        const body = try in.take(@intCast(msg.bodyLength));
+        const metas = msg.header.RecordBatch.?.buffers.items;
+        try std.testing.expectEqual(@as(usize, 4), metas.len);
+
+        // Random values do not compress: stored raw with the -1 prefix.
+        const noise_chunk = body[@intCast(metas[1].offset)..][0..@intCast(metas[1].length)];
+        try std.testing.expectEqual(@as(i64, -1), std.mem.readInt(i64, noise_chunk[0..8], .little));
+        try std.testing.expectEqualSlices(u8, noise.data().buffers[1].data[0..4096], noise_chunk[8..]);
+        // Repeated values do: the prefix is the uncompressed length.
+        const sevens_chunk = body[@intCast(metas[3].offset)..][0..@intCast(metas[3].length)];
+        try std.testing.expectEqual(@as(i64, 4096), std.mem.readInt(i64, sevens_chunk[0..8], .little));
+        try std.testing.expect(sevens_chunk.len < 4096);
+
+        var round: std.Io.Reader = .fixed(out.written());
+        var reader = @import("stream_reader.zig").StreamReader.init(allocator, &round);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        var got = (try reader.nextRecordBatch()).?;
+        defer got.deinit();
+        try std.testing.expectEqualSlices(i32, try (arr.Int32Array{ .data = noise.data() }).values(), try (arr.Int32Array{ .data = got.columns[0].data() }).values());
+        try std.testing.expectEqualSlices(i32, try (arr.Int32Array{ .data = sevens.data() }).values(), try (arr.Int32Array{ .data = got.columns[1].data() }).values());
+    }
 }

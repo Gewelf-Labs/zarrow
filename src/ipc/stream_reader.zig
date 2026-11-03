@@ -139,6 +139,8 @@ pub const StreamReader = struct {
     /// of faulting in fresh pages; otherwise the handle is released and a new buffer allocated.
     spare_body: ?array_data.SharedBuffer = null,
     spare_decoded: ?array_data.SharedBuffer = null,
+    spare_meta: ?array_data.SharedBuffer = null, // message flatbuffer (released after unpacking)
+    decode: DecodeContexts = .{},
 
     const Self = @This();
 
@@ -186,6 +188,9 @@ pub const StreamReader = struct {
         self.spare_body = null;
         if (self.spare_decoded) |*b| b.release();
         self.spare_decoded = null;
+        if (self.spare_meta) |*b| b.release();
+        self.spare_meta = null;
+        self.decode.deinit(self.allocator);
     }
 
     fn clearDictionaryValues(self: *Self) void {
@@ -235,6 +240,7 @@ pub const StreamReader = struct {
                         msg.msg.header.DictionaryBatch.?,
                         msg.body orelse .empty,
                         msg.msg.version,
+                        &self.decode,
                     );
                 },
                 .RecordBatch => {
@@ -246,6 +252,7 @@ pub const StreamReader = struct {
                         &self.dictionary_values,
                         msg.msg.version,
                         &self.spare_decoded,
+                        &self.decode,
                     );
                 },
                 // Tensor/SparseTensor are valid IPC message headers but are
@@ -348,10 +355,11 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
     const prefix = try format.readMessageLength(self.reader) orelse return null;
     const meta_len = prefix.len;
 
-    var meta_buf_owned = try readOwned(self.allocator, self.reader, null, meta_len);
+    var meta_buf_owned = try readOwned(self.allocator, self.reader, &self.spare_meta, meta_len);
     errdefer meta_buf_owned.deinit();
     var metadata = try meta_buf_owned.toShared(meta_len);
     errdefer metadata.release();
+    keepSpare(&self.spare_meta, metadata);
     try format.skipPadding(self.reader, prefix.pad);
 
     const envelope = fbs_lite_verify.parseArrowMessageEnvelope(metadata.data) catch return StreamError.InvalidMetadata;
@@ -996,6 +1004,7 @@ pub fn ingestDictionaryBatchFromMessageMetadata(
     dictionary_values: *std.AutoHashMap(i64, ArrayRef),
     metadata: []const u8,
     body: array_data.SharedBuffer,
+    contexts: *DecodeContexts,
 ) (StreamError || array_data.ValidationError || fbs_lite_builder.PackError || error{OutOfMemory})!void {
     var msg_t = try unpackMessageFromMetadata(allocator, metadata);
     defer msg_t.deinit(allocator);
@@ -1007,6 +1016,7 @@ pub fn ingestDictionaryBatchFromMessageMetadata(
         msg_t.header.DictionaryBatch.?,
         body,
         msg_t.version,
+        contexts,
     );
 }
 
@@ -1016,6 +1026,7 @@ pub fn buildRecordBatchFromMessageMetadata(
     dictionary_values: *const std.AutoHashMap(i64, ArrayRef),
     metadata: []const u8,
     body: array_data.SharedBuffer,
+    contexts: *DecodeContexts,
 ) (StreamError || array_data.ValidationError || record_batch.RecordBatchError || fbs_lite_builder.PackError || error{OutOfMemory})!RecordBatch {
     // Owns `schema_ref` (callers pass a retained ref); buildRecordBatchFromFlatbuf takes it over.
     var ref = schema_ref;
@@ -1033,6 +1044,7 @@ pub fn buildRecordBatchFromMessageMetadata(
         dictionary_values,
         msg_t.version,
         null,
+        contexts,
     );
 }
 
@@ -1465,12 +1477,7 @@ fn dataTypeFromIntType(int_type: datatype.IntType) StreamError!DataType {
     };
 }
 
-fn storageDataType(dt: DataType) DataType {
-    return switch (dt) {
-        .extension => |ext| storageDataType(ext.storage_type.*),
-        else => dt,
-    };
-}
+const storageDataType = datatype.storageDataType;
 
 fn buildRecordBatchFromFlatbuf(
     allocator: std.mem.Allocator,
@@ -1480,6 +1487,7 @@ fn buildRecordBatchFromFlatbuf(
     dictionary_values: *const std.AutoHashMap(i64, ArrayRef),
     metadata_version: fbs.MetadataVersion,
     spare_decoded: ?*?array_data.SharedBuffer,
+    contexts: *DecodeContexts,
 ) (StreamError || array_data.ValidationError || record_batch.RecordBatchError || error{OutOfMemory})!RecordBatch {
     // schema_ref is already retained by the caller; track it so early‑error paths release it.
     var schema_taken = false;
@@ -1494,8 +1502,8 @@ fn buildRecordBatchFromFlatbuf(
         allocator.free(columns);
     }
 
-    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, spare_decoded);
-    defer decoded.deinit(allocator);
+    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, spare_decoded, contexts);
+    defer decoded.deinit();
 
     var node_index: usize = 0;
     var buffer_index: usize = 0;
@@ -1853,18 +1861,30 @@ fn bufferCountForType(
 
 const DecodedRecordBatchBody = struct {
     body: array_data.SharedBuffer,
-    buffers_meta: []const fbs.BufferT,
+    buffers_meta: []const fbs.BufferT, // the message's, or DecodeContexts.decoded_meta
     owned_body: bool,
-    owned_meta: bool,
 
-    fn deinit(self: *DecodedRecordBatchBody, allocator: std.mem.Allocator) void {
-        if (self.owned_meta) {
-            allocator.free(@constCast(self.buffers_meta));
-        }
+    fn deinit(self: *DecodedRecordBatchBody) void {
         if (self.owned_body) {
             var body_mut = self.body;
             body_mut.release();
         }
+    }
+};
+
+/// Decompression state a reader keeps across messages: zstd and LZ4 frame contexts, taken on
+/// first use (ZSTD_decompress and a fresh LZ4F context per buffer allocate and free one on every
+/// call), and the decoded buffer layout of the current message.
+pub const DecodeContexts = struct {
+    zstd_dctx: ?*anyopaque = null,
+    lz4_dctx: ?*anyopaque = null,
+    decoded_meta: std.ArrayList(fbs.BufferT) = .empty,
+
+    pub fn deinit(self: *DecodeContexts, allocator: std.mem.Allocator) void {
+        if (self.zstd_dctx) |d| compression_dynlib.putZstdDCtx(d);
+        if (self.lz4_dctx) |d| compression_dynlib.putLz4DCtx(d);
+        self.decoded_meta.deinit(allocator);
+        self.* = .{};
     }
 };
 
@@ -1873,13 +1893,13 @@ fn decodeRecordBatchBody(
     record_batch_t: *fbs.RecordBatchT,
     body: array_data.SharedBuffer,
     spare: ?*?array_data.SharedBuffer,
+    contexts: *DecodeContexts,
 ) (StreamError || error{OutOfMemory})!DecodedRecordBatchBody {
     if (record_batch_t.compression == null) {
         return .{
             .body = body,
             .buffers_meta = record_batch_t.buffers.items,
             .owned_body = false,
-            .owned_meta = false,
         };
     }
 
@@ -1887,8 +1907,8 @@ fn decodeRecordBatchBody(
     if (compression.method != .BUFFER) return StreamError.UnsupportedType;
 
     const buffers_len = record_batch_t.buffers.items.len;
-    const decoded_meta = try allocator.alloc(fbs.BufferT, buffers_len);
-    errdefer allocator.free(decoded_meta);
+    try contexts.decoded_meta.resize(allocator, buffers_len);
+    const decoded_meta = contexts.decoded_meta.items;
 
     // Pass 1: lay out the decoded body from the 8-byte uncompressed-length prefixes.
     const cursor = try layoutDecodedBody(record_batch_t.buffers.items, body, decoded_meta, compression.codec);
@@ -1907,8 +1927,8 @@ fn decodeRecordBatchBody(
         if (std.mem.readInt(i64, chunk[0..8], .little) == -1) {
             @memcpy(dst, payload);
         } else switch (compression.codec) {
-            .ZSTD => try decompressZstdInto(payload, dst),
-            .LZ4_FRAME => try decompressLz4FrameInto(payload, dst),
+            .ZSTD => try decompressZstdInto(contexts, payload, dst),
+            .LZ4_FRAME => try decompressLz4FrameInto(contexts, payload, dst),
         }
     }
 
@@ -1918,7 +1938,6 @@ fn decodeRecordBatchBody(
         .body = decoded_body,
         .buffers_meta = decoded_meta,
         .owned_body = true,
-        .owned_meta = true,
     };
 }
 
@@ -2002,9 +2021,12 @@ fn decodedChunkLen(chunk: []const u8) StreamError!usize {
     return std.math.cast(usize, prefix) orelse StreamError.InvalidBody;
 }
 
-fn decompressZstdInto(payload: []const u8, dst: []u8) StreamError!void {
+fn decompressZstdInto(contexts: *DecodeContexts, payload: []const u8, dst: []u8) (StreamError || error{OutOfMemory})!void {
     const syms = compression_dynlib.loadZstdSymbols() catch return StreamError.UnsupportedType;
-    const written = syms.*.decompress(
+    if (contexts.zstd_dctx == null) contexts.zstd_dctx = compression_dynlib.takeZstdDCtx() orelse return error.OutOfMemory;
+    // The one-shot DCtx call starts a fresh frame every time, whatever the previous call left.
+    const written = syms.*.decompress_dctx(
+        contexts.zstd_dctx,
         @ptrCast(dst.ptr),
         dst.len,
         if (payload.len == 0) null else @ptrCast(payload.ptr),
@@ -2013,13 +2035,13 @@ fn decompressZstdInto(payload: []const u8, dst: []u8) StreamError!void {
     if (syms.*.is_error(written) != 0 or written != dst.len) return StreamError.InvalidBody;
 }
 
-fn decompressLz4FrameInto(payload: []const u8, out: []u8) StreamError!void {
+fn decompressLz4FrameInto(contexts: *DecodeContexts, payload: []const u8, out: []u8) StreamError!void {
     const syms = compression_dynlib.loadLz4Symbols() catch return StreamError.UnsupportedType;
 
-    var dctx: ?*anyopaque = null;
-    const create_rc = syms.*.create_decompression_context(&dctx, 100); // LZ4F_VERSION
-    if (syms.*.is_error(create_rc) != 0 or dctx == null) return StreamError.InvalidBody;
-    defer _ = syms.*.free_decompression_context(dctx);
+    if (contexts.lz4_dctx == null) contexts.lz4_dctx = compression_dynlib.takeLz4DCtx() orelse return StreamError.InvalidBody;
+    const dctx = contexts.lz4_dctx;
+    // A frame that failed or stopped early leaves the context mid-frame: start clean every time.
+    syms.*.reset_decompression_context(dctx);
 
     const expected_len = out.len;
     var src_pos: usize = 0;
@@ -2078,13 +2100,14 @@ fn ingestDictionaryBatchWithMap(
     dictionary_batch_t: *fbs.DictionaryBatchT,
     body: array_data.SharedBuffer,
     metadata_version: fbs.MetadataVersion,
+    contexts: *DecodeContexts,
 ) (StreamError || array_data.ValidationError || error{OutOfMemory})!void {
     const record_batch_t = dictionary_batch_t.data orelse return StreamError.InvalidMetadata;
     const value_type = findDictionaryValueType(schema, dictionary_batch_t.id) orelse return StreamError.InvalidMetadata;
     // Values that reference their own id would chain each replacement to the previous dictionary.
     if (findDictionaryValueTypeInDataType(value_type, dictionary_batch_t.id) != null) return StreamError.InvalidMetadata;
-    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, null);
-    defer decoded.deinit(allocator);
+    var decoded = try decodeRecordBatchBody(allocator, record_batch_t, body, null, contexts);
+    defer decoded.deinit();
 
     var node_index: usize = 0;
     var buffer_index: usize = 0;
@@ -2872,7 +2895,9 @@ test "ipc reader rejects a dictionary whose values contain its own id" {
     data.nodes.items = &nodes;
     data.buffers.items = &buffers;
     var batch: fbs.DictionaryBatchT = .{ .id = 7, .data = &data };
-    try std.testing.expectError(StreamError.InvalidMetadata, ingestDictionaryBatchWithMap(allocator, &dictionaries, .{ .fields = &fields }, &batch, .empty, .V5));
+    var contexts: DecodeContexts = .{};
+    defer contexts.deinit(allocator);
+    try std.testing.expectError(StreamError.InvalidMetadata, ingestDictionaryBatchWithMap(allocator, &dictionaries, .{ .fields = &fields }, &batch, .empty, .V5, &contexts));
 }
 
 fn expectMetadataEntry(metadata: []const datatype.KeyValue, key: []const u8, value: []const u8) !void {
@@ -4388,11 +4413,20 @@ test "ipc reader decodes real lz4 frame payload for compressed record batch body
         .variadicBufferCounts = try std.ArrayList(i64).initCapacity(allocator, 0),
     };
 
-    var decoded = try decodeRecordBatchBody(allocator, rb, body, null);
-    defer decoded.deinit(allocator);
-    try std.testing.expect(decoded.body.len() >= raw.len);
-    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), decoded.buffers_meta[1].length);
-    try std.testing.expectEqualSlices(u8, raw[0..], decoded.body.data[0..raw.len]);
+    var contexts: DecodeContexts = .{};
+    defer contexts.deinit(allocator);
+    // A frame cut before its end mark leaves the reused LZ4F context mid-frame; the next
+    // frames must still decode (the context is reset before every buffer).
+    rb.buffers.items[1].length = @intCast(compressed_len - 4);
+    try std.testing.expectError(StreamError.InvalidBody, decodeRecordBatchBody(allocator, rb, body, null, &contexts));
+    rb.buffers.items[1].length = @intCast(compressed_len);
+    for (0..3) |_| {
+        var decoded = try decodeRecordBatchBody(allocator, rb, body, null, &contexts);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.body.len() >= raw.len);
+        try std.testing.expectEqual(@as(i64, @intCast(raw.len)), decoded.buffers_meta[1].length);
+        try std.testing.expectEqualSlices(u8, raw[0..], decoded.body.data[0..raw.len]);
+    }
 }
 
 test "ipc reader decodes tensor message via tensor-like API" {

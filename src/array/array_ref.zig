@@ -106,13 +106,6 @@ pub const ArrayRef = struct {
     /// - list/map keep child in parent coordinate space (offset-driven view)
     /// - struct slices children to keep element alignment
     /// - dictionary keeps child/dictionary shared
-    fn storageType(dt: array_data.DataType) array_data.DataType {
-        return switch (dt) {
-            .extension => |ext| storageType(ext.storage_type.*),
-            else => dt,
-        };
-    }
-
     pub fn slice(self: ArrayRef, offset: usize, length: usize) !ArrayRef {
         var sliced = self.node.data.slice(offset, length);
         const allocator = self.node.allocator;
@@ -135,7 +128,7 @@ pub const ArrayRef = struct {
         if (sliced.dictionary) |dict| dict_ref = dict.retain();
         errdefer if (dict_ref) |*owned| owned.release();
 
-        switch (storageType(sliced.data_type)) {
+        switch (datatype.storageDataType(sliced.data_type)) {
             .struct_ => {
                 // Struct requires child-wise slicing to keep row alignment.
                 const total_offset = self.node.data.offset + offset;

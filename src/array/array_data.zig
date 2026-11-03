@@ -64,14 +64,9 @@ pub const ArrayData = struct {
 
     const Self = @This();
 
-    fn layoutDataType(dt: DataType) DataType {
-        return switch (dt) {
-            .extension => |ext| layoutDataType(ext.storage_type.*),
-            else => dt,
-        };
-    }
+    const layoutDataType = datatype.storageDataType;
 
-    fn hasTopLevelValidityBitmap(dt: DataType) bool {
+    inline fn hasTopLevelValidityBitmap(dt: DataType) bool {
         return switch (layoutDataType(dt)) {
             .null, .sparse_union, .dense_union => false,
             else => true,
