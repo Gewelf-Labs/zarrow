@@ -1,59 +1,59 @@
-# Apache Arrow 规范与 IPC：C / Rust 实现原理（面向实现）
+# Apache Arrow Specification and IPC: C / Rust Implementation Notes (Implementation-Oriented)
 
-> 更新时间：2026-04-16  
-> 目标：给实现者一份可直接落地的“规范 + 实现”说明，重点覆盖 Arrow 列式内存规范、IPC 线协议、C 接口实现方式与 Rust（arrow-rs）分层实现。
+> Updated: 2026-04-16  
+> Goal: give implementers a directly usable "specification + implementation" description, focusing on the Arrow columnar memory specification, the IPC wire protocol, how the C interface is implemented, and the layered implementation in Rust (arrow-rs).
 
-## 1. Arrow 列式规范（必须掌握）
+## 1. Arrow Columnar Specification (must know)
 
-### 1.1 统一数据模型
+### 1.1 Unified Data Model
 
-Arrow 数组在规范上由以下元素组成：
+By specification, an Arrow array consists of the following elements:
 
 - `data_type`
 - `buffers[]`
 - `length`
 - `null_count`
-- `children[]`（嵌套类型）
-- `dictionary`（字典编码）
+- `children[]` (nested types)
+- `dictionary` (dictionary encoding)
 
-实现上可以把任意列看成一棵 `ArrayData tree`：父节点描述本列，子节点描述 nested 子列。
+In implementation, any column can be viewed as an `ArrayData tree`: the parent node describes the column itself, and child nodes describe the nested sub-columns.
 
-### 1.2 对齐与填充
+### 1.2 Alignment and Padding
 
-- 内存分配推荐使用 `8` 或 `64` 字节对齐与 padding。
-- 在 IPC 序列化时，这些对齐与 padding 要求会被强制执行。
-- 社区建议优先使用 `64` 字节（更利于 SIMD / cache line 行为）。
+- For memory allocation, 8- or 64-byte alignment and padding are recommended.
+- During IPC serialization, these alignment and padding requirements are enforced.
+- Community guidance prefers 64-byte alignment (better for SIMD / cache-line behavior).
 
-### 1.3 空值位图（Validity Bitmap）
+### 1.3 Validity Bitmap
 
-- 大多数类型使用独立 validity bitmap。
-- 位语义：`1 = 非空`，`0 = null`。
-- 位序：`LSB-first`（`bitmap[j / 8] & (1 << (j % 8))`）。
-- `null_count == 0` 时，bitmap 可以省略（实现可自行决定是否仍分配）。
+- Most types use a separate validity bitmap.
+- Bit semantics: `1 = valid (non-null)`, `0 = null`.
+- Bit order: `LSB-first` (`bitmap[j / 8] & (1 << (j % 8))`).
+- When `null_count == 0`, the bitmap may be omitted (implementations may still choose to allocate it).
 
-### 1.4 变长布局核心约束（Binary/List）
+### 1.4 Core Constraints of Variable-Length Layouts (Binary/List)
 
-- 通过 `offsets` + `data` 表示变长值。
-- `offsets` 必须单调不减。
-- null 槽位可以对应非空物理区间（语义由 validity 决定）。
+- Variable-length values are represented by `offsets` + `data`.
+- `offsets` must be monotonically non-decreasing.
+- Null slots may correspond to non-empty physical intervals (the semantics are determined by validity).
 
-## 2. IPC 规范（Stream / File）
+## 2. IPC Specification (Stream / File)
 
-### 2.1 IPC 消息类型与结构
+### 2.1 IPC Message Types and Structures
 
-Arrow IPC 传输单元是消息流，核心消息：
+Arrow IPC transmits a stream of messages. The core messages are:
 
 - `Schema`
 - `RecordBatch`
 - `DictionaryBatch`
 
-#### 2.1.1 Schema / RecordBatch / DictionaryBatch 结构
+#### 2.1.1 Structures of Schema / RecordBatch / DictionaryBatch
 
-以下结构来自 Arrow IPC FlatBuffers 定义（`src/format/Schema.fbs`、`src/format/Message.fbs`）。
+The following structures come from the Arrow IPC FlatBuffers definitions (`src/format/Schema.fbs`, `src/format/Message.fbs`).
 
-#### Schema（逻辑结构定义）
+#### Schema (Logical Structure Definition)
 
-`Schema` 关注“列长什么样”，不包含具体列数据：
+`Schema` describes "what the columns look like" and does not contain actual column data:
 
 ```text
 Schema {
@@ -64,20 +64,20 @@ Schema {
 }
 ```
 
-`Field` 递归描述每一列：
+`Field` describes each column recursively:
 
 ```text
 Field {
   name: string
   nullable: bool
   type: Type
-  dictionary: DictionaryEncoding?   // 字典编码时存在
-  children: [Field]                 // List/Struct/Union 等嵌套类型
+  dictionary: DictionaryEncoding?   // present when dictionary-encoded
+  children: [Field]                 // nested types such as List/Struct/Union
   custom_metadata: [KeyValue]
 }
 ```
 
-`DictionaryEncoding` 关键字段：
+Key fields of `DictionaryEncoding`:
 
 ```text
 DictionaryEncoding {
@@ -87,22 +87,22 @@ DictionaryEncoding {
 }
 ```
 
-实现要点：
+Implementation notes:
 
-- `Schema` 决定后续 `RecordBatch` 的 `nodes/buffers` 扁平化顺序。
-- dictionary 列的索引类型在 `Field.dictionary.indexType` 固定，实际字典值由后续 `DictionaryBatch` 提供。
+- `Schema` determines the flattening order of `nodes/buffers` in subsequent `RecordBatch` messages.
+- The index type of a dictionary column is fixed in `Field.dictionary.indexType`; the actual dictionary values are provided by a later `DictionaryBatch`.
 
-#### RecordBatch（一批列数据）
+#### RecordBatch (A Batch of Column Data)
 
-`RecordBatch` 描述“这一批行的数据布局和 body 映射关系”：
+`RecordBatch` describes "the data layout of this batch of rows and how it maps onto the message body":
 
 ```text
 RecordBatch {
-  length: long                 // 行数
-  nodes: [FieldNode]           // 预序遍历后的逻辑节点
-  buffers: [Buffer]            // 预序遍历后的物理 buffer 区间
+  length: long                 // number of rows
+  nodes: [FieldNode]           // logical nodes in pre-order traversal
+  buffers: [Buffer]            // physical buffer ranges in pre-order traversal
   compression: BodyCompression?
-  variadicBufferCounts: [long] // BinaryView/Utf8View 等可变 buffer 计数
+  variadicBufferCounts: [long] // buffer counts for variable-count buffers such as BinaryView/Utf8View
 }
 
 FieldNode {
@@ -116,15 +116,15 @@ Buffer {
 }
 ```
 
-实现要点：
+Implementation notes:
 
-- `nodes` 与 `buffers` 都是按 schema 树“前序展开（pre-order flatten）”。
-- `Buffer.offset/length` 是相对本条消息 body 的区间。
-- `compression` 若开启，buffer 级别压缩并按规范附带原始长度头。
+- Both `nodes` and `buffers` are produced by a "pre-order flatten" of the schema tree.
+- `Buffer.offset/length` are ranges relative to the body of this message.
+- When `compression` is enabled, compression is applied per buffer, and each buffer carries a raw-length prefix as specified.
 
-#### DictionaryBatch（字典载荷）
+#### DictionaryBatch (Dictionary Payload)
 
-`DictionaryBatch` 是“给某个 dictionary id 发送字典值”的专用消息：
+`DictionaryBatch` is a dedicated message that "sends the dictionary values for a given dictionary id":
 
 ```text
 DictionaryBatch {
@@ -134,171 +134,171 @@ DictionaryBatch {
 }
 ```
 
-语义：
+Semantics:
 
-- `id`：对应 `Field.dictionary.id`。
-- `data`：字典值本身（也是一个 `RecordBatch`）。
-- `isDelta=false`：替换现有字典。
-- `isDelta=true`：把本批字典值 append 到已有字典末尾。
+- `id`: corresponds to `Field.dictionary.id`.
+- `data`: the dictionary values themselves (also a `RecordBatch`).
+- `isDelta=false`: replaces the existing dictionary.
+- `isDelta=true`: appends this batch's dictionary values to the end of the existing dictionary.
 
-实现要点：
+Implementation notes:
 
-- Writer 需要维护 `dictionary id -> last dictionary` 状态，决定发 full 还是 delta。
-- Reader 必须先消费/更新字典，再解码后续使用该 id 的 `RecordBatch`。
+- The writer must maintain a `dictionary id -> last dictionary` state to decide whether to send a full or a delta dictionary.
+- The reader must consume and update the dictionary first, before decoding subsequent `RecordBatch` messages that use that id.
 
-### 2.2 Encapsulated Message 格式
+### 2.2 Encapsulated Message Format
 
-每条 IPC 消息（stream/file）按下列结构封包：
+Each IPC message (stream or file) is wrapped with the following structure:
 
-1. 32-bit continuation indicator（有效值 `0xFFFFFFFF`）
+1. 32-bit continuation indicator (valid value `0xFFFFFFFF`)
 2. 32-bit little-endian metadata length
-3. FlatBuffers `Message` 元数据
-4. padding（对齐到 8 字节边界）
-5. body（长度需为 8 字节倍数）
+3. FlatBuffers `Message` metadata
+4. padding (aligned to an 8-byte boundary)
+5. body (length must be a multiple of 8 bytes)
 
-这保证了消息可重定位、可零拷贝重建结构。
+This ensures that messages are relocatable and that structures can be rebuilt with zero copy.
 
 ### 2.3 Streaming Format
 
-流格式顺序：
+Order in the stream format:
 
 1. `Schema`
-2. 若干 `DictionaryBatch`
-3. 若干 `RecordBatch`
-4. 可选 `EOS`：`0xFFFFFFFF 0x00000000`
+2. zero or more `DictionaryBatch` messages
+3. zero or more `RecordBatch` messages
+4. optional `EOS`: `0xFFFFFFFF 0x00000000`
 
-关键规则：
+Key rules:
 
-- `DictionaryBatch` 与 `RecordBatch` 可交错；
-- 但在 stream 中，某字典 key 被使用前，通常应先出现对应 dictionary；
-- 写端可通过 EOS 或关闭流来结束。
+- `DictionaryBatch` and `RecordBatch` messages may be interleaved;
+- but in a stream, the corresponding dictionary usually must appear before a dictionary key is used;
+- the writer can end the stream with EOS or by closing the stream.
 
-### 2.4 File Format（随机访问）
+### 2.4 File Format (Random Access)
 
-文件格式 = stream 格式 + footer：
+File format = stream format + footer:
 
-- 文件头魔数：`ARROW1`
-- 文件尾魔数：`ARROW1`
-- 尾部有 footer（包含 schema 副本与各数据块偏移/长度），用于随机访问 RecordBatch
+- File header magic: `ARROW1`
+- File trailer magic: `ARROW1`
+- The trailer contains a footer (with a copy of the schema and the offset/length of each data block), which enables random access to RecordBatches
 
-补充：
+Additional notes:
 
-- 文件中对 dictionary 的出现顺序比 stream 更宽松（只要在文件中定义过即可）；
-- 但同一 dictionary id 不能有多个“非 delta”替换批次。
+- In a file, dictionaries may appear in a looser order than in a stream (they only need to be defined somewhere in the file);
+- but the same dictionary id must not have more than one "non-delta" replacement batch.
 
-## 3. C 实现原理（推荐路径）
+## 3. C Implementation Principles (Recommended Path)
 
-### 3.1 以 C Data Interface 作为 ABI 核心
+### 3.1 The C Data Interface as the ABI Core
 
-C 侧最小可互操作单元是两个结构体：
+The minimal interoperable unit on the C side is two structs:
 
-- `ArrowSchema`：描述类型与元数据
-- `ArrowArray`：描述数据本体（buffers/children/dictionary）
+- `ArrowSchema`: describes the type and metadata
+- `ArrowArray`: describes the data itself (buffers/children/dictionary)
 
-重点不是“调用某个大库 API”，而是严格遵循这两个结构体的字段语义和生命周期契约。
+The key point is not calling some large library API, but strictly following the field semantics and lifetime contract of these two structs.
 
-### 3.2 生命周期与所有权模型
+### 3.2 Lifetime and Ownership Model
 
-C Data Interface 的核心机制：
+Core mechanics of the C Data Interface:
 
-- 生产者填充结构体 + 设置 `release` 回调；
-- 消费者使用后调用 `release`；
-- 结构体“释放态”由 `release == NULL` 表示；
-- move 语义通过“浅拷贝后将源标记为 released”实现。
+- The producer fills in the struct and sets the `release` callback;
+- The consumer calls `release` after use;
+- The "released" state of a struct is represented by `release == NULL`;
+- Move semantics are implemented by shallow-copying the struct and then marking the source as released.
 
-实现结论：C 实现的稳定性关键在于 **release 回调递归释放 children/dictionary/private_data** 是否严格正确。
+Implementation conclusion: the stability of a C implementation depends critically on whether the **release callback correctly and recursively releases children/dictionary/private_data**.
 
-### 3.3 多批次传输：C Stream Interface
+### 3.3 Multi-Batch Transfer: C Stream Interface
 
-`ArrowArrayStream` 通过回调提供 pull 模式：
+`ArrowArrayStream` provides a pull model through callbacks:
 
 - `get_schema`
 - `get_next`
 - `get_last_error`
 - `release`
 
-`get_next` 返回 released array 表示 EOS。  
-这层接口可直接承载数据库/执行引擎批处理输出，不需要 IPC 反序列化步骤。
+Returning a released array from `get_next` signals EOS.  
+This layer can directly carry batch output from a database or execution engine, without an IPC deserialization step.
 
-### 3.4 实践建议：nanoarrow
+### 3.4 Practical Recommendation: nanoarrow
 
-如果目标是“轻量 C/C++ Arrow API”，可优先 nanoarrow：
+If the goal is a "lightweight C/C++ Arrow API", prefer nanoarrow:
 
-- 直接围绕 C Data Interface 实现；
-- 体积小、易 vendoring；
-- 适合做 C ABI 边界层（而非完整分析引擎）。
+- It is built directly around the C Data Interface;
+- It is small and easy to vendor;
+- It suits the C ABI boundary layer (rather than a full analytics engine).
 
-## 4. Rust（arrow-rs）实现原理
+## 4. Rust (arrow-rs) Implementation Principles
 
-### 4.1 分层架构（最关键）
+### 4.1 Layered Architecture (Most Important)
 
-arrow-rs 不是一个单 crate，而是分层：
+arrow-rs is not a single crate but a set of layers:
 
-- `arrow-schema`：逻辑类型（`DataType` / `Field` / `Schema`）
-- `arrow-buffer`：底层共享内存与 bit/byte buffer 抽象
-- `arrow-data`：`ArrayData` 与 layout 校验、低层构造
-- `arrow-array`：强类型数组与 builder、`dyn Array` 类型擦除
-- `arrow-ipc`：Stream/File 读写与 IPC 编解码
+- `arrow-schema`: logical types (`DataType` / `Field` / `Schema`)
+- `arrow-buffer`: low-level shared memory and bit/byte buffer abstractions
+- `arrow-data`: `ArrayData` and layout validation, low-level construction
+- `arrow-array`: strongly typed arrays and builders, `dyn Array` type erasure
+- `arrow-ipc`: Stream/File reading and writing, IPC encoding/decoding
 
-实现建议：先用 `arrow-data` 心智模型（buffers/children/layout），再上 `arrow-array` API。
+Implementation advice: first adopt the `arrow-data` mental model (buffers/children/layout), then move up to the `arrow-array` API.
 
-### 4.2 IPC 在 Rust 里的对应
+### 4.2 IPC in Rust
 
-`arrow-ipc` 明确区分两类：
+`arrow-ipc` explicitly distinguishes two kinds:
 
-1. Streaming：`StreamReader` / `StreamWriter`
-2. File：`FileReader` / `FileWriter`
+1. Streaming: `StreamReader` / `StreamWriter`
+2. File: `FileReader` / `FileWriter`
 
-语义上和规范一一对应：
+These correspond one-to-one with the specification:
 
-- stream 面向连续读取；
-- file 依赖 footer 支持随机访问；
-- writer 结束阶段负责写 termination/footer（例如 `finish` / `close`）。
+- A stream is designed for sequential reading;
+- A file relies on the footer to support random access;
+- The writer is responsible for writing the termination/footer at the end (for example via `finish` / `close`).
 
-### 4.3 Rust 与 C ABI 互操作
+### 4.3 Rust and C ABI Interoperability
 
-arrow-rs 在 `ffi` / `ffi_stream` 模块提供 C 接口桥接：
+arrow-rs provides C interface bridging in the `ffi` / `ffi_stream` modules:
 
-- C Data Interface：`ArrowSchema` / `ArrowArray` 对应 Rust FFI 结构；
-- C Stream Interface：`ArrowArrayStream` 对应 `FFI_ArrowArrayStream`；
-- 可将 C 侧批流导入为 Rust `RecordBatchReader`，也可反向导出。
+- C Data Interface: `ArrowSchema` / `ArrowArray` correspond to the Rust FFI structs;
+- C Stream Interface: `ArrowArrayStream` corresponds to `FFI_ArrowArrayStream`;
+- C-side batch streams can be imported as a Rust `RecordBatchReader`, and the reverse export is also possible.
 
-这使 Rust 可作为“计算内核”，C 侧作为“系统边界层”。
+This lets Rust serve as the "compute kernel" and the C side as the "system boundary layer".
 
-## 5. C 与 Rust 的落地分工建议
+## 5. Recommended Division of Work Between C and Rust
 
-推荐分层：
+Recommended layering:
 
-1. C 层：进程内 ABI 边界（C Data/C Stream，负责生命周期与零拷贝交接）
-2. Rust 层：类型安全构造、校验、计算与 IPC 编解码
-3. 传输层：跨进程/落盘时使用 IPC Stream/File
+1. C layer: the in-process ABI boundary (C Data/C Stream, responsible for lifetime and zero-copy handoff)
+2. Rust layer: type-safe construction, validation, computation, and IPC encoding/decoding
+3. Transport layer: IPC Stream/File when crossing processes or writing to disk
 
-一句话总结：
+One-sentence summary:
 
-- **进程内**优先 C Data/C Stream（无 FlatBuffers 依赖、零拷贝）。
-- **进程间/持久化**使用 IPC（可流式、可随机访问、可压缩）。
+- **In-process**: prefer C Data/C Stream (no FlatBuffers dependency, zero-copy).
+- **Inter-process/persistence**: use IPC (streamable, random-access, compressible).
 
-## 6. 与本仓库（zarrow）的对应点
+## 6. Correspondence with This Repository (zarrow)
 
-本项目已覆盖上述关键路径，可重点对照：
+This project already covers the key paths above; the following are worth cross-referencing:
 
-- IPC：`src/ipc/`
-- FlatBuffers 协议定义：`src/format/*.fbs`
-- C Data Interface 相关：`src/ffi/c_data.zig`
-- ArrayData 与布局校验：`src/array/array_data.zig`
+- IPC: `src/ipc/`
+- FlatBuffers protocol definitions: `src/format/*.fbs`
+- C Data Interface related: `src/ffi/c_data.zig`
+- ArrayData and layout validation: `src/array/array_data.zig`
 
-## 7. 实例（可直接运行/改写）
+## 7. Examples (Runnable and Modifiable)
 
-### 7.1 Zig：IPC Stream 写读回环（zarrow）
+### 7.1 Zig: IPC Stream Write/Read Round Trip (zarrow)
 
-仓库现成示例：`examples/ipc_stream.zig`  
-运行：
+Existing example in the repository: `examples/ipc_stream.zig`  
+Run:
 
 ```sh
 zig build example-ipc_stream
 ```
 
-核心流程代码（和示例一致）：
+Core flow code (matches the example):
 
 ```zig
 const std = @import("std");
@@ -356,9 +356,9 @@ pub fn main() !void {
 }
 ```
 
-### 7.2 Zig：C Data Interface 导出/导入示例
+### 7.2 Zig: C Data Interface Export/Import Example
 
-这个例子展示“进程内零拷贝交接”最核心路径：
+This example shows the core path of "zero-copy in-process handoff":
 
 ```zig
 const std = @import("std");
@@ -393,7 +393,7 @@ pub fn main() !void {
 }
 ```
 
-### 7.3 Rust：arrow-rs IPC Stream 示例
+### 7.3 Rust: arrow-rs IPC Stream Example
 
 ```rust
 use std::sync::Arc;
@@ -431,77 +431,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## 8. 代码逻辑实现（zarrow 源码级）
+## 8. Code Logic Implementation (zarrow Source Level)
 
-### 8.1 IPC Writer 逻辑链
+### 8.1 IPC Writer Logic Chain
 
-对应文件：`src/ipc/stream_writer.zig`
+Corresponding file: `src/ipc/stream_writer.zig`
 
-1. `writeSchema()`：构建 Schema FlatBuffers 并写消息头  
-   入口：`writeSchema`（:186）  
-   核心：`buildSchemaT`（:556） -> `writeMessage`（:328）
-2. `writeRecordBatch()`：扫描字段、处理 dictionary、构建 RecordBatch 元数据与 body  
-   入口：`writeRecordBatch`（:216）  
-   关键动作：字典状态缓存（`dictionary_values`）+ body compression 选择
-3. `writeEnd()`：输出流结束标记（EOS）  
-   入口：`writeEnd`（:321）
+1. `writeSchema()`: builds the Schema FlatBuffers and writes the message header  
+   Entry: `writeSchema` (:186)  
+   Core: `buildSchemaT` (:556) -> `writeMessage` (:328)
+2. `writeRecordBatch()`: scans fields, handles dictionaries, builds the RecordBatch metadata and body  
+   Entry: `writeRecordBatch` (:216)  
+   Key actions: dictionary state caching (`dictionary_values`) + body compression selection
+3. `writeEnd()`: emits the stream end marker (EOS)  
+   Entry: `writeEnd` (:321)
 
-一句话：Writer 的职责是“把 `ArrayData tree` 线性化为 IPC 消息序列，并维持字典状态机”。
+In one sentence: the Writer's responsibility is to "linearize the `ArrayData tree` into an IPC message sequence and maintain the dictionary state machine".
 
-### 8.2 IPC Reader 逻辑链
+### 8.2 IPC Reader Logic Chain
 
-对应文件：`src/ipc/stream_reader.zig`
+Corresponding file: `src/ipc/stream_reader.zig`
 
-1. `readSchema()`：读取首个 Schema 消息并建立 `SchemaRef`  
-   入口：`readSchema`（:174）  
-   核心：`readMessage`（:352） -> `buildSchemaFromFlatbufWithEndiannessMode`（:687）
-2. `nextRecordBatch()`：循环取消息，先吞掉 dictionary，再产出 batch  
-   入口：`nextRecordBatch`（:193）  
-   核心：`readMessageOptional`（:281）  
-   Dictionary 分支：`ingestDictionaryBatchWithMap`（:1702）  
-   RecordBatch 分支：`buildRecordBatchFromFlatbuf`（:1119）
+1. `readSchema()`: reads the first Schema message and establishes a `SchemaRef`  
+   Entry: `readSchema` (:174)  
+   Core: `readMessage` (:352) -> `buildSchemaFromFlatbufWithEndiannessMode` (:687)
+2. `nextRecordBatch()`: loops over messages, consumes dictionaries first, then yields a batch  
+   Entry: `nextRecordBatch` (:193)  
+   Core: `readMessageOptional` (:281)  
+   Dictionary branch: `ingestDictionaryBatchWithMap` (:1702)  
+   RecordBatch branch: `buildRecordBatchFromFlatbuf` (:1119)
 
-一句话：Reader 的职责是“按消息顺序恢复 schema + dictionary 上下文，再重建列数据”。
+In one sentence: the Reader's responsibility is to "restore the schema and dictionary context in message order, then rebuild the column data".
 
-### 8.3 C Data 导入导出逻辑链
+### 8.3 C Data Import/Export Logic Chain
 
-对应文件：`src/ffi/c_data.zig`
+Corresponding file: `src/ffi/c_data.zig`
 
-1. Schema：
-- 导出：`exportSchema`（:120） -> `releaseExportedSchema`（:338）
-- 导入：`importSchemaOwned`（:126）
-2. Array：
-- 导出：`exportArray`（:153） -> `exportArrayRecursive`（:368） -> `releaseExportedArray`（:426）
-- 导入：`importArray`（:157） -> `importArrayRecursive`（:671）
-3. 生命周期关键点：
-- importer 接管所有权后，会将输入 `c_array.release = null`（避免双释放）
-- `ownerRelease`（:108）负责真正触发 C 侧 release 并销毁 owner
+1. Schema:
+- Export: `exportSchema` (:120) -> `releaseExportedSchema` (:338)
+- Import: `importSchemaOwned` (:126)
+2. Array:
+- Export: `exportArray` (:153) -> `exportArrayRecursive` (:368) -> `releaseExportedArray` (:426)
+- Import: `importArray` (:157) -> `importArrayRecursive` (:671)
+3. Key lifetime points:
+- After the importer takes ownership, it sets the input `c_array.release = null` (to avoid double release)
+- `ownerRelease` (:108) is responsible for actually triggering the C-side release and destroying the owner
 
-一句话：FFI 的核心不是“拷贝数据”，而是“严格转移所有权并保证 release 回调可重入、可递归”。
+In one sentence: the core of FFI is not "copying data" but "strictly transferring ownership and ensuring the release callback is reentrant and recursive".
 
-## 9. 官方来源（Primary Sources）
+## 9. Primary Sources
 
-- Arrow Columnar Format（规范主文档，Version 1.5）：  
+- Arrow Columnar Format (main specification document, Version 1.5):  
   https://arrow.apache.org/docs/format/Columnar.html
-- Arrow C Data Interface：  
+- Arrow C Data Interface:  
   https://arrow.apache.org/docs/format/CDataInterface.html
-- Arrow C Stream Interface：  
+- Arrow C Stream Interface:  
   https://arrow.apache.org/docs/format/CStreamInterface.html
-- Arrow C++ IPC API：  
+- Arrow C++ IPC API:  
   https://arrow.apache.org/docs/cpp/api/ipc.html
-- Arrow C++ Memory Management：  
+- Arrow C++ Memory Management:  
   https://arrow.apache.org/docs/cpp/memory.html
-- Arrow C++ C Interfaces（Import/Export C ABI）：  
+- Arrow C++ C Interfaces (Import/Export C ABI):  
   https://arrow.apache.org/docs/cpp/api/c_abi.html
-- arrow-rs crate docs（总体）：  
+- arrow-rs crate docs (overall):  
   https://docs.rs/arrow/latest/arrow/
-- arrow-ipc crate docs：  
+- arrow-ipc crate docs:  
   https://docs.rs/arrow-ipc/latest/arrow_ipc/
-- arrow-array crate docs：  
+- arrow-array crate docs:  
   https://docs.rs/arrow-array/latest/arrow_array/
-- arrow-data crate docs：  
+- arrow-data crate docs:  
   https://docs.rs/arrow-data/latest/arrow_data/
-- arrow-buffer crate docs：  
+- arrow-buffer crate docs:  
   https://docs.rs/arrow-buffer/latest/arrow_buffer/
-- nanoarrow 文档（轻量 C/C++ 实践）：  
+- nanoarrow documentation (lightweight C/C++ practice):  
   https://arrow.apache.org/nanoarrow/latest/getting-started/cpp.html
