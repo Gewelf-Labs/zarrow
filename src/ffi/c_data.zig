@@ -92,6 +92,8 @@ const ExportedArrayPrivate = struct {
     children_storage: []ArrowArray,
     children_ptrs: []?*ArrowArray,
     dict_storage: ?*ArrowArray,
+    /// string_view / binary_view: the trailing C buffer of variadic data buffer sizes.
+    variadic_sizes: []i64 = &.{},
 };
 
 const ImportedArrayOwner = struct {
@@ -379,13 +381,28 @@ fn exportArrayRecursive(allocator: std.mem.Allocator, arr: ArrayRef) Error!Arrow
         .dict_storage = null,
     };
 
-    const n_buffers = data.buffers.len;
+    // View arrays carry their data buffers only; the C Data Interface adds a final buffer
+    // holding the int64 size of each variadic data buffer.
+    const is_view = switch (storageDataType(data.data_type)) {
+        .string_view, .binary_view => true,
+        else => false,
+    };
+    if (is_view) {
+        if (data.buffers.len < 2) return error.InvalidBufferCount;
+        priv.variadic_sizes = try allocator.alloc(i64, data.buffers.len - 2);
+        errdefer allocator.free(priv.variadic_sizes);
+        for (priv.variadic_sizes, data.buffers[2..]) |*size, buf| size.* = std.math.cast(i64, buf.len()) orelse return error.InvalidLength;
+    }
+    errdefer if (priv.variadic_sizes.len > 0) allocator.free(priv.variadic_sizes);
+
+    const n_buffers = data.buffers.len + @intFromBool(is_view);
     if (n_buffers > 0) {
         priv.buffers_ptrs = try allocator.alloc(?*const anyopaque, n_buffers);
         errdefer allocator.free(priv.buffers_ptrs);
         for (data.buffers, 0..) |buf, i| {
             priv.buffers_ptrs[i] = if (buf.len() == 0) null else @ptrCast(buf.data.ptr);
         }
+        if (is_view) priv.buffers_ptrs[n_buffers - 1] = if (priv.variadic_sizes.len == 0) null else @ptrCast(priv.variadic_sizes.ptr);
     }
 
     if (data.children.len > 0) {
@@ -445,6 +462,7 @@ fn releaseExportedArray(raw: ?*ArrowArray) callconv(.c) void {
     if (priv.children_ptrs.len > 0) priv.allocator.free(priv.children_ptrs);
     if (priv.children_storage.len > 0) priv.allocator.free(priv.children_storage);
     if (priv.buffers_ptrs.len > 0) priv.allocator.free(priv.buffers_ptrs);
+    if (priv.variadic_sizes.len > 0) priv.allocator.free(priv.variadic_sizes);
 
     var retained = priv.retained_ref;
     retained.release();
@@ -506,6 +524,21 @@ fn importField(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!Field
 
 fn importDataType(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!DataType {
     const fmt = cString(c_schema.format) orelse return error.InvalidFormat;
+
+    // A dictionary-encoded field's format is its index type: check the dictionary first, or the
+    // field would import as a plain integer column without its dictionary.
+    if (c_schema.dictionary != null) {
+        const idx = intTypeFromFormat(fmt) orelse return error.InvalidFormat;
+        const dict_field = try importField(allocator, c_schema.dictionary.?);
+        const value_type = try allocator.create(DataType);
+        value_type.* = dict_field.data_type.*;
+        return DataType{ .dictionary = .{
+            .id = null,
+            .index_type = idx,
+            .value_type = value_type,
+            .ordered = (c_schema.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0,
+        } };
+    }
 
     if (std.mem.eql(u8, fmt, "n")) return DataType{ .null = {} };
     if (std.mem.eql(u8, fmt, "b")) return DataType{ .bool = {} };
@@ -652,19 +685,6 @@ fn importDataType(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!Da
         return DataType{ .fixed_size_list = .{ .value_field = child_field, .list_size = sz } };
     }
 
-    if (c_schema.dictionary != null) {
-        const idx = intTypeFromFormat(fmt) orelse return error.InvalidFormat;
-        const dict_field = try importField(allocator, c_schema.dictionary.?);
-        const value_type = try allocator.create(DataType);
-        value_type.* = dict_field.data_type.*;
-        return DataType{ .dictionary = .{
-            .id = null,
-            .index_type = idx,
-            .value_type = value_type,
-            .ordered = (c_schema.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0,
-        } };
-    }
-
     return error.UnsupportedType;
 }
 
@@ -698,7 +718,10 @@ fn importArrayRecursive(
 
     const total_len = std.math.add(usize, off, len) catch return error.InvalidLength;
 
-    const buffers = try allocator.alloc(SharedBuffer, n_buffers);
+    // The trailing variadic sizes buffer of a view array is C framing: it is read below to size
+    // the data buffers, but not kept, so a view's buffer index must name a real data buffer.
+    const kept_buffers = n_buffers - @intFromBool(is_view_type);
+    const buffers = try allocator.alloc(SharedBuffer, kept_buffers);
     var filled_buffers: usize = 0;
     errdefer {
         var i: usize = 0;
@@ -734,7 +757,7 @@ fn importArrayRecursive(
     }
 
     var i: usize = 0;
-    while (i < n_buffers) : (i += 1) {
+    while (i < kept_buffers) : (i += 1) {
         const needed = try neededBufferLen(layout_dt, i, total_len, offsets_i32, offsets_i64, data_buffer_len, view_variadic_lengths, n_buffers);
         const ptr_any = c_array.buffers[i];
         buffers[i] = try importBuffer(ptr_any, needed);
@@ -806,6 +829,12 @@ fn importArrayRecursive(
         error.MissingDictionary => return error.MissingDictionary,
         error.InvalidChildren => return error.InvalidChildren,
     };
+    // validateLayout only sizes the index buffer: bound every non-null index by the imported
+    // dictionary so an imported dictionary array never names a value past its dictionary.
+    if (layout_dt == .dictionary) layout.validateDictionaryIndices(layout_dt.dictionary, off, total_len) catch |err| switch (err) {
+        error.MissingDictionary => return error.MissingDictionary,
+        else => return error.InvalidOffset,
+    };
 
     return ArrayRef.fromOwnedWithOwner(allocator, layout, owner, ownerRetain, ownerRelease);
 }
@@ -860,7 +889,7 @@ fn neededBufferLen(
         .interval_month_day_nano, .decimal128 => if (idx == 1) checkedMulLen(total_len, 16) else error.UnsupportedType,
         .decimal256 => if (idx == 1) checkedMulLen(total_len, 32) else error.UnsupportedType,
         .fixed_size_binary => |fsb| if (idx == 1) checkedMulLen(total_len, std.math.cast(usize, fsb.byte_width) orelse return error.InvalidLength) else error.UnsupportedType,
-        .string, .binary, .list => {
+        .string, .binary => {
             if (idx == 1) return checkedOffsetBufferLen(i32, total_len);
             if (idx == 2) {
                 const offs = offsets_i32 orelse return error.UnsupportedType;
@@ -868,8 +897,13 @@ fn neededBufferLen(
             }
             return error.UnsupportedType;
         },
-        .map => {
+        // Lists and maps carry validity and offsets only; offsets are bounded by the child.
+        .list, .map => {
             if (idx == 1) return checkedOffsetBufferLen(i32, total_len);
+            return error.UnsupportedType;
+        },
+        .large_list => {
+            if (idx == 1) return checkedOffsetBufferLen(i64, total_len);
             return error.UnsupportedType;
         },
         .list_view => {
@@ -891,7 +925,7 @@ fn neededBufferLen(
             if (idx == 1) return checkedMulLen(total_len, @sizeOf(i32));
             return error.UnsupportedType;
         },
-        .large_string, .large_binary, .large_list => {
+        .large_string, .large_binary => {
             if (idx == 1) return checkedOffsetBufferLen(i64, total_len);
             if (idx == 2) {
                 const offs = offsets_i64 orelse return error.UnsupportedType;
@@ -960,8 +994,10 @@ fn expectedBufferCount(dt: DataType) ?i64 {
         .fixed_size_binary,
         .dictionary,
         .map,
+        .list,
+        .large_list,
         => 2,
-        .string, .binary, .large_string, .large_binary, .list, .large_list, .list_view, .large_list_view => 3,
+        .string, .binary, .large_string, .large_binary, .list_view, .large_list_view => 3,
         else => null,
     };
 }
@@ -2412,13 +2448,85 @@ test "c data array import supports list_view and large_list_view" {
     try std.testing.expect(llv_c_array.release == null);
 }
 
+test "c data dictionary field imports as dictionary and rejects indices past the dictionary" {
+    const allocator = std.testing.allocator;
+    const value_type = DataType{ .string = {} };
+    const dict_type = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 16, .signed = true }, .value_type = &value_type } };
+    const fields = [_]Field{.{ .name = "d", .data_type = &dict_type, .nullable = true }};
+    var c_schema = try exportSchema(allocator, .{ .fields = &fields });
+    var owned = try importSchemaOwned(allocator, &c_schema);
+    defer owned.deinit();
+    const imported_type = owned.schema.fields[0].data_type;
+    try std.testing.expect(imported_type.* == .dictionary);
+    try std.testing.expectEqual(@as(u8, 16), imported_type.dictionary.index_type.bit_width);
+    try std.testing.expect(imported_type.dictionary.value_type.* == .string);
+
+    const offsets = [_]i32{ 0, 1, 3, 6 };
+    const dict_bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(std.mem.sliceAsBytes(offsets[0..])), SharedBuffer.fromSlice("abbccc") };
+    var dict = try ArrayRef.fromBorrowed(allocator, .{ .data_type = value_type, .length = 3, .null_count = 0, .buffers = &dict_bufs });
+    defer dict.release();
+    // Index 3 is one past the 3-value dictionary; row 1 is null and holds garbage.
+    const validity = [_]u8{0b101};
+    for ([_][3]i16{ .{ 2, 77, 0 }, .{ 2, 77, 3 } }, [_]bool{ true, false }) |indices, ok| {
+        const bufs = [_]SharedBuffer{ SharedBuffer.fromSlice(&validity), SharedBuffer.fromSlice(std.mem.sliceAsBytes(indices[0..])) };
+        var arr = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dict_type, .length = 3, .null_count = 1, .buffers = &bufs, .dictionary = dict });
+        defer arr.release();
+        var c_array = try exportArray(allocator, arr);
+        if (ok) {
+            var back = try importArray(allocator, imported_type, &c_array);
+            defer back.release();
+            try back.data().validateFull();
+        } else {
+            try std.testing.expectError(error.InvalidOffset, importArray(allocator, imported_type, &c_array));
+        }
+    }
+}
+
+test "c data import rejects a view whose buffer index names the variadic sizes buffer" {
+    const allocator = std.testing.allocator;
+
+    // Two 16-byte data buffers; the view (13 bytes, out of line) names buffer index 2, which is
+    // the trailing sizes buffer, not a data buffer. Its prefix matches the sizes bytes so only
+    // the buffer index is wrong.
+    var view: [16]u8 = @splat(0);
+    std.mem.writeInt(u32, view[0..4], 13, .little);
+    view[4] = 16;
+    std.mem.writeInt(u32, view[8..12], 2, .little);
+    const d0: [16]u8 = @splat('a');
+    const d1: [16]u8 = @splat('b');
+    var sizes = [_]i64{ 16, 16 };
+    var bufs = [_]?*const anyopaque{ null, &view, &d0, &d1, &sizes };
+    var c_array = ArrowArray{
+        .length = 1,
+        .null_count = 0,
+        .offset = 0,
+        .n_buffers = bufs.len,
+        .n_children = 0,
+        .buffers = &bufs,
+        .children = null,
+        .dictionary = null,
+        .release = testNoopReleaseArray,
+        .private_data = null,
+    };
+    const bv_type = DataType{ .binary_view = {} };
+    try std.testing.expectError(error.InvalidOffset, importArray(allocator, &bv_type, &c_array));
+
+    // The same view naming data buffer 1 imports.
+    std.mem.writeInt(u32, view[8..12], 1, .little);
+    @memcpy(view[4..8], d1[0..4]);
+    c_array.release = testNoopReleaseArray;
+    var ok = try importArray(allocator, &bv_type, &c_array);
+    defer ok.release();
+    try std.testing.expectEqual(@as(usize, 4), ok.data().buffers.len);
+}
+
 test "c data array import supports string_view and binary_view buffers" {
     const allocator = std.testing.allocator;
 
+    // zarrow keeps [validity, views, data...]; the exported C array adds the variadic sizes buffer.
     var valid_bits = [_]u8{0x01};
     var sv_views: [16]u8 = @splat(0);
     var sv_data = [_]u8{'x'};
-    var sv_lens = [_]i64{@as(i64, sv_data.len)};
     const sv_layout = ArrayData{
         .data_type = DataType{ .string_view = {} },
         .length = 1,
@@ -2427,24 +2535,24 @@ test "c data array import supports string_view and binary_view buffers" {
             SharedBuffer.fromSlice(valid_bits[0..]),
             SharedBuffer.fromSlice(sv_views[0..]),
             SharedBuffer.fromSlice(sv_data[0..]),
-            SharedBuffer.fromSlice(std.mem.sliceAsBytes(sv_lens[0..])),
         },
     };
     var sv_ref = try ArrayRef.fromBorrowed(allocator, sv_layout);
     defer sv_ref.release();
 
     var sv_c_array = try exportArray(allocator, sv_ref);
+    try std.testing.expectEqual(@as(i64, 4), sv_c_array.n_buffers);
+    const sv_sizes: [*]const i64 = @ptrCast(@alignCast(sv_c_array.buffers[3].?));
+    try std.testing.expectEqual(@as(i64, 1), sv_sizes[0]);
     var sv_imported = try importArray(allocator, &sv_ref.data().data_type, &sv_c_array);
     defer sv_imported.release();
     try std.testing.expect(sv_imported.data().data_type == .string_view);
-    try std.testing.expectEqual(@as(usize, 4), sv_imported.data().buffers.len);
+    try std.testing.expectEqual(@as(usize, 3), sv_imported.data().buffers.len);
     try std.testing.expectEqual(@as(usize, 16), sv_imported.data().buffers[1].len());
     try std.testing.expectEqual(@as(usize, 1), sv_imported.data().buffers[2].len());
-    try std.testing.expectEqual(@as(usize, 8), sv_imported.data().buffers[3].len());
     try std.testing.expect(sv_c_array.release == null);
 
     var bv_views: [16]u8 = @splat(0);
-    const empty_lens = [_]i64{};
     const bv_layout = ArrayData{
         .data_type = DataType{ .binary_view = {} },
         .length = 1,
@@ -2452,18 +2560,17 @@ test "c data array import supports string_view and binary_view buffers" {
         .buffers = &[_]SharedBuffer{
             SharedBuffer.fromSlice(valid_bits[0..]),
             SharedBuffer.fromSlice(bv_views[0..]),
-            SharedBuffer.fromSlice(std.mem.sliceAsBytes(empty_lens[0..])),
         },
     };
     var bv_ref = try ArrayRef.fromBorrowed(allocator, bv_layout);
     defer bv_ref.release();
 
     var bv_c_array = try exportArray(allocator, bv_ref);
+    try std.testing.expectEqual(@as(i64, 3), bv_c_array.n_buffers);
     var bv_imported = try importArray(allocator, &bv_ref.data().data_type, &bv_c_array);
     defer bv_imported.release();
     try std.testing.expect(bv_imported.data().data_type == .binary_view);
-    try std.testing.expectEqual(@as(usize, 3), bv_imported.data().buffers.len);
+    try std.testing.expectEqual(@as(usize, 2), bv_imported.data().buffers.len);
     try std.testing.expectEqual(@as(usize, 16), bv_imported.data().buffers[1].len());
-    try std.testing.expectEqual(@as(usize, 0), bv_imported.data().buffers[2].len());
     try std.testing.expect(bv_c_array.release == null);
 }

@@ -177,7 +177,7 @@ pub const ArrayData = struct {
         return null_count;
     }
 
-    fn fixedWidthByteSize(dt: DataType) ?usize {
+    pub fn fixedWidthByteSize(dt: DataType) ?usize {
         return switch (dt) {
             .bool => 1,
             .uint8, .int8 => 1,
@@ -445,7 +445,7 @@ pub const ArrayData = struct {
         }
     }
 
-    fn validateDictionaryIndices(self: Self, dict: datatype.DictionaryType, start: usize, end: usize) ValidationError!void {
+    pub fn validateDictionaryIndices(self: Self, dict: datatype.DictionaryType, start: usize, end: usize) ValidationError!void {
         if (self.buffers.len < 2) return error.InvalidBufferCount;
         const dictionary_ref = self.dictionary orelse return error.MissingDictionary;
         const dictionary_len = dictionary_ref.data().length;

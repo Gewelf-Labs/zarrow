@@ -362,3 +362,70 @@ test "c api stream import/export keeps callbacks and avoids materialization" {
 
     if (out.release) |release_fn| release_fn(&out);
 }
+
+test "c api abi version is 1" {
+    try std.testing.expectEqual(@as(u32, 1), zarrow_c_abi_version());
+}
+
+var counted_release_calls: usize = 0;
+var counted_array_release: ?*const fn (?*ffi.ArrowArray) callconv(.c) void = null;
+var counted_stream_release: ?*const fn (?*ffi.ArrowArrayStream) callconv(.c) void = null;
+
+fn countingArrayRelease(raw: ?*ffi.ArrowArray) callconv(.c) void {
+    counted_release_calls += 1;
+    counted_array_release.?(raw);
+}
+
+fn countingStreamRelease(raw: ?*ffi.ArrowArrayStream) callconv(.c) void {
+    counted_release_calls += 1;
+    counted_stream_release.?(raw);
+}
+
+test "c api release functions run the producer release callback exactly once" {
+    // The producer side uses the leak-checking allocator: a release that never reaches it fails.
+    const allocator = std.testing.allocator;
+    const id_type = DataType{ .int32 = {} };
+    const fields = [_]datatype.Field{.{ .name = "id", .data_type = &id_type, .nullable = false }};
+    const schema = schema_mod.Schema{ .fields = fields[0..] };
+    var ids = try @import("compute/test_common.zig").makeInt32Array(allocator, &.{ 1, 2, 3 });
+    defer ids.release();
+    var batch = try record_batch_mod.RecordBatch.initBorrowed(allocator, schema, &[_]ffi.c_stream.ArrayRef{ids});
+    defer batch.deinit();
+
+    var src = try ffi.exportRecordBatchStream(allocator, schema, &[_]record_batch_mod.RecordBatch{batch});
+    var c_schema = releasedArrowSchema();
+    try std.testing.expectEqual(@as(c_int, 0), src.get_schema.?(&src, &c_schema));
+    var schema_handle: ?*SchemaHandle = null;
+    try std.testing.expectEqual(ZARROW_C_STATUS_OK, zarrow_c_import_schema(&c_schema, &schema_handle));
+    try std.testing.expect(c_schema.release == null); // the schema is copied and released on import
+
+    var c_array = releasedArrowArray();
+    try std.testing.expectEqual(@as(c_int, 0), src.get_next.?(&src, &c_array));
+    counted_release_calls = 0;
+    counted_array_release = c_array.release;
+    c_array.release = countingArrayRelease;
+    var array_handle: ?*ArrayHandle = null;
+    try std.testing.expectEqual(ZARROW_C_STATUS_OK, zarrow_c_import_array(schema_handle, &c_array, &array_handle));
+    zarrow_c_release_schema(schema_handle);
+
+    // Re-exporting shares the imported buffers; releasing that export keeps the producer alive.
+    var exported = releasedArrowArray();
+    try std.testing.expectEqual(ZARROW_C_STATUS_OK, zarrow_c_export_array(array_handle, &exported));
+    exported.release.?(&exported);
+    try std.testing.expectEqual(@as(usize, 0), counted_release_calls);
+    zarrow_c_release_array(array_handle);
+    try std.testing.expectEqual(@as(usize, 1), counted_release_calls);
+
+    counted_release_calls = 0;
+    counted_stream_release = src.release;
+    src.release = countingStreamRelease;
+    var stream_handle: ?*StreamHandle = null;
+    try std.testing.expectEqual(ZARROW_C_STATUS_OK, zarrow_c_import_stream(&src, &stream_handle));
+    zarrow_c_release_stream(stream_handle);
+    try std.testing.expectEqual(@as(usize, 1), counted_release_calls);
+
+    // Null handles are ignored.
+    zarrow_c_release_schema(null);
+    zarrow_c_release_array(null);
+    zarrow_c_release_stream(null);
+}

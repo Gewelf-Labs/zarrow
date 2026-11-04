@@ -89,9 +89,9 @@ fn checkFixture(reader: anytype, fixture_case: FixtureCase) !void {
     switch (fixture_case) {
         .canonical => try checkCanonical(reader),
         .dict_delta => try checkDictionaryDelta(reader),
-        .ree => try checkRee(reader),
-        .ree_int16 => try checkRee(reader),
-        .ree_int64 => try checkRee(reader),
+        .ree => try checkRee(reader, 32),
+        .ree_int16 => try checkRee(reader, 16),
+        .ree_int64 => try checkRee(reader, 64),
         .complex => try checkComplex(reader),
         .extension => try checkExtension(reader),
         .view => try checkView(reader),
@@ -214,16 +214,15 @@ fn checkExtension(reader: anytype) !void {
     if (done != null) return error.UnexpectedExtraBatch;
 }
 
-fn checkRee(reader: anytype) !void {
+/// `run_end_bits` is the run-end width the fixture case names (ree: 32, ree-int16: 16, ree-int64: 64).
+fn checkRee(reader: anytype, run_end_bits: u8) !void {
     const schema = try reader.readSchema();
     if (schema.fields.len != 1) return error.InvalidSchema;
     if (!std.mem.eql(u8, schema.fields[0].name, "ree")) return error.InvalidSchema;
     if (schema.fields[0].data_type.* != .run_end_encoded) return error.InvalidSchema;
     const ree_dt = schema.fields[0].data_type.run_end_encoded;
     if (!ree_dt.run_end_type.signed) return error.InvalidSchema;
-    if (ree_dt.run_end_type.bit_width != 16 and ree_dt.run_end_type.bit_width != 32 and ree_dt.run_end_type.bit_width != 64) {
-        return error.InvalidSchema;
-    }
+    if (ree_dt.run_end_type.bit_width != run_end_bits) return error.InvalidSchema;
     if (ree_dt.value_type.* != .int32) return error.InvalidSchema;
 
     const batch_opt = try reader.nextRecordBatch();

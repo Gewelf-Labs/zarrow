@@ -9,6 +9,7 @@ const fbs_lite_builder = @import("fbs_lite/builder.zig");
 const fbs_lite_verify = @import("fbs_lite/verify.zig");
 const compression_dynlib = @import("compression_dynlib.zig");
 const tensor_types = @import("tensor_types.zig");
+const concat_array_refs = @import("../concat_array_refs.zig");
 const arrow_fbs = @import("ipc_schema");
 
 pub const StreamError = format.StreamError;
@@ -281,11 +282,22 @@ pub const StreamWriter = struct {
         self.variadic_buffer_counts.clearRetainingCapacity();
         self.body_buffers.clearRetainingCapacity();
 
+        // Compacted copies of sliced columns; their buffers stay referenced until the body is written.
+        var compacted = try std.ArrayList(ArrayRef).initCapacity(self.allocator, 0);
+        defer {
+            for (compacted.items) |*arr| arr.release();
+            compacted.deinit(self.allocator);
+        }
+
         var body_offset: u64 = 0;
         for (batch.columns) |col| {
+            const col_data = if (try compactForIpc(self.allocator, col.data())) |arr| blk: {
+                try compacted.append(self.allocator, arr);
+                break :blk arr.data();
+            } else col.data();
             try appendArrayMeta(
                 self.allocator,
-                col.data(),
+                col_data,
                 &self.nodes,
                 &self.buffers,
                 &self.variadic_buffer_counts,
@@ -970,10 +982,12 @@ fn writeDictionaryBatch(
     var body_buffers = try std.ArrayList(array_data.SharedBuffer).initCapacity(allocator, 0);
     defer body_buffers.deinit(allocator);
 
+    var compacted = try compactForIpc(allocator, dictionary_data);
+    defer if (compacted) |*arr| arr.release();
     var body_offset: u64 = 0;
     try appendArrayMeta(
         allocator,
-        dictionary_data,
+        if (compacted) |arr| arr.data() else dictionary_data,
         &nodes,
         &buffers,
         &variadic_buffer_counts,
@@ -1200,6 +1214,26 @@ fn bitAt(buf: array_data.SharedBuffer, bit_index: usize) bool {
     return @import("../bitmap.zig").bitIsSet(buf.data, bit_index);
 }
 
+/// IPC buffers carry no offset, so an array that is (or holds a child that is) a slice is
+/// rewritten at offset 0 before its buffers are emitted. Null when `data` has no offset.
+/// Dictionary values are not part of the body; they are compacted by writeDictionaryBatch.
+fn compactForIpc(allocator: std.mem.Allocator, data: *const ArrayData) WriterError!?ArrayRef {
+    if (!hasSliceOffset(data)) return null;
+    const parts = [_]ArrayRef{try ArrayRef.fromBorrowed(allocator, data.*)};
+    var part = parts[0];
+    defer part.release();
+    return concat_array_refs.concatArrayRefs(allocator, data.data_type, &parts) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => StreamError.InvalidMetadata,
+    };
+}
+
+fn hasSliceOffset(data: *const ArrayData) bool {
+    if (data.offset != 0) return true;
+    for (data.children) |child| if (hasSliceOffset(child.data())) return true;
+    return false;
+}
+
 fn appendArrayMeta(
     allocator: std.mem.Allocator,
     data: *const ArrayData,
@@ -1305,9 +1339,11 @@ fn compressInto(codec: BodyCompressionCodec, zstd_cctx: ?*anyopaque, out: []u8, 
     return written;
 }
 
+/// Null count of an array whose count is unknown (a slice): every row of a null-type array is
+/// null, other layouts count their validity bitmap.
 fn computeNullCount(data: *const ArrayData) usize {
-    const validity = data.validity() orelse return 0;
-    return validity.countNulls();
+    var copy = data.*;
+    return copy.nullCount();
 }
 
 fn parseGoldenHexCsv(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -1608,6 +1644,22 @@ test "ipc writer emits dictionary delta on append-only dictionary growth" {
     try std.testing.expectEqual(@as(usize, 2), dict_flags.items.len);
     try std.testing.expectEqual(false, dict_flags.items[0]);
     try std.testing.expectEqual(true, dict_flags.items[1]);
+
+    // The delta carries the appended value ("green"), not the dictionary's first rows: the
+    // delta is a slice of the new dictionary and is compacted before its buffers are written.
+    var again: std.Io.Reader = .fixed(out.written());
+    var stream_reader = @import("stream_reader.zig").StreamReader.init(allocator, &again);
+    defer stream_reader.deinit();
+    _ = try stream_reader.readSchema();
+    for ([_][]const []const u8{ &.{ "red", "blue" }, &.{"green"} }) |want| {
+        var batch = (try stream_reader.nextRecordBatch()) orelse return error.TestUnexpectedResult;
+        defer batch.deinit();
+        const col = batch.columns[0].data();
+        try col.validateFull();
+        const indices = try col.buffers[1].typedSlice(i32);
+        const values = @import("../array/string_array.zig").StringArray{ .data = col.dictionary.?.data() };
+        for (want, 0..) |w, k| try std.testing.expectEqualStrings(w, try values.value(@intCast(indices[col.offset + k])));
+    }
 }
 
 test "ipc writer emits body compression metadata and framing" {
