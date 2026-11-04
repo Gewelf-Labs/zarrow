@@ -63,7 +63,8 @@ pub const Scalar = struct {
     /// Optional owned array payload used for nested scalar values.
     ///
     /// For nested scalars this is expected to be length=1 and type-equal to
-    /// `data_type`; reference counting is managed by retain/release.
+    /// `data_type`; reference counting is managed by retain/release. A string or binary scalar
+    /// returned by a kernel also carries its one-row result array here: `value` borrows its bytes.
     payload: ?ArrayRef = null,
 
     fn nestedValueTag(data_type: DataType) ?ScalarValue {
@@ -229,6 +230,12 @@ pub const SortNullPlacement = options_mod.SortNullPlacement;
 pub const SortNaNPlacement = options_mod.SortNaNPlacement;
 pub const SortOptions = options_mod.SortOptions;
 pub const CustomOptions = options_mod.CustomOptions;
+pub const DayOfWeekOptions = options_mod.DayOfWeekOptions;
+pub const MatchSubstringOptions = options_mod.MatchSubstringOptions;
+pub const SliceOptions = options_mod.SliceOptions;
+pub const JoinNullHandling = options_mod.JoinNullHandling;
+pub const JoinOptions = options_mod.JoinOptions;
+pub const TrimOptions = options_mod.TrimOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;

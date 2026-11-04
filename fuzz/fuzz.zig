@@ -295,9 +295,11 @@ fn kernelRegistry() *const zarrow.compute.FunctionRegistry {
     return &kernel_registry.?;
 }
 
-/// add / less / sum / min_max (numeric), and_kleene / any (bool), less (strings), is_null and
-/// count (any type) on a decoded array that passed validateFull and on a slice of it: the call must
-/// succeed and an array output must validate with the input length.
+/// add / less / sum / min_max (numeric), and_kleene / any (bool), less and string kernels
+/// (strings), temporal extraction (dates, timestamps), cast (numbers, strings, binaries, dates,
+/// timestamps, dictionaries), is_null and count (any type) on a decoded array that passed
+/// validateFull and on a slice of it: the call must succeed (or fail with an expected error such as
+/// InvalidCast) and an array output must validate with the input length.
 fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
     var ctx = zarrow.compute.ExecContext.initWithConfig(gpa, kernelRegistry(), .{ .overflow_mode = .wrapping });
     for ([_]ArrayRef{ arr, sliced }) |a| {
@@ -319,15 +321,53 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectKernel(&ctx, "less", .scalar, &binary, len, false);
                 expectKernel(&ctx, "any", .aggregate, &.{d}, null, false);
             },
-            .string, .large_string, .string_view => expectKernel(&ctx, "less", .scalar, &binary, len, false),
+            .string, .large_string, .string_view => {
+                expectKernel(&ctx, "less", .scalar, &binary, len, false);
+                // validateFull passed, so the values are UTF-8: the utf8 kernels must succeed.
+                expectCall(&ctx, "utf8_upper", .scalar, &.{d}, .none, len, &.{});
+                expectCall(&ctx, "utf8_slice_codeunits", .scalar, &.{d}, .{ .slice = .{ .start = -3, .stop = 1, .step = -1 } }, len, &.{});
+                expectCall(&ctx, "binary_join_element_wise", .scalar, &binary, .none, len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .large_string = {} }, true), len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .binary_view = {} }, true), len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int32 = {} }, true), len, &.{error.InvalidCast});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .double = {} }, true), len, &.{error.InvalidCast});
+            },
+            .binary, .large_binary, .binary_view => expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{ error.InvalidCast, error.Overflow }),
+            .date32, .date64, .timestamp => {
+                // A timestamp with a non-UTC timezone is NotImplemented; casts may overflow when safe.
+                const tz_ok = [_]anyerror{error.NotImplemented};
+                expectCall(&ctx, "year", .scalar, &.{d}, .none, len, &tz_ok);
+                expectCall(&ctx, "iso_calendar", .scalar, &.{d}, .none, len, &tz_ok);
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .timestamp = .{ .unit = .nanosecond, .timezone = null } }, true), len, &.{error.InvalidCast});
+            },
+            .dictionary => |dict| expectCall(&ctx, "cast", .scalar, &.{d}, cast(dict.value_type.*, true), len, &.{error.UnsupportedType}),
+            else => {},
+        }
+        switch (a.data().data_type) {
+            .bool, .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int8 = {} }, false), len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int64 = {} }, true), len, &.{error.InvalidCast});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string_view = {} }, true), len, &.{});
+            },
             else => {},
         }
     }
 }
 
+fn cast(to: DataType, safe: bool) zarrow.compute.Options {
+    return .{ .cast = .{ .to_type = to, .safe = safe } };
+}
+
 fn expectKernel(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, expected_len: ?usize, unsupported_ok: bool) void {
-    var out = ctx.invoke(name, kind, args, .none) catch |e| {
-        if (unsupported_ok and e == error.NoMatchingKernel) return;
+    expectCall(ctx, name, kind, args, .none, expected_len, if (unsupported_ok) &.{error.NoMatchingKernel} else &.{});
+}
+
+/// Invoke `name`; an error outside `allowed` is a finding, and an array output must validate with
+/// `expected_len` rows.
+fn expectCall(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, options: zarrow.compute.Options, expected_len: ?usize, allowed: []const anyerror) void {
+    var out = ctx.invoke(name, kind, args, options) catch |e| {
+        for (allowed) |ok| if (e == ok) return;
         std.debug.panic("fuzz-invariant: kernel {s} failed on a valid {s} array: {s}", .{ name, @tagName(args[0].dataType().id()), @errorName(e) });
     };
     defer out.release();

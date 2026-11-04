@@ -556,3 +556,109 @@ pub fn chunkedAt(allocator: std.mem.Allocator, arr: ArrayRef, cuts: []const usiz
 pub fn scalarOf(comptime T: type, v: ?T) Scalar {
     return Scalar.init(dense.dataTypeOf(T), if (v) |x| dense.scalarValueOf(T, x) else .null);
 }
+
+/// Primitive array of logical type `dt` (date32, timestamp, ...) stored as `T`, from optionals.
+pub fn makeTyped(comptime T: type, comptime dt: DataType, allocator: std.mem.Allocator, values: []const ?T) !ArrayRef {
+    var b = try array_mod.PrimitiveBuilder(T, dt).init(allocator, values.len);
+    defer b.deinit();
+    for (values) |v| if (v) |x| try b.append(x) else try b.appendNull();
+    return b.finish();
+}
+
+/// String or binary array of layout `tag` (string, large_string, string_view, binary, large_binary,
+/// binary_view) from optional byte strings.
+pub fn makeStrings(comptime tag: std.meta.Tag(DataType), allocator: std.mem.Allocator, values: []const ?[]const u8) !ArrayRef {
+    const Builder = switch (tag) {
+        .string => array_mod.StringBuilder,
+        .large_string => array_mod.LargeStringBuilder,
+        .string_view => array_mod.StringViewBuilder,
+        .binary => array_mod.BinaryBuilder,
+        .large_binary => array_mod.LargeBinaryBuilder,
+        .binary_view => array_mod.BinaryViewBuilder,
+        else => @compileError("not a string or binary type"),
+    };
+    var b = try Builder.init(allocator, values.len, 64);
+    defer b.deinit();
+    for (values) |v| if (v) |x| try b.append(x) else try b.appendNull();
+    return b.finish();
+}
+
+/// Bytes of row `i` of a string or binary array of any layout, null for a null row.
+pub fn bytesAt(data: *const array_mod.ArrayData, i: usize) !?[]const u8 {
+    if (data.isNull(i)) return null;
+    return switch (data.data_type) {
+        .binary => try (array_mod.BinaryArray{ .data = data }).value(i),
+        .large_binary => try (array_mod.LargeBinaryArray{ .data = data }).value(i),
+        .binary_view => try (array_mod.BinaryViewArray{ .data = data }).value(i),
+        else => stringAt(data, i),
+    };
+}
+
+/// Rows of a string / binary datum (array, chunked or scalar) as optional slices borrowed from
+/// the datum; every array part must pass validateFull. Caller frees the outer slice.
+pub fn collectStrings(allocator: std.mem.Allocator, datum: Datum) ![]?[]const u8 {
+    switch (datum) {
+        .scalar => |s| {
+            const out = try allocator.alloc(?[]const u8, 1);
+            out[0] = switch (s.value) {
+                .null => null,
+                .string, .binary => |b| b,
+                else => return error.TestUnexpectedResult,
+            };
+            return out;
+        },
+        .array => |arr| return collectStringParts(allocator, &.{arr}),
+        .chunked => |chunked| return collectStringParts(allocator, chunked.chunks()),
+    }
+}
+
+fn collectStringParts(allocator: std.mem.Allocator, parts: []const ArrayRef) ![]?[]const u8 {
+    var total: usize = 0;
+    for (parts) |p| total += p.data().length;
+    const out = try allocator.alloc(?[]const u8, total);
+    errdefer allocator.free(out);
+    var pos: usize = 0;
+    for (parts) |p| {
+        try p.data().validateFull();
+        for (0..p.data().length) |i| out[pos + i] = try bytesAt(p.data(), i);
+        pos += p.data().length;
+    }
+    return out;
+}
+
+/// Element-wise equality of optional byte strings.
+pub fn expectStrings(expected: []const ?[]const u8, actual: []const ?[]const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |e, a, i| {
+        const same = if (e == null or a == null) e == null and a == null else std.mem.eql(u8, e.?, a.?);
+        if (!same) {
+            std.debug.print("row {d}: expected {?s}, got {?s}\n", .{ i, e, a });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+/// Invoke scalar function `name` with `options` and compare the string rows with `expected`.
+pub fn expectInvokeStrings(ctx: *ExecContext, name: []const u8, args: []const Datum, options: Options, expected: []const ?[]const u8) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invokeScalar(name, args, options);
+    defer out.release();
+    const rows = try collectStrings(allocator, out);
+    defer allocator.free(rows);
+    try expectStrings(expected, rows);
+}
+
+/// Invoke scalar function `name` with `options` and compare the rows (of storage `T`) with `expected`.
+pub fn expectInvokeWith(comptime T: type, ctx: *ExecContext, name: []const u8, args: []const Datum, options: Options, expected: []const ?T) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invokeScalar(name, args, options);
+    defer out.release();
+    switch (out) {
+        .array => |arr| try arr.data().validateFull(),
+        .chunked => |chunked| for (chunked.chunks()) |c| try c.data().validateFull(),
+        .scalar => {},
+    }
+    const rows = try collect(T, allocator, out);
+    defer allocator.free(rows);
+    try expectRows(T, expected, rows);
+}

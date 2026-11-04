@@ -476,13 +476,26 @@ test "registerAll registers every kernel family function name with its kind" {
     defer registry.deinit();
     try common.kernels.registerAll(&registry);
 
+    const string_names = [_][]const u8{
+        "ascii_upper",            "ascii_lower",            "utf8_upper",           "utf8_lower",
+        "ascii_trim",             "ascii_ltrim",            "ascii_rtrim",          "ascii_trim_whitespace",
+        "ascii_ltrim_whitespace", "ascii_rtrim_whitespace", "utf8_trim_whitespace", "utf8_ltrim_whitespace",
+        "utf8_rtrim_whitespace",  "utf8_slice_codeunits",   "utf8_reverse",         "starts_with",
+        "ends_with",              "match_substring",        "string_is_ascii",      "ascii_is_alpha",
+        "ascii_is_decimal",       "ascii_is_space",         "utf8_is_alpha",        "utf8_is_digit",
+        "utf8_is_space",          "utf8_length",            "binary_length",        "binary_join_element_wise",
+    };
+    const temporal_names = [_][]const u8{
+        "year",        "month",       "day",        "day_of_week", "day_of_year", "hour",         "minute",  "second",
+        "millisecond", "microsecond", "nanosecond", "iso_year",    "iso_week",    "iso_calendar", "quarter", "is_leap_year",
+    };
     const scalar_names = [_][]const u8{
         "add",       "add_checked",    "subtract", "subtract_checked", "multiply", "multiply_checked",
         "divide",    "divide_checked", "negate",   "negate_checked",   "abs",      "abs_checked",
         "equal",     "not_equal",      "less",     "less_equal",       "greater",  "greater_equal",
         "and",       "or",             "xor",      "and_not",          "invert",   "and_kleene",
-        "or_kleene", "is_null",        "is_valid", "true_unless_null",
-    };
+        "or_kleene", "is_null",        "is_valid", "true_unless_null", "cast",
+    } ++ string_names ++ temporal_names;
     const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
     for (scalar_names) |name| try std.testing.expect(registry.containsFunction(name, .scalar));
     for (aggregate_names) |name| {
@@ -499,6 +512,13 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 14), registry.kernelCount("less", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("min_max", .aggregate));
+    // One cast kernel for every pair; string kernels per string layout (binary_length also for the
+    // binary layouts); temporal date parts for date32 / date64 / timestamp, time parts without date32.
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("cast", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("utf8_upper", .scalar));
+    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("binary_length", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("year", .scalar));
+    try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("hour", .scalar));
     // Kinds are separate namespaces: no scalar "sum".
     try std.testing.expect(!registry.containsFunction("sum", .scalar));
 }

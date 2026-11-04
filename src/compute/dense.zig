@@ -26,6 +26,32 @@ fn andValidityBits(dst: []u8, src: []const u8, offset: usize, len: usize) void {
     }
 }
 
+/// Return the AND of the validity bitmaps of `inputs` over `len` rows (bit 0 = row 0, padding
+/// bits clear), or null when no input has a null. A null entry stands for a non-null scalar
+/// operand (it adds no nulls); every input that is present must have `len` rows.
+pub fn combinedValidity(allocator: std.mem.Allocator, len: usize, inputs: []const ?*const ArrayData) error{ OutOfMemory, InvalidInput }!?OwnedBuffer {
+    for (inputs) |maybe| if (maybe) |input| if (input.length != len) return error.InvalidInput;
+    var validity: ?OwnedBuffer = null;
+    errdefer if (validity) |*v| v.deinit();
+    for (inputs) |maybe| {
+        const input = maybe orelse continue;
+        if (!input.hasNulls()) continue;
+        const bits = (input.validity() orelse continue).data;
+        if (validity == null) {
+            var v = try OwnedBuffer.initUninit(allocator, bitmap.byteLength(len));
+            @memset(v.data[0..bitmap.byteLength(len)], 0xFF);
+            validity = v;
+        }
+        andValidityBits(validity.?.data, bits, input.offset, len);
+    }
+    // Padding bits past `len` may hold source garbage: clear them.
+    if (validity) |*v| if (len % 8 != 0) {
+        const keep: u8 = (@as(u8, 1) << @as(u3, @intCast(len % 8))) - 1;
+        v.data[bitmap.byteLength(len) - 1] &= keep;
+    };
+    return validity;
+}
+
 /// Output of a dense unary/binary kernel over primitive inputs: a values buffer (`[]T`, or the
 /// packed bits of a bool array when `T == bool`) plus the AND of the inputs' validity bitmaps.
 pub fn DenseBinaryOutput(comptime T: type) type {
@@ -47,29 +73,9 @@ pub fn DenseBinaryOutput(comptime T: type) type {
         /// Allocate the output for `len` rows; a null input stands for a non-null scalar operand
         /// (it adds no nulls). Every input that is present must have `len` rows.
         pub fn initValidity(allocator: std.mem.Allocator, len: usize, lhs: ?*const ArrayData, rhs: ?*const ArrayData, out_type: DataType) error{ OutOfMemory, InvalidInput }!Self {
-            const inputs = [2]?*const ArrayData{ lhs, rhs };
-            for (inputs) |maybe| if (maybe) |input| if (input.length != len) return error.InvalidInput;
-            var values_buf = try OwnedBuffer.initUninit(allocator, if (is_bits) bitmap.byteLength(len) else len * @sizeOf(T));
-            errdefer values_buf.deinit();
-
-            var validity: ?OwnedBuffer = null;
+            var validity = try combinedValidity(allocator, len, &.{ lhs, rhs });
             errdefer if (validity) |*v| v.deinit();
-            for (inputs) |maybe| {
-                const input = maybe orelse continue;
-                if (!input.hasNulls()) continue;
-                const bits = (input.validity() orelse continue).data;
-                if (validity == null) {
-                    var v = try OwnedBuffer.initUninit(allocator, bitmap.byteLength(len));
-                    @memset(v.data[0..bitmap.byteLength(len)], 0xFF);
-                    validity = v;
-                }
-                andValidityBits(validity.?.data, bits, input.offset, len);
-            }
-            // Padding bits past `len` may hold source garbage: clear them.
-            if (validity) |*v| if (len % 8 != 0) {
-                const keep: u8 = (@as(u8, 1) << @as(u3, @intCast(len % 8))) - 1;
-                v.data[bitmap.byteLength(len) - 1] &= keep;
-            };
+            const values_buf = try OwnedBuffer.initUninit(allocator, if (is_bits) bitmap.byteLength(len) else len * @sizeOf(T));
             return .{ .allocator = allocator, .len = len, .values_buf = values_buf, .validity = validity, .out_type = out_type };
         }
 
@@ -245,11 +251,13 @@ pub inline fn at(v: anytype, i: usize) Elem(@TypeOf(v)) {
 
 /// Kernel callback that computes one output chunk from aligned input chunks of `len` rows.
 pub const ChunkFn = fn (ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef;
+/// Like `ChunkFn`, with the options of the call.
+pub const ChunkOptionsFn = fn (ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef;
 
-/// Run a unary or binary element-wise kernel chunk by chunk: all-scalar inputs give a scalar, any
-/// chunked input gives a chunked output (chunk boundaries are the union of the inputs'), otherwise
-/// an array. Every array chunk passes `validateLayout` first, so `chunk_fn` may index its buffers.
-/// With `null_scalars_propagate` (null intersection) a null scalar input yields an all-null chunk
+/// Run an element-wise kernel chunk by chunk: all-scalar inputs give a scalar, any chunked input
+/// gives a chunked output (chunk boundaries are the union of the inputs'), otherwise an array.
+/// Every array chunk passes `validateLayout` first, so `chunk_fn` may index its buffers. With
+/// `null_scalars_propagate` (null intersection) a null scalar input yields an all-null chunk
 /// without calling `chunk_fn`.
 pub fn execElementwise(
     ctx: *ExecContext,
@@ -258,7 +266,23 @@ pub fn execElementwise(
     comptime null_scalars_propagate: bool,
     comptime chunk_fn: ChunkFn,
 ) KernelError!Datum {
-    if (args.len == 0 or args.len > 2) return error.InvalidArity;
+    return execElementwiseWith(ctx, args, Options.noneValue(), out_type, null_scalars_propagate, struct {
+        fn f(c: *ExecContext, values: []const ExecChunkValue, len: usize, _: Options) KernelError!ArrayRef {
+            return chunk_fn(c, values, len);
+        }
+    }.f);
+}
+
+/// `execElementwise` for any number of arguments, handing `options` to every chunk.
+pub fn execElementwiseWith(
+    ctx: *ExecContext,
+    args: []const Datum,
+    options: Options,
+    out_type: DataType,
+    comptime null_scalars_propagate: bool,
+    comptime chunk_fn: ChunkOptionsFn,
+) KernelError!Datum {
+    if (args.len == 0) return error.InvalidArity;
     const len = try core.inferNaryExecLen(args);
     var any_chunked = false;
     var all_scalar = true;
@@ -267,13 +291,15 @@ pub fn execElementwise(
         if (arg != .scalar) all_scalar = false;
     }
     if (!any_chunked) {
-        var values: [2]ExecChunkValue = undefined;
-        for (args, 0..) |arg, i| values[i] = switch (arg) {
+        var stack: [4]ExecChunkValue = undefined;
+        const values = if (args.len <= stack.len) stack[0..args.len] else ctx.allocator.alloc(ExecChunkValue, args.len) catch return error.OutOfMemory;
+        defer if (args.len > stack.len) ctx.allocator.free(values);
+        for (args, values) |arg, *v| v.* = switch (arg) {
             .array => |arr| .{ .array = arr },
             .scalar => |s| .{ .scalar = s },
             .chunked => unreachable,
         };
-        var out = try runChunk(ctx, values[0..args.len], len, out_type, null_scalars_propagate, chunk_fn);
+        var out = try runChunk(ctx, values, len, options, out_type, null_scalars_propagate, chunk_fn);
         if (!all_scalar) return .{ .array = out };
         defer out.release();
         return .{ .scalar = try scalarAt0(out) };
@@ -289,7 +315,7 @@ pub fn execElementwise(
     while (try it.next()) |next| {
         var chunk = next;
         defer chunk.deinit();
-        var out = try runChunk(ctx, chunk.values, chunk.len, out_type, null_scalars_propagate, chunk_fn);
+        var out = try runChunk(ctx, chunk.values, chunk.len, options, out_type, null_scalars_propagate, chunk_fn);
         outs.append(ctx.allocator, out) catch {
             out.release();
             return error.OutOfMemory;
@@ -306,23 +332,102 @@ fn runChunk(
     ctx: *ExecContext,
     values: []const ExecChunkValue,
     len: usize,
+    options: Options,
     out_type: DataType,
     comptime null_scalars_propagate: bool,
-    comptime chunk_fn: ChunkFn,
+    comptime chunk_fn: ChunkOptionsFn,
 ) KernelError!ArrayRef {
     for (values) |v| if (v == .array) v.array.data().validateLayout() catch return error.InvalidInput;
     if (null_scalars_propagate) for (values) |v| {
-        if (v == .scalar and v.scalar.isNull()) return (try core.datumBuildNullLikeWithAllocator(ctx.allocator, out_type, len)).array;
+        if (v == .scalar and v.scalar.isNull()) return nullArray(ctx.allocator, out_type, len);
     };
-    return chunk_fn(ctx, values, len);
+    return chunk_fn(ctx, values, len, options);
 }
 
-/// Return row 0 of a numeric or bool kernel output as a scalar.
+/// Return an all-null array of `len` rows of a primitive, bool, string / binary or struct type.
+pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) KernelError!ArrayRef {
+    switch (datatype.storageDataType(out_type)) {
+        .string, .large_string, .string_view, .binary, .large_binary, .binary_view => {
+            var out = try VarBinaryOutput.init(allocator, out_type, len, try zeroBits(allocator, len), 0);
+            errdefer out.deinit();
+            for (0..len) |_| try out.commit(0);
+            return out.finish();
+        },
+        .bool => {
+            var values_buf = try zeroBits(allocator, len);
+            const validity = zeroBits(allocator, len) catch |err| {
+                values_buf.deinit();
+                return err;
+            };
+            return boolArray(allocator, len, values_buf, validity);
+        },
+        .struct_, .list, .large_list, .fixed_size_list, .null => return (try core.datumBuildNullLikeWithAllocator(allocator, out_type, len)).array,
+        .dictionary, .extension => return error.UnsupportedType,
+        else => {
+            const width = (out_type.bitWidth() orelse return error.UnsupportedType) / 8;
+            var validity = try zeroBits(allocator, len);
+            var values_buf = OwnedBuffer.init(allocator, len * width) catch {
+                validity.deinit();
+                return error.OutOfMemory;
+            };
+            return finishFixed(allocator, out_type, len, &values_buf, validity);
+        },
+    }
+}
+
+/// Return a zeroed packed-bit buffer for `len` rows (an all-null validity bitmap).
+fn zeroBits(allocator: std.mem.Allocator, len: usize) KernelError!OwnedBuffer {
+    return OwnedBuffer.init(allocator, bitmap.byteLength(len)) catch error.OutOfMemory;
+}
+
+/// Hand a fixed-width values buffer of `len` rows and a validity bitmap (null: no nulls) to a new
+/// array of `out_type`; takes ownership of both buffers (also on error).
+pub fn finishFixed(allocator: std.mem.Allocator, out_type: DataType, len: usize, values_buf: *OwnedBuffer, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    const width = (out_type.bitWidth() orelse 8) / 8;
+    var v = validity;
+    errdefer if (v) |*b| b.deinit();
+    errdefer values_buf.deinit();
+    var buffers: [2]SharedBuffer = .{ .empty, .empty };
+    var null_count: usize = 0;
+    if (v) |*b| {
+        null_count = bitmap.countUnsetBit(b.data, len);
+        buffers[0] = b.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
+        v = null;
+    }
+    errdefer buffers[0].release();
+    buffers[1] = values_buf.toShared(len * width) catch return error.OutOfMemory;
+    errdefer buffers[1].release();
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{ .data_type = out_type, .length = len, .null_count = null_count, .buffers = &buffers }) catch error.OutOfMemory;
+}
+
+/// Return row 0 of a kernel output as a scalar. A string / binary scalar borrows its bytes from
+/// `payload`, which it retains; a struct scalar is a nested scalar over the row.
 fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
     const data = arr.data();
     if (data.length != 1) return error.InvalidInput;
     if (data.isNull(0)) return Scalar.init(data.data_type, .null);
-    if (data.data_type == .bool) return Scalar.init(data.data_type, .{ .bool = bitmap.bitIsSet(data.buffers[1].data, data.offset) });
+    switch (datatype.storageDataType(data.data_type)) {
+        .bool => return Scalar.init(data.data_type, .{ .bool = bitmap.bitIsSet(data.buffers[1].data, data.offset) }),
+        .string, .large_string, .string_view, .binary, .large_binary, .binary_view => {
+            const bytes = switch (try StringOperand.init(.{ .array = arr })) {
+                inline else => |op| op.get(0),
+            };
+            const text = switch (datatype.storageDataType(data.data_type)) {
+                .string, .large_string, .string_view => true,
+                else => false,
+            };
+            var s = Scalar.init(data.data_type, if (text) .{ .string = bytes } else .{ .binary = bytes });
+            s.payload = arr.retain();
+            return s;
+        },
+        .struct_ => return Scalar.initNested(data.data_type, arr),
+        inline .date32, .date64, .timestamp, .time32, .time64, .duration => |_, tag| {
+            const T = if (tag == .date32 or tag == .time32) i32 else i64;
+            const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
+            return Scalar.init(data.data_type, @unionInit(ScalarValue, @tagName(tag), values[0]));
+        },
+        else => {},
+    }
     inline for (numeric_types) |T| {
         if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dataTypeOf(T))) {
             const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
@@ -331,6 +436,282 @@ fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
     }
     return error.UnsupportedType;
 }
+
+/// Return the array of an exec chunk value: the array itself (retained), or a one-row array
+/// holding a scalar of a primitive, bool, temporal or string / binary type. The caller releases it.
+pub fn chunkArray(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!ArrayRef {
+    const s = switch (v) {
+        .array => |arr| return arr.retain(),
+        .scalar => |s| s,
+    };
+    if (s.payload) |p| return if (p.data().length == 1) p.retain() else error.InvalidInput;
+    if (s.isNull()) return nullArray(allocator, s.data_type, 1);
+    switch (datatype.storageDataType(s.data_type)) {
+        .string, .large_string, .string_view, .binary, .large_binary, .binary_view => {
+            const bytes = switch (s.value) {
+                .string, .binary => |b| b,
+                else => return error.InvalidInput,
+            };
+            var out = try VarBinaryOutput.init(allocator, s.data_type, 1, null, bytes.len);
+            errdefer out.deinit();
+            try out.append(bytes);
+            return out.finish();
+        },
+        .bool => {
+            const b = try scalarAs(bool, s);
+            var bits = try bitsBuffer(allocator, 1);
+            bits.data[0] = @intFromBool(b);
+            return boolArray(allocator, 1, bits, null);
+        },
+        else => {},
+    }
+    const width = (s.data_type.bitWidth() orelse return error.UnsupportedType) / 8;
+    // The payload must be the field of the scalar's own type (an int32 scalar holds `.i32`).
+    const expected: std.meta.Tag(ScalarValue) = switch (datatype.storageDataType(s.data_type)) {
+        .int8 => .i8,
+        .int16 => .i16,
+        .int32 => .i32,
+        .int64 => .i64,
+        .uint8 => .u8,
+        .uint16 => .u16,
+        .uint32 => .u32,
+        .uint64 => .u64,
+        .float => .f32,
+        .double => .f64,
+        .date32 => .date32,
+        .date64 => .date64,
+        .timestamp => .timestamp,
+        .time32 => .time32,
+        .time64 => .time64,
+        .duration => .duration,
+        else => return error.UnsupportedType,
+    };
+    if (std.meta.activeTag(s.value) != expected) return error.InvalidInput;
+    var values_buf = OwnedBuffer.init(allocator, width) catch return error.OutOfMemory;
+    switch (s.value) {
+        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .date32, .date64, .timestamp, .time32, .time64, .duration => |x| @memcpy(values_buf.data[0..width], std.mem.asBytes(&x)),
+        else => unreachable,
+    }
+    return finishFixed(allocator, s.data_type, 1, &values_buf, null);
+}
+
+// ------------------------------------------------------------------- variable-width rows
+
+/// Rows of a string / binary operand: a scalar, or an array of string / large_string /
+/// string_view (or the binary twins) that passed `validateLayout` (offsets and views are in
+/// bounds, so rows are sliced without further checks).
+pub const StringOperand = union(enum) {
+    scalar: ScalarBytes,
+    offsets32: OffsetBytes(i32),
+    offsets64: OffsetBytes(i64),
+    views: ViewBytes,
+
+    pub fn init(v: ExecChunkValue) KernelError!StringOperand {
+        const data = switch (v) {
+            .scalar => |s| return switch (s.value) {
+                .string, .binary => |bytes| .{ .scalar = .{ .bytes = bytes } },
+                else => error.InvalidInput,
+            },
+            .array => |arr| arr.data(),
+        };
+        switch (datatype.storageDataType(data.data_type)) {
+            inline .string, .large_string, .binary, .large_binary => |_, tag| {
+                const O = if (tag == .string or tag == .binary) i32 else i64;
+                const all = data.buffers[1].typedSlice(O) catch return error.InvalidInput;
+                const op: OffsetBytes(O) = .{ .offsets = all[data.offset..][0 .. data.length + 1], .data = data.buffers[2].data };
+                return if (O == i32) .{ .offsets32 = op } else .{ .offsets64 = op };
+            },
+            .string_view, .binary_view => return .{ .views = .{ .views = data.buffers[1].data[data.offset * 16 ..][0 .. data.length * 16], .data = data } },
+            else => return error.UnsupportedType,
+        }
+    }
+};
+
+pub const ScalarBytes = struct {
+    bytes: []const u8,
+    pub inline fn get(self: ScalarBytes, _: usize) []const u8 {
+        return self.bytes;
+    }
+};
+
+pub fn OffsetBytes(comptime O: type) type {
+    return struct {
+        offsets: []const O,
+        data: []const u8,
+        pub inline fn get(self: @This(), i: usize) []const u8 {
+            return self.data[@intCast(self.offsets[i])..@intCast(self.offsets[i + 1])];
+        }
+    };
+}
+
+pub const ViewBytes = struct {
+    views: []const u8,
+    data: *const ArrayData,
+    pub inline fn get(self: ViewBytes, i: usize) []const u8 {
+        const view = self.views[i * 16 ..][0..16];
+        const len = std.mem.readInt(u32, view[0..4], .little);
+        if (len <= 12) return view[4..][0..len];
+        const buf = std.mem.readInt(u32, view[8..12], .little);
+        const off = std.mem.readInt(u32, view[12..16], .little);
+        return self.data.buffers[2 + buf].data[off..][0..len];
+    }
+};
+
+/// Total bytes of rows `[0, len)` of an array operand (an upper bound of a transform's output).
+pub fn totalBytes(op: StringOperand, len: usize) usize {
+    return switch (op) {
+        .scalar => |s| s.bytes.len * len,
+        inline .offsets32, .offsets64 => |o| @intCast(o.offsets[len] - o.offsets[0]),
+        .views => |o| blk: {
+            var n: usize = 0;
+            for (0..len) |i| n += std.mem.readInt(u32, o.views[i * 16 ..][0..4], .little);
+            break :blk n;
+        },
+    };
+}
+
+/// Builder of a string / large_string / string_view (or binary twin) output, row by row in
+/// order: `reserve` a slot, fill it, `commit` the bytes used (0 for a null row). Offsets past
+/// `maxInt(i32)` (string / binary) or a data buffer past 4 GiB (views) are `Overflow`.
+pub const VarBinaryOutput = struct {
+    allocator: std.mem.Allocator,
+    out_type: DataType,
+    len: usize,
+    validity: ?OwnedBuffer,
+    /// Offsets (`len + 1` entries) or 16-byte views (`len` entries).
+    index: OwnedBuffer,
+    data: OwnedBuffer,
+    kind: Layout,
+    pos: usize = 0,
+    row: usize = 0,
+
+    const Self = @This();
+    const Layout = enum { offsets32, offsets64, views };
+
+    inline fn layout(self: *const Self) Layout {
+        return self.kind;
+    }
+
+    /// Takes ownership of `validity` (also on error); `data_capacity` is the expected byte total.
+    pub fn init(allocator: std.mem.Allocator, out_type: DataType, len: usize, validity: ?OwnedBuffer, data_capacity: usize) KernelError!Self {
+        var v = validity;
+        errdefer if (v) |*b| b.deinit();
+        const kind: Layout = switch (datatype.storageDataType(out_type)) {
+            .string, .binary => .offsets32,
+            .large_string, .large_binary => .offsets64,
+            .string_view, .binary_view => .views,
+            else => return error.UnsupportedType,
+        };
+        const index_bytes: usize = switch (kind) {
+            .offsets32 => (len + 1) * 4,
+            .offsets64 => (len + 1) * 8,
+            .views => len * 16,
+        };
+        var index = OwnedBuffer.initUninit(allocator, index_bytes) catch return error.OutOfMemory;
+        errdefer index.deinit();
+        const data = OwnedBuffer.initUninit(allocator, data_capacity) catch return error.OutOfMemory;
+        var self: Self = .{ .allocator = allocator, .out_type = out_type, .len = len, .validity = v, .index = index, .data = data, .kind = kind };
+        switch (self.layout()) {
+            .offsets32 => self.index.typedSlice(i32)[0] = 0,
+            .offsets64 => self.index.typedSlice(i64)[0] = 0,
+            .views => {},
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.validity) |*v| v.deinit();
+        self.index.deinit();
+        self.data.deinit();
+    }
+
+    /// Return a writable slot of `n` bytes for the next row.
+    pub fn reserve(self: *Self, n: usize) KernelError![]u8 {
+        const need = std.math.add(usize, self.pos, n) catch return error.Overflow;
+        if (need > self.data.data.len) self.data.resize(@max(need, self.data.data.len * 2)) catch return error.OutOfMemory;
+        return self.data.data[self.pos..need];
+    }
+
+    /// Close the next row with the first `n` bytes of its slot.
+    pub fn commit(self: *Self, n: usize) KernelError!void {
+        std.debug.assert(self.row < self.len);
+        const end = self.pos + n;
+        switch (self.layout()) {
+            .offsets32 => self.index.typedSlice(i32)[self.row + 1] = std.math.cast(i32, end) orelse return error.Overflow,
+            .offsets64 => self.index.typedSlice(i64)[self.row + 1] = std.math.cast(i64, end) orelse return error.Overflow,
+            .views => {
+                const view = self.index.data[self.row * 16 ..][0..16];
+                @memset(view, 0);
+                std.mem.writeInt(u32, view[0..4], @intCast(n), .little);
+                if (n <= 12) {
+                    if (n > 0) @memcpy(view[4..][0..n], self.data.data[self.pos..end]);
+                    self.row += 1;
+                    return;
+                }
+                @memcpy(view[4..8], self.data.data[self.pos..][0..4]);
+                std.mem.writeInt(u32, view[12..16], std.math.cast(u32, self.pos) orelse return error.Overflow, .little);
+                _ = std.math.cast(u32, end) orelse return error.Overflow;
+            },
+        }
+        self.pos = end;
+        self.row += 1;
+    }
+
+    /// Close every row at once over bytes already written at the start of the data buffer: row
+    /// `i` spans `[offsets[i], offsets[i + 1])` rebased to `offsets[0]` (offsets layouts only).
+    pub fn bulkOffsets(self: *Self, offsets: anytype) KernelError!void {
+        std.debug.assert(self.row == 0 and self.pos == 0 and offsets.len == self.len + 1);
+        const base = offsets[0];
+        switch (self.layout()) {
+            inline .offsets32, .offsets64 => |l| {
+                const O = if (l == .offsets32) i32 else i64;
+                for (self.index.typedSlice(O)[0..offsets.len], offsets) |*d, s| d.* = std.math.cast(O, s - base) orelse return error.Overflow;
+            },
+            .views => unreachable,
+        }
+        self.pos = @intCast(offsets[self.len] - base);
+        self.row = self.len;
+    }
+
+    /// Copy `bytes` into the next row.
+    pub fn append(self: *Self, bytes: []const u8) KernelError!void {
+        @memcpy(try self.reserve(bytes.len), bytes);
+        try self.commit(bytes.len);
+    }
+
+    /// Hand the buffers to a new array (every row must have been committed).
+    pub fn finish(self: *Self) KernelError!ArrayRef {
+        std.debug.assert(self.row == self.len);
+        errdefer self.deinit();
+        var buffers: [3]SharedBuffer = .{ .empty, .empty, .empty };
+        var count: usize = 3;
+        var null_count: usize = 0;
+        errdefer for (buffers[0..count]) |*b| b.release();
+        if (self.validity) |*v| {
+            null_count = bitmap.countUnsetBit(v.data, self.len);
+            buffers[0] = v.toShared(bitmap.byteLength(self.len)) catch return error.OutOfMemory;
+            self.validity = null;
+        }
+        const index_bytes = switch (self.layout()) {
+            .offsets32 => (self.len + 1) * 4,
+            .offsets64 => (self.len + 1) * 8,
+            .views => self.len * 16,
+        };
+        buffers[1] = self.index.toShared(index_bytes) catch return error.OutOfMemory;
+        if (self.layout() == .views and self.pos == 0) {
+            count = 2;
+            self.data.deinit();
+        } else {
+            buffers[2] = self.data.toShared(self.pos) catch return error.OutOfMemory;
+        }
+        return ArrayRef.fromOwnedInlineBuffers(self.allocator, .{
+            .data_type = self.out_type,
+            .length = self.len,
+            .null_count = null_count,
+            .buffers = buffers[0..count],
+        }) catch error.OutOfMemory;
+    }
+};
 
 /// Packed bits read 8 rows at a time: an array buffer at a bit offset, or a broadcast byte.
 pub const Bits = struct {

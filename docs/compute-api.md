@@ -40,10 +40,13 @@ defer sum.release();
 | Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene` |
 | Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `count`, `count_all`, `any`, `all` |
 | Categorizations | `is_null.zig` | `is_null`, `is_valid`, `true_unless_null` |
+| Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp units, dictionary decode and encode, the null type |
+| Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `utf8_upper`, `utf8_lower` (ASCII letters), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_space`, `utf8_is_alpha`, `utf8_is_digit`, `utf8_is_space` (string, large_string, string_view) |
+| Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `iso_calendar`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp) |
 
 Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
 scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar.
-Operands of a binary function must have the same type: there are no implicit casts. Exact semantics,
+Operands of a binary function must have the same type: there are no implicit casts (call `cast`). Exact semantics,
 including the differences from Arrow C++, are in [compute-support-matrix.md](compute-support-matrix.md).
 
 This repository also ships take/filter/select (`datumTake`, `datumFilter`,
@@ -100,15 +103,28 @@ Compute options are type-safe and tag-based.
 - `arithmetic`
 - `filter`
 - `sort`
+- `day_of_week`
+- `match_substring`
+- `slice`
+- `join`
+- `trim`
 - `custom`
 
 ### Payload types
 
-- `CastOptions`
+- `CastOptions` (`to_type`, `safe`)
 - `ArithmeticOptions`
 - `FilterOptions`
 - `SortOptions`
+- `DayOfWeekOptions` (`count_from_zero`, `week_start`)
+- `MatchSubstringOptions` (`pattern`, `ignore_case`)
+- `SliceOptions` (`start`, `stop`, `step`)
+- `JoinOptions` (`null_handling`: `emit_null | skip | replace`, `null_replacement`)
+- `TrimOptions` (`characters`)
 - `CustomOptions`
+
+Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`) also accept
+`.none` for the defaults.
 
 Use `KernelSignature.options_check` to validate allowed option families for each kernel.
 
@@ -178,7 +194,7 @@ Error conventions, mirroring Arrow C++ (`Status`, `Result<T>`, no exceptions acr
 
 `ExecConfig` currently includes:
 
-- `safe_cast`
+- `safe_cast`: `cast` is safe only when both `safe_cast` and `CastOptions.safe` are true
 - `overflow_mode` (`checked | wrapping | saturating`): the unchecked arithmetic functions (`add`, ...) wrap
   like Arrow C++ under `checked` and `wrapping` and saturate under `saturating` (the `_checked` names always
   return `Overflow`); `sum`, which has no `_checked` twin, returns `Overflow` under `checked`, wraps under
@@ -235,9 +251,13 @@ Framework helpers include:
 - null propagation: `unaryNullPropagates`, `binaryNullPropagates`, `naryNullPropagates`;
 - scalar broadcast length inference: `inferBinaryExecLen`, `inferNaryExecLen`;
 - chunk-aligned iterators: `UnaryExecChunkIterator`, `BinaryExecChunkIterator`, `NaryExecChunkIterator`;
-- `dense.execElementwise`: the driver of the element-wise families (array / chunked / scalar dispatch,
-  `validateLayout` of every input chunk, null scalars under intersection), with `dense.Bits` /
-  `dense.mapBits` for packed-bit operands.
+- `dense.execElementwise` / `dense.execElementwiseWith` (any arity, options passed to every chunk): the
+  driver of the element-wise families (array / chunked / scalar dispatch, `validateLayout` of every input
+  chunk, null scalars under intersection), with `dense.Bits` / `dense.mapBits` for packed-bit operands,
+  `dense.StringOperand` for the rows of the string and binary layouts, `dense.VarBinaryOutput` for a
+  string / large_string / string_view output (offsets checked against the 32-bit range) and
+  `dense.chunkArray` to read a scalar operand as a one-row array. A string or binary scalar result owns
+  its bytes through `Scalar.payload`.
 
 Permutation-family helpers include:
 
@@ -271,6 +291,9 @@ Kernels may receive arrays that came from IPC or the C data interface. They must
 read (buffer counts, offsets windows, index ranges, dictionary lengths) and return `InvalidInput` rather than
 trust `length` or `null_count`. The selection and concat kernels in this repository are the reference for
 how much checking is expected; nothing in a kernel may weaken what `validateLayout` establishes.
+`validateLayout` does not check UTF-8 or dictionary indices: the string kernels that decode code points
+reject a non-null row that is not UTF-8 (`InvalidInput`), a cast to a string type runs the UTF-8 check of
+`validateFull` on a binary source, and `cast` checks dictionary indices before decoding.
 
 ---
 
