@@ -1,11 +1,11 @@
-# Compute API（zarrow-core）使用说明
+# Compute API 使用说明
 
-本文档说明 `zarrow.compute` 的下游开发接口，面向 `zarrow-compute` 这类独立库。
+本文档说明 `zarrow.compute` 的开发接口：面向在本仓库内新增 kernel 的开发者（core 与 compute 同在一个仓库，见 [repo-layout.md](repo-layout.md)），以及注册并调用这些 kernel 的应用。
 
 ## 1. 目标与边界
 
 - `zarrow` 当前提供 **compute 框架层**：注册、调度、类型检查、结果类型推导、执行上下文、聚合生命周期。
-- `cast/add/filter/sum/...` 等具体 kernel 实现应由下游库（如 `zarrow-compute`）提供。
+- `cast/add/filter/sum/...` 等具体 kernel 实现位于本仓库的 `src/compute/` 下，每个 family 一个文件。`FunctionRegistry.init` 返回空注册表；每个 family 暴露 `register`，统一注册全部 family 的便捷入口（等价于 `arrow::compute::Initialize()`）计划随第一个 kernel family 一起提供。
 - Support status against the Arrow C++ compute function catalog, category by category: [compute-support-matrix.md](compute-support-matrix.md) (English).
 
 ## 2. 核心类型
@@ -111,7 +111,7 @@
 
 ## 10. 数组执行工具层（新）
 
-为下游 `zarrow-compute` 提供了通用执行 helper：
+为 kernel 提供了通用执行 helper：
 
 - null 传播：
   - `unaryNullPropagates(...)`

@@ -46,8 +46,8 @@ Zig 在这个领域有天然优势：显式内存管理、可预测性能、清�
 | Arrow IPC Stream 读写 | 已支持 |
 | Arrow IPC 互操作 fixtures | 已支持 |
 | Arrow C Data / C Stream ABI | 已支持 |
-| 面向下游库的 `zarrow-core` 模块 | 已支持 |
-| 完整 compute kernels | 下游项目：[zarrow-compute](https://github.com/tylitianrui/zarrow-compute) |
+| `zarrow-core` 模块（不含 IPC/FFI 的 core 与 compute） | 已支持 |
+| Compute kernels | 本仓库内：目前有 selection、concat、dictionary encode 与 validation，见 [compute-support-matrix.md](compute-support-matrix.md) |
 | Parquet | 下游项目：[zarrow-parquet](https://github.com/tylitianrui/zarrow-parquet) |
 
 项目优先级是正确性、显式所有权、互操作验证与规范对齐，而不是过早冻结 API。
@@ -67,7 +67,7 @@ Zig 在这个领域有天然优势：显式内存管理、可预测性能、清�
 - 共享 C ABI 库目标：`zarrow_c`
 - 面向无需 IPC/FFI 的下游库模块：`zarrow-core`
 - 针对 Arrow Go、Arrow C++、arrow-rs 的互操作 smoke 测试
-- 面向下游 [zarrow-compute](https://github.com/tylitianrui/zarrow-compute) 的 compute 框架基础
+- compute 框架与 kernels（core 与 compute 同在一个仓库，见 [repo-layout.md](repo-layout.md)）
 - 示例、基准、fuzz corpus 与 CI 兼容性工具
 
 ---
@@ -178,7 +178,7 @@ len=3, v0=10, isNull1=true, v2=30
 | 模块 | 作用 |
 | --- | --- |
 | `zarrow` | 全量公共包接口，包含数组、schema、record batch、IPC 及 Arrow 数据结构。 |
-| `zarrow-core` | 核心能力接口，适合不需要 IPC 或 FFI 依赖的下游库（如 [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)）。 |
+| `zarrow-core` | core 与 compute 接口，适合不需要 IPC 或 FFI 依赖的下游库。 |
 
 构建系统还提供 C ABI 共享库：
 
@@ -228,7 +228,7 @@ zig build interop-fixture-check -- .interop-fixtures/zarrow.arrow canonical stre
 
 ## Compute 框架
 
-`zarrow` 提供面向下游（如 [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)）的 compute 框架基础。
+`zarrow` 包含 compute 框架与 compute kernels；core 与 compute 同在一个仓库（见 [repo-layout.md](repo-layout.md)）。
 
 核心库提供的框架级构件包括：
 
@@ -244,9 +244,9 @@ zig build interop-fixture-check -- .interop-fixtures/zarrow.arrow canonical stre
 - unary / binary / n-ary 执行 helper
 - 面向 take/filter/permutation 路径的 chunk-aware helper
 
-`zarrow` 在本仓库中**不会**直接承接完整 compute 函数目录。算术、比较、filter、sort、cast、aggregate 等具体 kernel 应在下游库（如 [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)）中实现。
+具体 kernel（算术、比较、filter、sort、cast、aggregate 等 family）位于本仓库的 `src/compute/` 下，每个 family 一个文件，并配有测试与基准。目前已有 selection、concat、dictionary encode 与 validation；Arrow compute 目录的其余部分见 [compute-support-matrix.md](compute-support-matrix.md)。
 
-下游 API 边界参考：
+compute API 与现状：
 
 - [compute-api.md](compute-api.md)
 - [compute-api-zh.md](compute-api-zh.md)
@@ -381,17 +381,16 @@ zig build compute-compat-check -- numeric
 
 当前下游 / 相关项目：
 
-- [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)：基于 `zarrow` / `zarrow-core` 的 Arrow compute kernels。
 - [zarrow-parquet](https://github.com/tylitianrui/zarrow-parquet)：作为下游项目提供 Parquet 读写集成。
 
 规划中或自然延伸方向：
 
-- compute kernels；
+- Arrow compute 目录的其余部分（在本仓库内）；
 - dataframe / query engine 集成；
 - Parquet 集成；
 - Arrow Flight / IPC 工具；
 - PyArrow / Arrow C++ / arrow-rs 互操作示例；
-- 更多基于 `zarrow-core` 的下游样例。
+- 更多基于 `zarrow-core` 的样例。
 
 如果你的项目正在使用 `zarrow`，欢迎提交 PR 将项目加入本节。
 
@@ -404,8 +403,8 @@ zig build compute-compat-check -- numeric
 - 保持 Arrow 布局行为与规范对齐；
 - 扩展类型覆盖测试与示例；
 - 强化 IPC 与 C ABI 互操作覆盖；
-- 提升下游 `zarrow-core` 使用体验；
-- 以稳定 compute 框架边界支撑 [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)；
+- 提升 `zarrow-core` 使用体验；
+- 扩充 `src/compute/` 中的 kernel 目录（见 support matrix）；
 - 增加真实互操作 demo；
 - 持续完善所有权、内存布局、生命周期文档。
 
