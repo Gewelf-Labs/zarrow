@@ -250,6 +250,8 @@ For the compute API and status, see:
 - [docs/compute-api-zh.md](docs/compute-api-zh.md)
 - [docs/compute-support-matrix.md](docs/compute-support-matrix.md): status of every Arrow C++ compute function category here
 - [docs/canonical-extensions.md](docs/canonical-extensions.md): coverage of Arrow's canonical extension types
+- [docs/type-coverage.md](docs/type-coverage.md): every Arrow type across build, validate, IPC, C ABI and compute
+- `python -I tools/ecosystem_scorecard.py` counts the yes / partial / no rows of these evidence docs (CI runs it)
 - [docs/repo-layout.md](docs/repo-layout.md): core and compute in one repository, where kernels go
 - [docs/ecosystem-readiness.md](docs/ecosystem-readiness.md)
 - Example: [`examples/compute_lifecycle.zig`](examples/compute_lifecycle.zig)
