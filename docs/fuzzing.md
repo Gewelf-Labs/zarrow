@@ -24,7 +24,7 @@ Targets (`zig build fuzz -- <target> ...`):
 | `ipc-stream-zero-copy` | the same, through `IpcStreamReader.initZeroCopy` | `ipc-stream` |
 | `ipc-file` | an IPC file for `IpcFileReader` (batches, tensors, sparse tensors) | `ipc-file` |
 | `array-layout` | a recipe for a hand-built `ArrayData` tree (type, lengths, buffers, children); `validateLayout`, then `validateFull`, then compute | `array-layout` |
-| `compute` | an IPC stream; every column that passes `validateFull` goes through slice / take / filter / concat with indices derived from the input, and every result must pass `validateFull` with the expected length | `ipc-stream` |
+| `compute` | an IPC stream; every column that passes `validateFull` goes through slice / take / filter / concat with indices derived from the input and, where the type fits, the kernels `add`, `less`, `sum`, `min_max`, `and_kleene`, `any`, `is_null` and `count` (on the column and a slice of it); the kernels must succeed and every array result must pass `validateFull` with the expected length | `ipc-stream` |
 | `c-abi` | a recipe for `ArrowSchema` / `ArrowArray` trees imported with `importSchemaFromC` / `importArrayFromC`; an accepted array goes through compute like above, then is exported and re-imported | `c-abi` |
 
 What counts as a finding (the harness panics, the supervisor saves the input):

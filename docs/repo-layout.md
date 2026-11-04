@@ -38,10 +38,10 @@ project.
 
 ## Registry
 
-`FunctionRegistry.init` returns an empty registry. Kernel families expose a `register(registry)` function;
-an application registers the families it uses. A convenience that registers every family in the repository
-is the intended equivalent of `arrow::compute::Initialize()` and should be added with the first kernel
-family.
+`FunctionRegistry.init` returns an empty registry. Kernel families expose a `register(registry)` function
+(`compute.kernels.arithmetic.register`, ...); an application registers the families it uses, or calls
+`compute.registerAll` (`src/compute/kernels.zig`), the equivalent of `arrow::compute::Initialize()`, which
+registers every family in the repository. A new family adds its `register` call there.
 
 ## Still separate
 

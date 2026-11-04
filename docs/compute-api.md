@@ -19,12 +19,34 @@ Chinese version: [compute-api-zh.md](compute-api-zh.md)
 - common helper utilities for array/scalar/chunked execution;
 - chunk-aware permutation helpers.
 
-Concrete kernels (cast/arithmetic/comparison/filter/sort/aggregate families) live in this repository under
-`src/compute/`, one file per family. `FunctionRegistry.init` returns an empty registry; each family exposes a
-`register` function, and a convenience that registers every family is the intended equivalent of
-`arrow::compute::Initialize()` (to be added with the first kernel family).
+Concrete kernels live in this repository under `src/compute/`, one file per family. `FunctionRegistry.init`
+returns an empty registry; each family exposes `register(registry)`, and `registerAll(registry)`
+(`compute.registerAll`, `zarrow.computeRegisterAll`) registers every family, the equivalent of
+`arrow::compute::Initialize()`:
 
-What this repository does ship as callable operations: take/filter/select (`datumTake`, `datumFilter`,
+```zig
+var registry = zarrow.compute.FunctionRegistry.init(allocator);
+defer registry.deinit();
+try zarrow.compute.registerAll(&registry); // or compute.kernels.arithmetic.register(&registry), ...
+var ctx = zarrow.compute.ExecContext.init(allocator, &registry);
+var sum = try ctx.invoke("add", .scalar, &.{ lhs, rhs }, .none); // lhs, rhs: Datum
+defer sum.release();
+```
+
+| Family | File | Functions |
+|---|---|---|
+| Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` and their `_checked` variants (int8..int64, uint8..uint64, float32/64) |
+| Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string, large_string, string_view) |
+| Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene` |
+| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `count`, `count_all`, `any`, `all` |
+| Categorizations | `is_null.zig` | `is_null`, `is_valid`, `true_unless_null` |
+
+Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
+scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar.
+Operands of a binary function must have the same type: there are no implicit casts. Exact semantics,
+including the differences from Arrow C++, are in [compute-support-matrix.md](compute-support-matrix.md).
+
+This repository also ships take/filter/select (`datumTake`, `datumFilter`,
 `datumSelect`), concatenation (`concatArrayRefs`), slicing, `dictionaryEncode`, validation and null-like /
 empty-like construction. [compute-support-matrix.md](compute-support-matrix.md) maps every category of the
 Arrow C++ function catalog to its status here.
@@ -34,6 +56,7 @@ Arrow C++ function catalog to its status here.
 | Arrow C++ | zarrow |
 |---|---|
 | `arrow::compute::Function` (name + kernels) | `Function` |
+| `arrow::compute::Initialize()` (built-in function catalog) | `registerAll` (per family: `kernels.<family>.register`) |
 | `ScalarKernel` / `VectorKernel` / `ScalarAggregateKernel` | `Kernel` with `FunctionKind.scalar` / `.vector` / `.aggregate` |
 | `KernelSignature` (`InputType`, `OutputType`, type matchers) | `KernelSignature` (`arity`, `type_check`, `result_type_fn`) |
 | `FunctionOptions` | `Options` (tagged union, section 3) |
@@ -156,7 +179,10 @@ Error conventions, mirroring Arrow C++ (`Status`, `Result<T>`, no exceptions acr
 `ExecConfig` currently includes:
 
 - `safe_cast`
-- `overflow_mode` (`checked | wrapping | saturating`)
+- `overflow_mode` (`checked | wrapping | saturating`): the unchecked arithmetic functions (`add`, ...) wrap
+  like Arrow C++ under `checked` and `wrapping` and saturate under `saturating` (the `_checked` names always
+  return `Overflow`); `sum`, which has no `_checked` twin, returns `Overflow` under `checked`, wraps under
+  `wrapping` and clamps under `saturating`
 - `threads`
 - `arena_allocator`
 
@@ -208,7 +234,10 @@ Framework helpers include:
 
 - null propagation: `unaryNullPropagates`, `binaryNullPropagates`, `naryNullPropagates`;
 - scalar broadcast length inference: `inferBinaryExecLen`, `inferNaryExecLen`;
-- chunk-aligned iterators: `UnaryExecChunkIterator`, `BinaryExecChunkIterator`, `NaryExecChunkIterator`.
+- chunk-aligned iterators: `UnaryExecChunkIterator`, `BinaryExecChunkIterator`, `NaryExecChunkIterator`;
+- `dense.execElementwise`: the driver of the element-wise families (array / chunked / scalar dispatch,
+  `validateLayout` of every input chunk, null scalars under intersection), with `dense.Bits` /
+  `dense.mapBits` for packed-bit operands.
 
 Permutation-family helpers include:
 
@@ -318,7 +347,7 @@ Readable mismatch diagnostics are available:
 ## 11. References
 
 - Example: [`examples/compute_lifecycle.zig`](../examples/compute_lifecycle.zig)
-- Reference kernels used for timing the framework: [`benchmarks/compute_benchmark.zig`](../benchmarks/compute_benchmark.zig)
+- Kernel family benchmarks: [`benchmarks/compute_benchmark.zig`](../benchmarks/compute_benchmark.zig)
 - Support status against the Arrow catalog: [compute-support-matrix.md](compute-support-matrix.md)
 - Readiness note: [ecosystem-readiness.md](ecosystem-readiness.md)
 - Arrow C++: [compute functions](https://arrow.apache.org/docs/cpp/compute.html),

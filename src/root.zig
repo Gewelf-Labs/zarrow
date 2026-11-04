@@ -250,6 +250,8 @@ pub const computeDatumSelectNullable = compute_mod.datumSelectNullable;
 pub const computeDatumFilter = compute_mod.datumFilter;
 pub const computeIntCastOrInvalidCast = compute_mod.intCastOrInvalidCast;
 pub const computeArithmeticDivI64 = compute_mod.arithmeticDivI64;
+/// Register every kernel family of this repository (the equivalent of `arrow::compute::Initialize()`).
+pub const computeRegisterAll = compute_mod.registerAll;
 
 // Pull buffer tests into the root test target.
 test {

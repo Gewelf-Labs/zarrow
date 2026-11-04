@@ -601,6 +601,84 @@ test "stream reader zero-copy read equals copying read on pyarrow fixtures" {
     try expectZeroCopyMatchesCopy(allocator, @embedFile("testdata/pyarrow_multi_batch_stream.arrow"), true);
 }
 
+test "stream and file readers reject a dictionary index equal to the dictionary length at decode" {
+    const allocator = std.testing.allocator;
+    const SharedBuffer = array_data.SharedBuffer;
+    const value_type = DataType{ .string = {} };
+    const offsets = [_]i32{ 0, 1, 3, 6 };
+    const dict_bufs = [_]SharedBuffer{ .empty, .fromSlice(std.mem.sliceAsBytes(offsets[0..])), .fromSlice("abbccc") };
+    var dict = try ArrayRef.fromBorrowed(allocator, .{ .data_type = value_type, .length = 3, .null_count = 0, .buffers = &dict_bufs });
+    defer dict.release();
+    // Row 1 is null and holds an out-of-range index, which stays legal; a valid row naming
+    // index 3 (== dictionary length) or a negative index is rejected by the reader itself.
+    const validity = [_]u8{0b101};
+    const Case = struct { width: u8, indices: [3]i64, ok: bool };
+    const cases = [_]Case{
+        .{ .width = 16, .indices = .{ 2, 77, 0 }, .ok = true },
+        .{ .width = 16, .indices = .{ 2, 77, 3 }, .ok = false },
+        .{ .width = 32, .indices = .{ 3, 0, 1 }, .ok = false },
+        .{ .width = 8, .indices = .{ 0, 1, -1 }, .ok = false },
+        .{ .width = 64, .indices = .{ 1, -5, 2 }, .ok = true },
+    };
+    for (cases) |c| {
+        const dict_type = DataType{ .dictionary = .{ .id = 0, .index_type = .{ .bit_width = c.width, .signed = true }, .value_type = &value_type } };
+        const fields = [_]Field{.{ .name = "d", .data_type = &dict_type, .nullable = true }};
+        const schema = Schema{ .fields = &fields };
+        var raw: [3 * 8]u8 align(8) = undefined;
+        for (c.indices, 0..) |v, k| switch (c.width) {
+            8 => std.mem.writeInt(i8, raw[k..][0..1], @intCast(v), .little),
+            16 => std.mem.writeInt(i16, raw[k * 2 ..][0..2], @intCast(v), .little),
+            32 => std.mem.writeInt(i32, raw[k * 4 ..][0..4], @intCast(v), .little),
+            else => std.mem.writeInt(i64, raw[k * 8 ..][0..8], v, .little),
+        };
+        const bufs = [_]SharedBuffer{ .fromSlice(&validity), .fromSlice(raw[0 .. 3 * @as(usize, c.width / 8)]) };
+        var col = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dict_type, .length = 3, .null_count = 1, .buffers = &bufs, .dictionary = dict });
+        defer col.release();
+        var batch = try RecordBatch.initBorrowed(allocator, schema, &[_]ArrayRef{col});
+        defer batch.deinit();
+
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+        defer writer.deinit();
+        try writer.writeSchema(schema);
+        try writer.writeRecordBatch(batch);
+        try writer.writeEnd();
+
+        for ([_]bool{ false, true }) |zero_copy| {
+            var fixed: std.Io.Reader = .fixed(out.written());
+            var reader = if (zero_copy) StreamReader.initZeroCopy(allocator, &fixed, .fromSlice(out.written())) else StreamReader.init(allocator, &fixed);
+            defer reader.deinit();
+            _ = try reader.readSchema();
+            if (c.ok) {
+                var back = (try reader.nextRecordBatch()) orelse return error.TestUnexpectedResult;
+                defer back.deinit();
+                try back.columns[0].data().validateFull();
+            } else {
+                try std.testing.expectError(StreamError.InvalidBody, reader.nextRecordBatch());
+            }
+        }
+
+        var file_bytes: std.Io.Writer.Allocating = .init(allocator);
+        defer file_bytes.deinit();
+        var file_writer = try @import("file_writer.zig").FileWriter.init(allocator, &file_bytes.writer);
+        defer file_writer.deinit();
+        try file_writer.writeSchema(schema);
+        try file_writer.writeRecordBatch(batch);
+        try file_writer.writeEnd();
+        var file_reader = @import("file_reader.zig").FileReader.init(allocator, file_bytes.written());
+        defer file_reader.deinit();
+        _ = try file_reader.readSchema();
+        if (c.ok) {
+            var back = try file_reader.readRecordBatchAt(0);
+            defer back.deinit();
+            try back.columns[0].data().validateFull();
+        } else {
+            try std.testing.expectError(StreamError.InvalidBody, file_reader.readRecordBatchAt(0));
+        }
+    }
+}
+
 test "stream reader zero-copy read equals copying read for nested, dictionary and compressed streams" {
     const allocator = std.testing.allocator;
 
@@ -1693,6 +1771,10 @@ fn readArrayFromMeta(
         .dictionary = dictionary_ref,
     };
     try data.validateLayout();
+    // validateLayout only sizes the index buffer: bound every non-null index by the dictionary
+    // here (as the C data import does), not only in validateFull, so a decoded array never names a
+    // value past its dictionary.
+    if (layout_dt == .dictionary) data.validateDictionaryIndices(layout_dt.dictionary, 0, array_len) catch return StreamError.InvalidBody;
     return ArrayRef.fromOwnedInline(allocator, data);
 }
 

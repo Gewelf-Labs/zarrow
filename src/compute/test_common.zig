@@ -335,3 +335,224 @@ pub fn collectInt32ValuesFromDatum(allocator: std.mem.Allocator, datum: Datum) !
         },
     };
 }
+
+// ------------------------------------------------------------------ kernel family test helpers
+
+pub const kernels = @import("kernels.zig");
+pub const dense = @import("dense.zig");
+pub const bitmap = @import("../bitmap.zig");
+pub const SharedBuffer = @import("../buffer.zig").SharedBuffer;
+pub const none = Options.noneValue();
+
+/// Registry holding every kernel family (`registerAll`).
+pub fn kernelRegistry(allocator: std.mem.Allocator) !FunctionRegistry {
+    var registry = FunctionRegistry.init(allocator);
+    errdefer registry.deinit();
+    try kernels.registerAll(&registry);
+    return registry;
+}
+
+/// Array of the numeric or bool type `T` from optionals.
+pub fn makeArray(comptime T: type, allocator: std.mem.Allocator, values: []const ?T) !ArrayRef {
+    if (T == bool) return makeBoolArray(allocator, values);
+    var b = try array_mod.PrimitiveBuilder(T, dense.dataTypeOf(T)).init(allocator, values.len);
+    defer b.deinit();
+    for (values) |v| if (v) |x| try b.append(x) else try b.appendNull();
+    return b.finish();
+}
+
+/// Borrowed primitive array over `values` with an optional validity bitmap (null rows keep the
+/// given values, such as a zero divisor or minInt, where a builder would store zero).
+pub fn borrowedArray(comptime T: type, allocator: std.mem.Allocator, values: []const T, validity: ?[]const u8) !ArrayRef {
+    var nulls: usize = 0;
+    if (validity) |v| for (0..values.len) |i| {
+        if (!bitmap.bitIsSet(v, i)) nulls += 1;
+    };
+    const bufs = [_]SharedBuffer{ if (validity) |v| .fromSlice(v) else .empty, .fromSlice(std.mem.sliceAsBytes(values)) };
+    return ArrayRef.fromBorrowed(allocator, .{ .data_type = dense.dataTypeOf(T), .length = values.len, .null_count = nulls, .buffers = &bufs });
+}
+
+/// Random value of `T`: full range, with edge values (0, 1, -1, min, max, NaN, inf) mixed in.
+pub fn randomValue(comptime T: type, rng: std.Random) T {
+    if (T == bool) return rng.boolean();
+    const edge = rng.uintLessThan(u8, 16) == 0;
+    if (@typeInfo(T) == .float) {
+        if (edge) return switch (rng.uintLessThan(u8, 5)) {
+            0 => 0,
+            1 => std.math.nan(T),
+            2 => std.math.inf(T),
+            3 => -std.math.inf(T),
+            else => -0.0,
+        };
+        return @floatCast((rng.float(f64) - 0.5) * 2000.0);
+    }
+    if (edge) return switch (rng.uintLessThan(u8, 5)) {
+        0 => 0,
+        1 => 1,
+        2 => std.math.maxInt(T),
+        3 => std.math.minInt(T),
+        else => if (@typeInfo(T).int.signedness == .signed) -1 else 2,
+    };
+    return rng.int(T);
+}
+
+/// Options of `randomArray`.
+pub const RandomOptions = struct {
+    /// Keep integers in a range where add / subtract / multiply cannot overflow.
+    small: bool = false,
+    /// Avoid zero in valid rows.
+    nonzero: bool = false,
+};
+
+/// Random array of `len + off` rows (about `null_pct`% null) sliced to the last `len` rows, so
+/// the result has offset `off`.
+pub fn randomArray(comptime T: type, allocator: std.mem.Allocator, rng: std.Random, len: usize, off: usize, null_pct: u8, opts: RandomOptions) !ArrayRef {
+    var values: std.ArrayList(?T) = .empty;
+    defer values.deinit(allocator);
+    for (0..len + off) |_| {
+        if (rng.uintLessThan(u8, 100) < null_pct) {
+            try values.append(allocator, null);
+            continue;
+        }
+        var v = randomValue(T, rng);
+        if (T != bool and @typeInfo(T) == .int and opts.small) {
+            v = v >> (@typeInfo(T).int.bits / 2 + 1);
+        }
+        if (T != bool and opts.nonzero and v == 0) v = 1;
+        try values.append(allocator, v);
+    }
+    var full = try makeArray(T, allocator, values.items);
+    defer full.release();
+    return full.slice(off, len);
+}
+
+/// Random utf8 values of type `tag` (string / large_string / string_view), some longer than 12
+/// bytes so string_view stores them out of line; sliced like `randomArray`.
+pub fn randomStrings(comptime tag: std.meta.Tag(DataType), allocator: std.mem.Allocator, rng: std.Random, len: usize, off: usize, null_pct: u8) !ArrayRef {
+    const Builder = switch (tag) {
+        .string => array_mod.StringBuilder,
+        .large_string => array_mod.LargeStringBuilder,
+        .string_view => array_mod.StringViewBuilder,
+        else => @compileError("not a string type"),
+    };
+    var b = try Builder.init(allocator, len + off, (len + off) * 20);
+    defer b.deinit();
+    const alphabet = "abz";
+    var buf: [24]u8 = undefined;
+    for (0..len + off) |_| {
+        if (rng.uintLessThan(u8, 100) < null_pct) {
+            try b.appendNull();
+            continue;
+        }
+        const n = if (rng.boolean()) rng.uintAtMost(usize, 4) else rng.uintAtMost(usize, 20);
+        for (buf[0..n]) |*c| c.* = alphabet[rng.uintLessThan(usize, alphabet.len)];
+        try b.append(buf[0..n]);
+    }
+    var full = try b.finish();
+    defer full.release();
+    return full.slice(off, len);
+}
+
+/// Bytes of string row `i` (string / large_string / string_view), null for a null row.
+pub fn stringAt(data: *const array_mod.ArrayData, i: usize) !?[]const u8 {
+    if (data.isNull(i)) return null;
+    return switch (data.data_type) {
+        .string => try (array_mod.StringArray{ .data = data }).value(i),
+        .large_string => try (array_mod.LargeStringArray{ .data = data }).value(i),
+        .string_view => try (array_mod.StringViewArray{ .data = data }).value(i),
+        else => error.InvalidInput,
+    };
+}
+
+fn collectArray(comptime T: type, data: *const array_mod.ArrayData, out: []?T) !void {
+    for (out, 0..) |*o, i| {
+        if (data.isNull(i)) {
+            o.* = null;
+        } else if (T == bool) {
+            o.* = try (array_mod.BooleanArray{ .data = data }).value(i);
+        } else {
+            o.* = (try (array_mod.PrimitiveArray(T){ .data = data }).values())[i];
+        }
+    }
+}
+
+/// Rows of an array, chunked or scalar datum of `T` (numeric or bool) as optionals; caller frees.
+pub fn collect(comptime T: type, allocator: std.mem.Allocator, datum: Datum) ![]?T {
+    switch (datum) {
+        .array => |arr| {
+            const out = try allocator.alloc(?T, arr.data().length);
+            errdefer allocator.free(out);
+            try collectArray(T, arr.data(), out);
+            return out;
+        },
+        .chunked => |chunked| {
+            const out = try allocator.alloc(?T, chunked.len());
+            errdefer allocator.free(out);
+            var pos: usize = 0;
+            for (chunked.chunks()) |chunk| {
+                try collectArray(T, chunk.data(), out[pos..][0..chunk.data().length]);
+                pos += chunk.data().length;
+            }
+            return out;
+        },
+        .scalar => |s| {
+            const out = try allocator.alloc(?T, 1);
+            errdefer allocator.free(out);
+            out[0] = if (s.isNull()) null else try dense.scalarAs(T, s);
+            return out;
+        },
+    }
+}
+
+/// Element-wise equality of optional rows; NaN equals NaN.
+pub fn expectRows(comptime T: type, expected: []const ?T, actual: []const ?T) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |e, a, i| {
+        const same = if (e == null or a == null)
+            e == null and a == null
+        else if (T != bool and @typeInfo(T) == .float)
+            (std.math.isNan(e.?) and std.math.isNan(a.?)) or e.? == a.?
+        else
+            e.? == a.?;
+        if (!same) {
+            std.debug.print("row {d}: expected {any}, got {any}\n", .{ i, e, a });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+/// Invoke `name` and compare the result rows with `expected`; the output must validate.
+pub fn expectInvoke(comptime T: type, ctx: *ExecContext, kind: core.FunctionKind, name: []const u8, args: []const Datum, expected: []const ?T) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invoke(name, kind, args, none);
+    defer out.release();
+    switch (out) {
+        .array => |arr| try arr.data().validateFull(),
+        .chunked => |chunked| for (chunked.chunks()) |c| try c.data().validateFull(),
+        .scalar => {},
+    }
+    const rows = try collect(T, allocator, out);
+    defer allocator.free(rows);
+    try expectRows(T, expected, rows);
+}
+
+/// Chunked array of `arr` cut before each index in `cuts` (ascending, inside `(0, len)`).
+pub fn chunkedAt(allocator: std.mem.Allocator, arr: ArrayRef, cuts: []const usize) !ChunkedArray {
+    var parts: std.ArrayList(ArrayRef) = .empty;
+    defer {
+        for (parts.items) |*p| p.release();
+        parts.deinit(allocator);
+    }
+    var start: usize = 0;
+    for (cuts) |c| {
+        try parts.append(allocator, try arr.slice(start, c - start));
+        start = c;
+    }
+    try parts.append(allocator, try arr.slice(start, arr.data().length - start));
+    return ChunkedArray.init(allocator, arr.data().data_type, parts.items);
+}
+
+/// Scalar of the Zig primitive `v` (or a null one).
+pub fn scalarOf(comptime T: type, v: ?T) Scalar {
+    return Scalar.init(dense.dataTypeOf(T), if (v) |x| dense.scalarValueOf(T, x) else .null);
+}

@@ -41,13 +41,19 @@ pub fn DenseBinaryOutput(comptime T: type) type {
 
         /// `rhs` may be null for a unary kernel. Rows are `lhs.length`; `rhs` must have the same length.
         pub fn init(allocator: std.mem.Allocator, lhs: *const ArrayData, rhs: ?*const ArrayData, out_type: DataType) !Self {
-            const len = lhs.length;
-            if (rhs) |r| if (r.length != len) return error.InvalidInput;
+            return initValidity(allocator, lhs.length, lhs, rhs, out_type);
+        }
+
+        /// Allocate the output for `len` rows; a null input stands for a non-null scalar operand
+        /// (it adds no nulls). Every input that is present must have `len` rows.
+        pub fn initValidity(allocator: std.mem.Allocator, len: usize, lhs: ?*const ArrayData, rhs: ?*const ArrayData, out_type: DataType) error{ OutOfMemory, InvalidInput }!Self {
+            const inputs = [2]?*const ArrayData{ lhs, rhs };
+            for (inputs) |maybe| if (maybe) |input| if (input.length != len) return error.InvalidInput;
             var values_buf = try OwnedBuffer.initUninit(allocator, if (is_bits) bitmap.byteLength(len) else len * @sizeOf(T));
             errdefer values_buf.deinit();
 
             var validity: ?OwnedBuffer = null;
-            const inputs = [2]?*const ArrayData{ lhs, rhs };
+            errdefer if (validity) |*v| v.deinit();
             for (inputs) |maybe| {
                 const input = maybe orelse continue;
                 if (!input.hasNulls()) continue;
@@ -123,6 +129,275 @@ pub inline fn laneMask(data: *const ArrayData, bits: ?[]const u8, i: usize) @Vec
     const bytes: @Vector(8, u8) = @splat(byte);
     const shifts = @Vector(8, u3){ 0, 1, 2, 3, 4, 5, 6, 7 };
     return ((bytes >> shifts) & @as(@Vector(8, u8), @splat(1))) == @as(@Vector(8, u8), @splat(1));
+}
+
+// ------------------------------------------------------------------- element-wise kernel driver
+
+const core = @import("core.zig");
+const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
+
+const ChunkedArray = core.ChunkedArray;
+const Datum = core.Datum;
+const ExecChunkValue = core.ExecChunkValue;
+const ExecContext = core.ExecContext;
+const KernelError = core.KernelError;
+const Options = core.Options;
+const Scalar = core.Scalar;
+const ScalarValue = core.ScalarValue;
+const TypeTag = std.meta.Tag(DataType);
+
+/// Zig element types of the numeric kernels (int8..int64, uint8..uint64, float32, float64).
+pub const numeric_types = [_]type{ i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 };
+
+/// Return the Arrow type of the Zig primitive `T`.
+pub fn dataTypeOf(comptime T: type) DataType {
+    return switch (T) {
+        bool => .{ .bool = {} },
+        i8 => .{ .int8 = {} },
+        i16 => .{ .int16 = {} },
+        i32 => .{ .int32 = {} },
+        i64 => .{ .int64 = {} },
+        u8 => .{ .uint8 = {} },
+        u16 => .{ .uint16 = {} },
+        u32 => .{ .uint32 = {} },
+        u64 => .{ .uint64 = {} },
+        f32 => .{ .float = {} },
+        f64 => .{ .double = {} },
+        else => @compileError("no Arrow type for " ++ @typeName(T)),
+    };
+}
+
+/// `ScalarValue` field holding a `T` (`i32`, `f64`, `bool`, ...).
+fn scalarField(comptime T: type) []const u8 {
+    return switch (T) {
+        f32 => "f32",
+        f64 => "f64",
+        else => @typeName(T),
+    };
+}
+
+/// Return the scalar value holding the Zig primitive `v`.
+pub fn scalarValueOf(comptime T: type, v: T) ScalarValue {
+    return @unionInit(ScalarValue, scalarField(T), v);
+}
+
+/// Return the value of a non-null scalar as `T`; `InvalidInput` when the payload does not hold a `T`.
+pub fn scalarAs(comptime T: type, s: Scalar) KernelError!T {
+    const field = comptime scalarField(T);
+    if (std.meta.activeTag(s.value) != @field(std.meta.Tag(ScalarValue), field)) return error.InvalidInput;
+    return @field(s.value, field);
+}
+
+/// Return a type check accepting exactly `arity` arguments of type `tag` (array, chunked or scalar).
+pub fn argsOfType(comptime tag: TypeTag, comptime arity: usize) *const fn ([]const Datum) bool {
+    return &struct {
+        fn check(args: []const Datum) bool {
+            if (args.len != arity) return false;
+            for (args) |arg| if (std.meta.activeTag(arg.dataType()) != tag) return false;
+            return true;
+        }
+    }.check;
+}
+
+/// Return a result type callback that always answers `dt`.
+pub fn resultTypeOf(comptime dt: DataType) *const fn ([]const Datum, Options) KernelError!DataType {
+    return &struct {
+        fn infer(_: []const Datum, _: Options) KernelError!DataType {
+            return dt;
+        }
+    }.infer;
+}
+
+/// Accept only `Options.none` (kernels that read no options).
+pub fn noOptions(options: Options) bool {
+    return options == .none;
+}
+
+/// Return the array of an exec chunk value, or null for a scalar.
+pub fn arrayData(v: ExecChunkValue) ?*const ArrayData {
+    return switch (v) {
+        .array => |arr| arr.data(),
+        .scalar => null,
+    };
+}
+
+/// A numeric operand: the typed values of an array chunk (offset applied) or a non-null scalar.
+pub fn Operand(comptime T: type) type {
+    return union(enum) { slice: []const T, scalar: T };
+}
+
+/// Return the numeric operand of an exec chunk value (`InvalidInput` on a malformed buffer or scalar).
+pub fn operand(comptime T: type, v: ExecChunkValue) KernelError!Operand(T) {
+    return switch (v) {
+        .array => |arr| .{ .slice = (PrimitiveArray(T){ .data = arr.data() }).values() catch return error.InvalidInput },
+        .scalar => |s| .{ .scalar = try scalarAs(T, s) },
+    };
+}
+
+fn Elem(comptime V: type) type {
+    return if (@typeInfo(V) == .pointer) std.meta.Child(V) else V;
+}
+
+/// Return row `i` of an operand payload: `v[i]` for a slice, `v` for a broadcast scalar.
+pub inline fn at(v: anytype, i: usize) Elem(@TypeOf(v)) {
+    return if (comptime @typeInfo(@TypeOf(v)) == .pointer) v[i] else v;
+}
+
+/// Kernel callback that computes one output chunk from aligned input chunks of `len` rows.
+pub const ChunkFn = fn (ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef;
+
+/// Run a unary or binary element-wise kernel chunk by chunk: all-scalar inputs give a scalar, any
+/// chunked input gives a chunked output (chunk boundaries are the union of the inputs'), otherwise
+/// an array. Every array chunk passes `validateLayout` first, so `chunk_fn` may index its buffers.
+/// With `null_scalars_propagate` (null intersection) a null scalar input yields an all-null chunk
+/// without calling `chunk_fn`.
+pub fn execElementwise(
+    ctx: *ExecContext,
+    args: []const Datum,
+    out_type: DataType,
+    comptime null_scalars_propagate: bool,
+    comptime chunk_fn: ChunkFn,
+) KernelError!Datum {
+    if (args.len == 0 or args.len > 2) return error.InvalidArity;
+    const len = try core.inferNaryExecLen(args);
+    var any_chunked = false;
+    var all_scalar = true;
+    for (args) |arg| {
+        if (arg == .chunked) any_chunked = true;
+        if (arg != .scalar) all_scalar = false;
+    }
+    if (!any_chunked) {
+        var values: [2]ExecChunkValue = undefined;
+        for (args, 0..) |arg, i| values[i] = switch (arg) {
+            .array => |arr| .{ .array = arr },
+            .scalar => |s| .{ .scalar = s },
+            .chunked => unreachable,
+        };
+        var out = try runChunk(ctx, values[0..args.len], len, out_type, null_scalars_propagate, chunk_fn);
+        if (!all_scalar) return .{ .array = out };
+        defer out.release();
+        return .{ .scalar = try scalarAt0(out) };
+    }
+
+    var it = try core.NaryExecChunkIterator.init(ctx.allocator, args);
+    defer it.deinit();
+    var outs: std.ArrayList(ArrayRef) = .empty;
+    defer {
+        for (outs.items) |*o| o.release();
+        outs.deinit(ctx.allocator);
+    }
+    while (try it.next()) |next| {
+        var chunk = next;
+        defer chunk.deinit();
+        var out = try runChunk(ctx, chunk.values, chunk.len, out_type, null_scalars_propagate, chunk_fn);
+        outs.append(ctx.allocator, out) catch {
+            out.release();
+            return error.OutOfMemory;
+        };
+    }
+    const chunked = ChunkedArray.init(ctx.allocator, out_type, outs.items) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    return .{ .chunked = chunked };
+}
+
+fn runChunk(
+    ctx: *ExecContext,
+    values: []const ExecChunkValue,
+    len: usize,
+    out_type: DataType,
+    comptime null_scalars_propagate: bool,
+    comptime chunk_fn: ChunkFn,
+) KernelError!ArrayRef {
+    for (values) |v| if (v == .array) v.array.data().validateLayout() catch return error.InvalidInput;
+    if (null_scalars_propagate) for (values) |v| {
+        if (v == .scalar and v.scalar.isNull()) return (try core.datumBuildNullLikeWithAllocator(ctx.allocator, out_type, len)).array;
+    };
+    return chunk_fn(ctx, values, len);
+}
+
+/// Return row 0 of a numeric or bool kernel output as a scalar.
+fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
+    const data = arr.data();
+    if (data.length != 1) return error.InvalidInput;
+    if (data.isNull(0)) return Scalar.init(data.data_type, .null);
+    if (data.data_type == .bool) return Scalar.init(data.data_type, .{ .bool = bitmap.bitIsSet(data.buffers[1].data, data.offset) });
+    inline for (numeric_types) |T| {
+        if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dataTypeOf(T))) {
+            const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
+            return Scalar.init(data.data_type, scalarValueOf(T, values[0]));
+        }
+    }
+    return error.UnsupportedType;
+}
+
+/// Packed bits read 8 rows at a time: an array buffer at a bit offset, or a broadcast byte.
+pub const Bits = struct {
+    /// Null for a broadcast operand (`splat` in every byte).
+    bytes: ?[]const u8 = null,
+    /// Bit position of row 0 in `bytes`.
+    offset: usize = 0,
+    splat: u8 = 0xFF,
+
+    /// Return rows `[8 * j, 8 * j + 8)` as one byte (bit 0 = first row).
+    pub inline fn byte(self: Bits, j: usize) u8 {
+        const b = self.bytes orelse return self.splat;
+        return bitmap.byteAtBit(b, self.offset + j * 8);
+    }
+
+    /// Return the value bits of a bool array.
+    pub fn values(data: *const ArrayData) Bits {
+        return .{ .bytes = data.buffers[1].data, .offset = data.offset };
+    }
+
+    /// Return the validity of `data` (all valid when it has no null; all null for the null type).
+    pub fn validity(data: *const ArrayData) Bits {
+        if (datatype.storageDataType(data.data_type) == .null) return .{ .splat = 0 };
+        const bits = validityBits(data) orelse return .{};
+        return .{ .bytes = bits, .offset = data.offset };
+    }
+
+    /// Return all-set bits for `true`, all-clear bits for `false`.
+    pub fn of(b: bool) Bits {
+        return .{ .splat = if (b) 0xFF else 0 };
+    }
+};
+
+/// Set `out[j] = f(operand bytes j)` for the `out.len` bytes of a packed bool output of `len`
+/// rows; bits past `len` in the last byte are cleared.
+pub fn mapBits(comptime N: usize, out: []u8, ops: [N]Bits, len: usize, comptime f: fn ([N]u8) u8) void {
+    var byte_aligned = true;
+    for (ops) |o| {
+        if (o.bytes != null and o.offset % 8 != 0) byte_aligned = false;
+    }
+    if (byte_aligned) {
+        var bases: [N]usize = undefined;
+        for (ops, &bases) |o, *b| b.* = o.offset / 8;
+        for (out, 0..) |*d, j| {
+            var in: [N]u8 = undefined;
+            inline for (0..N) |k| in[k] = if (ops[k].bytes) |b| b[bases[k] + j] else ops[k].splat;
+            d.* = f(in);
+        }
+    } else for (out, 0..) |*d, j| {
+        var in: [N]u8 = undefined;
+        inline for (0..N) |k| in[k] = ops[k].byte(j);
+        d.* = f(in);
+    }
+    if (len % 8 != 0) out[out.len - 1] &= (@as(u8, 1) << @as(u3, @intCast(len % 8))) - 1;
+}
+
+/// Return a bool array of `len` rows built from packed value bits and an optional validity
+/// bitmap; takes ownership of both buffers (also on error).
+pub fn boolArray(allocator: std.mem.Allocator, len: usize, values_buf: OwnedBuffer, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    var out = DenseBinaryOutput(bool){ .allocator = allocator, .len = len, .values_buf = values_buf, .validity = validity, .out_type = .{ .bool = {} } };
+    errdefer out.deinit();
+    return out.finish() catch error.OutOfMemory;
+}
+
+/// Return an uninitialized packed-bit buffer for `len` rows.
+pub fn bitsBuffer(allocator: std.mem.Allocator, len: usize) KernelError!OwnedBuffer {
+    return OwnedBuffer.initUninit(allocator, bitmap.byteLength(len)) catch error.OutOfMemory;
 }
 
 // ------------------------------------------------------------------------------------------ tests
