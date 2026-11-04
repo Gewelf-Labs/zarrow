@@ -10,8 +10,8 @@ Legend:
 - **yes**: a public operation exists in this repository with the same semantics, and a test exercises it.
 - **partial**: a building block exists (types, helpers, accessors) but no callable function, or the
   operation exists without a test.
-- **no**: nothing in this repository. Kernels in this state belong downstream (see
-  [compute-api.md](compute-api.md), section 1).
+- **no**: nothing in this repository yet. Kernels in this state are to be added under `src/compute/`
+  (see [compute-api.md](compute-api.md), section 9).
 
 ## Evidence rule
 
@@ -22,7 +22,7 @@ Every `yes` or `partial` row cites its evidence: at least one **source** referen
 row lacks either kind of reference. The rule itself is stated in [`CLAUDE.md`](../CLAUDE.md).
 
 The framework itself (function registry, signatures, options, exec context, aggregate lifecycle, chunk-aware
-iterators) is complete and is what downstream kernel libraries build on. `FunctionRegistry.init` starts
+iterators) is complete and is what the kernel families build on. `FunctionRegistry.init` starts
 empty: there is no built-in kernel catalog, and `arrow::compute::Initialize()` has no counterpart.
 
 ## Calling model
@@ -38,7 +38,7 @@ empty: there is no built-in kernel catalog, and `arrow::compute::Initialize()` h
 | Kernel signature matching and dispatch diagnostics | `KernelSignature.matches`, `explainMismatch`, `FunctionRegistry.resolveKernel`, `explainResolveKernelFailure` | yes | `src/compute/signature.zig:157`, `src/compute/signature.zig:173`, `src/compute/registry.zig:183`, `src/compute/registry.zig:217` | `src/compute/test_registry.zig:"compute resolveKernel prefers exact then range then at_least arity"`, `src/compute/test_options.zig:"compute explain helpers provide readable diagnostics"` |
 | chunked execution (`ExecBatch` / `ExecSpan`) | `UnaryExecChunkIterator`, `BinaryExecChunkIterator`, `NaryExecChunkIterator` | yes | `src/compute/iterators.zig:237`, `src/compute/iterators.zig:269`, `src/compute/iterators.zig:308` | `src/compute/test_iterators.zig:"compute execution helpers align chunked chunks for binary kernels"`, `src/compute/test_iterators.zig:"compute nary execution helper aligns misaligned chunk boundaries"`, `src/compute/test_iterators.zig:"compute unary execution helper propagates nulls over chunked input"` |
 | `NullHandling::INTERSECTION` | `unaryNullPropagates` / `binaryNullPropagates` / `naryNullPropagates`, `dense.DenseBinaryOutput`, `dense.validityBits`, `dense.laneMask` | yes | `src/compute/iterators.zig:43`, `src/compute/dense.zig:31`, `src/compute/dense.zig:111`, `src/compute/dense.zig:119` | `src/compute/test_iterators.zig:"compute nary execution helper propagates nulls across all inputs"`, `src/compute/dense.zig:"DenseBinaryOutput validity equals per-row null propagation (sliced, nullable, empty inputs)"`, `src/compute/dense.zig:"laneMask matches isNull per row (random, sliced, all-null, no-null, tail block)"` |
-| `arrow::compute::Initialize()` | none; downstream registers its kernels into a `FunctionRegistry` | no (by design) | | |
+| `arrow::compute::Initialize()` | none yet; each kernel family exposes `register`, an all-families convenience is planned | no | | |
 
 ## Function catalog
 

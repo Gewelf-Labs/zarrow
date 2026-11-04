@@ -44,8 +44,8 @@ Use `zarrow` when you want to:
 | Arrow IPC stream read/write | Supported |
 | Arrow IPC interop fixtures | Supported |
 | Arrow C Data / C Stream ABI | Supported |
-| `zarrow-core` module for downstream libraries | Supported |
-| Full compute kernels | Downstream project: [zarrow-compute](https://github.com/tylitianrui/zarrow-compute) |
+| `zarrow-core` module (core and compute without IPC/FFI) | Supported |
+| Compute kernels | In this repository: selections, concat, dictionary encode and validation today; see [docs/compute-support-matrix.md](docs/compute-support-matrix.md) |
 | Parquet | Downstream project: [zarrow-parquet](https://github.com/tylitianrui/zarrow-parquet) |
 
 The project favors correctness, explicit ownership, interop testing, and spec-aligned behavior over premature API stabilization.
@@ -63,9 +63,9 @@ The project favors correctness, explicit ownership, interop testing, and spec-al
 - Arrow IPC stream read/write
 - Arrow C Data / C Stream ABI import/export
 - Shared C ABI library surface: `zarrow_c`
-- `zarrow-core` module for downstream libraries that do not need IPC/FFI
+- `zarrow-core` module for consumers that do not need IPC/FFI
 - Interop smoke tests against Arrow Go, Arrow C++, and arrow-rs tooling
-- Compute framework foundation for downstream [zarrow-compute](https://github.com/tylitianrui/zarrow-compute)
+- Compute framework and kernels (one repository for core and compute; see [docs/repo-layout.md](docs/repo-layout.md))
 - Examples, benchmarks, fuzz corpus, and CI-oriented compatibility tools
 
 ---
@@ -176,7 +176,7 @@ len=3, v0=10, isNull1=true, v2=30
 | Module | Purpose |
 | --- | --- |
 | `zarrow` | Full public package surface, including arrays, schemas, record batches, IPC, and public Arrow data structures. |
-| `zarrow-core` | Core-only surface for downstream libraries that do not require IPC or FFI dependencies. Useful for compute libraries such as [zarrow-compute](https://github.com/tylitianrui/zarrow-compute). |
+| `zarrow-core` | Core and compute surface for consumers that do not require IPC or FFI dependencies. Useful for consumers that only need data structures and compute. |
 
 The build also provides a C ABI shared library:
 
@@ -226,7 +226,7 @@ zig build interop-fixture-check -- .interop-fixtures/zarrow.arrow canonical stre
 
 ## Compute Framework
 
-`zarrow` includes a compute framework foundation for downstream projects such as [zarrow-compute](https://github.com/tylitianrui/zarrow-compute).
+`zarrow` includes the compute framework and the compute kernels. Core and compute are one repository (see [docs/repo-layout.md](docs/repo-layout.md)).
 
 The core library provides framework-level building blocks:
 
@@ -242,14 +242,15 @@ The core library provides framework-level building blocks:
 - unary, binary, and n-ary execution helpers
 - chunk-aware helpers for take, filter, and permutation-style operations
 
-`zarrow` intentionally does **not** try to own the full compute function catalog in this repository. Concrete kernels such as arithmetic, comparison, filter, sort, cast, and aggregate functions should live in downstream libraries such as [zarrow-compute](https://github.com/tylitianrui/zarrow-compute).
+Concrete kernels (arithmetic, comparison, filter, sort, cast, aggregate families) belong in `src/compute/`, one file per family with tests and benchmarks. The selection, concat, dictionary-encode and validation kernels are there today; the rest of the Arrow catalog is tracked in the support matrix.
 
-For the downstream API boundary, see:
+For the compute API and status, see:
 
 - [docs/compute-api.md](docs/compute-api.md)
 - [docs/compute-api-zh.md](docs/compute-api-zh.md)
 - [docs/compute-support-matrix.md](docs/compute-support-matrix.md): status of every Arrow C++ compute function category here
 - [docs/canonical-extensions.md](docs/canonical-extensions.md): coverage of Arrow's canonical extension types
+- [docs/repo-layout.md](docs/repo-layout.md): core and compute in one repository, where kernels go
 - [docs/ecosystem-readiness.md](docs/ecosystem-readiness.md)
 - Example: [`examples/compute_lifecycle.zig`](examples/compute_lifecycle.zig)
 
@@ -381,19 +382,18 @@ See:
 
 `zarrow` is intended to be the base layer for a Zig Arrow ecosystem.
 
-Downstream and related projects:
+Related projects:
 
-- [zarrow-compute](https://github.com/tylitianrui/zarrow-compute) — Arrow compute kernels in Zig, built on top of `zarrow` / `zarrow-core`.
 - [zarrow-parquet](https://github.com/tylitianrui/zarrow-parquet) — Parquet read/write integration built as a downstream project.
 
 Planned or natural ecosystem directions:
 
-- compute kernels;
+- the rest of the Arrow compute catalog, in this repository;
 - dataframe/query-engine integration;
 - Parquet integration;
 - Arrow Flight / IPC tooling;
 - PyArrow / Arrow C++ / arrow-rs interoperability examples;
-- more downstream examples using `zarrow-core`.
+- more examples using `zarrow-core`.
 
 If your project uses `zarrow`, feel free to open a PR adding it to this section.
 
@@ -406,8 +406,8 @@ Near-term priorities:
 - keep Arrow layout behavior spec-aligned;
 - expand type coverage tests and examples;
 - strengthen IPC and C ABI interop coverage;
-- improve downstream `zarrow-core` ergonomics;
-- support [zarrow-compute](https://github.com/tylitianrui/zarrow-compute) with stable compute framework boundaries;
+- improve `zarrow-core` ergonomics;
+- grow the compute kernel catalog in `src/compute/` (see the support matrix);
 - add more real-world interop demos;
 - improve documentation for ownership, memory layout, and lifecycle rules.
 

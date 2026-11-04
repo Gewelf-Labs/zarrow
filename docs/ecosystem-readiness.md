@@ -1,15 +1,16 @@
 # zarrow ecosystem extension readiness (compute refresh)
 
 > Refresh date: 2026-05-02  
-> Scope: the compute core and the boundary for downstream kernel extensions (zarrow-compute and similar)
+> Scope: the compute core and the boundary between the framework and the kernel families in `src/compute/`
+> (superseded in part: core and compute are one repository, see [repo-layout.md](repo-layout.md))
 
 ---
 
 ## 0. Executive conclusion
 
 Current conclusion: **the compute framework has array / scalar / chunked entry points for data and provides
-chunk-aware permutation primitives; downstream repositories should implement concrete business kernels on top
-of it.**
+chunk-aware permutation primitives; kernel families implement concrete kernels on top of it, in this
+repository.**
 
 - `Datum` is now three-state (`array / scalar / chunked`); it is no longer limited to a single chunk.
 - The compute core is responsible for the type and dispatch framework, shared helpers and the options
@@ -47,14 +48,14 @@ Current definition and behavior of `Datum`:
 
 This means:
 
-- downstream kernels can accept `chunked` input directly;
+- kernels can accept `chunked` input directly;
 - "support chunked" is not a prerequisite refactoring task;
 - the focus shifts to "how to use the chunked helpers efficiently" rather than "is there a chunked entry
   point".
 
 ---
 
-## 3. Responsibility boundary: compute core vs downstream repositories
+## 3. Responsibility boundary: compute framework vs kernel families
 
 ### 3.1 What the compute core already provides
 
@@ -70,13 +71,13 @@ This means:
   - `chunkedResolveLogicalIndices`
   - consistent index and null handling on the chunked take / filter paths
 
-### 3.2 What downstream repositories own
+### 3.2 What kernel families own
 
 - The semantics and implementation of concrete business kernels (for example sort key interpretation,
   aggregation strategy, expression-level optimization)
 - The function catalog and naming conventions (which functions are exposed as stable API)
 - Performance strategy (parallelism, local sort algorithms, cross-chunk merge strategy)
-- Integration with higher-level engines and execution plans
+- Integration with higher-level engines and execution plans (those remain separate projects)
 
 ---
 
@@ -84,7 +85,7 @@ This means:
 
 ### 4.1 sort (recommended)
 
-1. Implement `sort_indices` downstream, with one logical semantics shared by array and chunked input.
+1. Implement `sort_indices` as a kernel family, with one logical semantics shared by array and chunked input.
 2. Reuse the core `Datum` and chunk helpers to map logical indices to chunk-local ones.
 3. Drive sort behavior through `SortOptions`; do not hard-code "ascending + nulls last" inside the kernel.
 4. If `array_sort_indices` is needed, make it an array specialization wrapping `sort_indices` rather than a
@@ -102,7 +103,7 @@ This means:
 - Chunk-aware execution: `datumFilterChunkAware`
 - When the legacy array output shape is required, use `datumFilter` (compatibility path)
 
-### 4.4 Consistency checklist (for downstream implementations)
+### 4.4 Consistency checklist (for kernel implementations)
 
 - Do array and chunked inputs yield the same logical result?
 - Misaligned chunk boundaries (contiguous and non-contiguous indices across chunks)
@@ -148,9 +149,9 @@ Matching payloads:
 
 ---
 
-## 6. Onboarding advice for downstream repositories (short version)
+## 6. Onboarding advice for a new kernel family (short version)
 
-- Step 1: depend only on the framework and helpers exported by `compute/core.zig`.
+- Step 1: use only the framework and helpers exported by `compute/core.zig`.
 - Step 2: land the three paths `sort_indices + take + filter` first, reusing the existing chunk-aware
   infrastructure.
 - Step 3: put options validation in `KernelSignature.options_check` instead of scattering type checks
@@ -167,6 +168,6 @@ Matching payloads:
 
 - The document matches the current compute public API: `Datum` is `array / scalar / chunked`.
 - The old statement "chunked datum support is missing" has been removed.
-- Clarified: the compute core provides the framework and helpers; downstream repositories implement concrete
-  kernels.
+- Clarified: the compute core provides the framework and helpers; kernel families in this repository
+  implement concrete kernels.
 - Added: the recommended extension path for `sort / take / filter` and the options family (including `sort`).

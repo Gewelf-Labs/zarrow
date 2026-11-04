@@ -1,8 +1,8 @@
-# Compute API (zarrow-core)
+# Compute API
 
-This document describes the downstream-facing compute framework API in `zarrow.compute`.
+This document describes the compute framework API in `zarrow.compute`.
 
-It is intended for external kernel libraries (for example `zarrow-compute`) that implement concrete compute functions on top of zarrow's core execution model.
+It is for anyone adding kernels to this repository (core and compute live together, see [repo-layout.md](repo-layout.md)) and for applications that register and invoke them.
 
 Chinese version: [compute-api-zh.md](compute-api-zh.md)
 
@@ -19,10 +19,10 @@ Chinese version: [compute-api-zh.md](compute-api-zh.md)
 - common helper utilities for array/scalar/chunked execution;
 - chunk-aware permutation helpers.
 
-`zarrow` does **not** aim to own the full compute function catalog in this repository.
-Concrete kernels (cast/arithmetic/comparison/filter/sort/aggregate families) should live in downstream libraries.
-`FunctionRegistry.init` therefore returns an empty registry; there is no equivalent of
-`arrow::compute::Initialize()`.
+Concrete kernels (cast/arithmetic/comparison/filter/sort/aggregate families) live in this repository under
+`src/compute/`, one file per family. `FunctionRegistry.init` returns an empty registry; each family exposes a
+`register` function, and a convenience that registers every family is the intended equivalent of
+`arrow::compute::Initialize()` (to be added with the first kernel family).
 
 What this repository does ship as callable operations: take/filter/select (`datumTake`, `datumFilter`,
 `datumSelect`), concatenation (`concatArrayRefs`), slicing, `dictionaryEncode`, validation and null-like /
@@ -218,7 +218,7 @@ Permutation-family helpers include:
 - `datumFilterChunkAware`
 - `datumSelect`, `datumSelectNullable`
 
-These are intended to help downstream kernels preserve chunked execution/output where possible, instead of pre-concatenating chunked inputs.
+These are intended to help kernels preserve chunked execution/output where possible, instead of pre-concatenating chunked inputs.
 
 ### Null handling
 
@@ -245,9 +245,9 @@ how much checking is expected; nothing in a kernel may weaken what `validateLayo
 
 ---
 
-## 9. Recommended Downstream Extension Path
+## 9. Recommended Extension Path
 
-For new sort/take/filter kernels in downstream repos:
+For new sort/take/filter kernels:
 
 1. keep one logical behavior for both array and chunked inputs;
 2. drive behavior through typed options (especially `SortOptions`), not hardcoded defaults;
@@ -257,11 +257,11 @@ For new sort/take/filter kernels in downstream repos:
 ### Adding a function, step by step
 
 This follows the Arrow C++ developer workflow (one function, its kernels, options, tests, benchmark, docs)
-translated to this repository's layout.
+translated to this repository's layout. Kernels are added here, not in a separate repository.
 
 1. **Name it like Arrow.** Use the Arrow C++ function name (`add`, `less`, `sum`, `sort_indices`), with
    the `_checked` suffix for the overflow-checking variant and `hash_` prefix for grouped aggregates, so
-   downstream users can read the Arrow reference. Options types end in `Options`.
+   users can read the Arrow reference. Options types end in `Options`.
 2. **Place the code.** One file per family, underscores in file names (`arithmetic.zig`,
    `comparison.zig`, `aggregate_basic.zig`); tests in `test_<family>.zig` next to it; a benchmark in
    `benchmarks/<family>_benchmark.zig`. Public symbols are re-exported from the family's `mod.zig`;
