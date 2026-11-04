@@ -21,6 +21,26 @@ Chinese version: [compute-api-zh.md](compute-api-zh.md)
 
 `zarrow` does **not** aim to own the full compute function catalog in this repository.
 Concrete kernels (cast/arithmetic/comparison/filter/sort/aggregate families) should live in downstream libraries.
+`FunctionRegistry.init` therefore returns an empty registry; there is no equivalent of
+`arrow::compute::Initialize()`.
+
+What this repository does ship as callable operations: take/filter/select (`datumTake`, `datumFilter`,
+`datumSelect`), concatenation (`concatArrayRefs`), slicing, `dictionaryEncode`, validation and null-like /
+empty-like construction. [compute-support-matrix.md](compute-support-matrix.md) maps every category of the
+Arrow C++ function catalog to its status here.
+
+### Arrow C++ to zarrow glossary
+
+| Arrow C++ | zarrow |
+|---|---|
+| `arrow::compute::Function` (name + kernels) | `Function` |
+| `ScalarKernel` / `VectorKernel` / `ScalarAggregateKernel` | `Kernel` with `FunctionKind.scalar` / `.vector` / `.aggregate` |
+| `KernelSignature` (`InputType`, `OutputType`, type matchers) | `KernelSignature` (`arity`, `type_check`, `result_type_fn`) |
+| `FunctionOptions` | `Options` (tagged union, section 3) |
+| `ExecContext` + `MemoryPool` | `ExecContext` + `std.mem.Allocator` (section 6) |
+| `Datum` | `Datum` (array, chunked, scalar) |
+| `ExecBatch` / `ExecSpan` chunk-wise execution | exec chunk iterators (section 8) |
+| `Status` / `Result<T>` | Zig error unions (`KernelError!T`, section 5) |
 
 ---
 
@@ -118,6 +138,17 @@ Helpful utility helpers are provided for common arithmetic/cast behavior:
 - `intCastOrInvalidCast(...)`
 - `arithmeticDivI64(...)`
 
+Error conventions, mirroring Arrow C++ (`Status`, `Result<T>`, no exceptions across the API):
+
+- every fallible kernel entry point returns an error union; a kernel never panics on input it was given
+  through the public API, including malformed arrays (validation errors are returned, not asserted);
+- `std.debug.assert` is reserved for internal invariants that cannot fail on valid input (Arrow's `DCHECK`),
+  and is stripped in release builds, so it must not guard input;
+- `OutOfMemory` passes through unchanged; kernels do not retry or fall back silently;
+- an unsupported type is `UnsupportedType`, a malformed value is `InvalidInput`, and an arity or option
+  mismatch is reported through the signature errors above, so callers can distinguish "cannot" from
+  "will not".
+
 ---
 
 ## 6. ExecContext and Config
@@ -138,6 +169,16 @@ For borrowed scalar string/binary data, use:
 
 - `ExecContext.dupScalarString(...)`
 - `ExecContext.dupScalarBinary(...)`
+
+Memory conventions (Arrow's `default_memory_pool()` has no implicit counterpart here):
+
+- every allocation is made through the allocator the caller passed (`ExecContext.allocator`, or the datum's
+  allocator through `inferDatumAllocator`); kernels never reach for a global allocator;
+- `ExecContext.tempAllocator()` is for scratch that dies with the call (uses `arena_allocator` when set);
+- output buffers are built with `OwnedBuffer` and handed over with `toShared`; a kernel that produces an array
+  returns it with `ArrayRef.fromOwnedInlineBuffers` so node and buffers are one allocation;
+- builders may keep a spare buffer from a previous batch, but reuse it only once `SharedBuffer.reclaim`
+  shows no live array references it (nothing may alias a buffer a live `ArrayRef` still holds).
 
 ---
 
@@ -179,6 +220,29 @@ Permutation-family helpers include:
 
 These are intended to help downstream kernels preserve chunked execution/output where possible, instead of pre-concatenating chunked inputs.
 
+### Null handling
+
+Arrow C++ kernels declare a `NullHandling` policy; here the policy is a choice of helper:
+
+- **intersection** (the default for element-wise kernels): combine input validity once, bitmap word by
+  word, then run the value loop over plain typed slices with no per-element null check. Null slots may
+  compute garbage that the output validity hides. Use `dense.DenseBinaryOutput`, `dense.validityBits` and
+  `dense.laneMask`; `unaryNullPropagates` / `binaryNullPropagates` / `naryNullPropagates` answer the
+  question for scalar inputs.
+- **computed**: the kernel writes its own validity (comparisons with Kleene logic, `is_null`-style
+  categorizations). Write the bitmap explicitly; do not derive it per row with `isNull`.
+- **output not null**: aggregates and count-like kernels return a scalar; use `Scalar.init`.
+
+Per-element `isNull` calls inside a hot loop are the one pattern to avoid: they were measured at 4 to
+15 ns per row against under 1 ns for the dense path.
+
+### Validity at trust boundaries
+
+Kernels may receive arrays that came from IPC or the C data interface. They must bounds-check what they
+read (buffer counts, offsets windows, index ranges, dictionary lengths) and return `InvalidInput` rather than
+trust `length` or `null_count`. The selection and concat kernels in this repository are the reference for
+how much checking is expected; nothing in a kernel may weaken what `validateLayout` establishes.
+
 ---
 
 ## 9. Recommended Downstream Extension Path
@@ -189,6 +253,54 @@ For new sort/take/filter kernels in downstream repos:
 2. drive behavior through typed options (especially `SortOptions`), not hardcoded defaults;
 3. reuse core chunk-aware helpers for index resolution, null handling, and gather/filter execution;
 4. test array/chunked logical equivalence, including misaligned chunk-boundary cases.
+
+### Adding a function, step by step
+
+This follows the Arrow C++ developer workflow (one function, its kernels, options, tests, benchmark, docs)
+translated to this repository's layout.
+
+1. **Name it like Arrow.** Use the Arrow C++ function name (`add`, `less`, `sum`, `sort_indices`), with
+   the `_checked` suffix for the overflow-checking variant and `hash_` prefix for grouped aggregates, so
+   downstream users can read the Arrow reference. Options types end in `Options`.
+2. **Place the code.** One file per family, underscores in file names (`arithmetic.zig`,
+   `comparison.zig`, `aggregate_basic.zig`); tests in `test_<family>.zig` next to it; a benchmark in
+   `benchmarks/<family>_benchmark.zig`. Public symbols are re-exported from the family's `mod.zig`;
+   anything not re-exported is internal.
+3. **Write the signature first.** `KernelSignature.unary` / `.binary` / `.atLeast` with a `type_check`
+   that accepts exactly the types the kernel handles (`unaryNumeric`, `binarySameNumeric`, or a custom
+   check) and a `result_type_fn` when the output type differs from the input.
+4. **Pick the kernel kind and options family.** `registerScalarKernel` for element-wise,
+   `registerVectorKernel` for whole-array (sort, unique, cumulative), `registerAggregateKernel` with an
+   `AggregateLifecycle` for reductions. Declare the options family the kernel reads
+   (`options_check`); read `ExecContext.overflowMode()` and `safeCastEnabled()` instead of re-deriving them.
+5. **Execute chunk-wise.** Iterate with the exec chunk iterators so a chunked input yields a chunked
+   output; never concatenate inputs first. Use the dense helpers for validity (section 8).
+6. **Return errors, do not assert.** See section 5. Overflow in `checked` mode is `Overflow`, division by
+   zero is `DivideByZero`, a narrowing cast that loses data in safe mode is `InvalidCast`.
+7. **Test.** For every kernel: a hand-written expected-value test; an oracle test comparing the kernel
+   against a simple per-element loop on random data with nulls and sliced inputs (offset != 0); array
+   versus chunked equivalence with chunk boundaries that do not align; empty input; all-null input; the
+   error cases of step 6. Register the test file in the family's `test.zig`.
+8. **Benchmark.** One case per kernel and type at 200k rows in `benchmarks/<family>_benchmark.zig`,
+   printing the common CSV line; register the case name in `tools/benchmark_ci_check.py`
+   (`EXPECTED_BENCHES`), `tools/benchmark_ci_thresholds.json` and `tools/test_benchmark_ci_check.py`
+   (`VALID_ROWS`) so the CI smoke run covers it.
+9. **Document.** Add a `///` docstring on the public entry point (summary line in the infinitive, as in
+   Arrow: "Add two numeric arrays", not "Adds"), and flip the function's row in
+   [compute-support-matrix.md](compute-support-matrix.md).
+
+### Source conventions
+
+Taken from the Arrow C++ [conventions](https://arrow.apache.org/docs/developers/cpp/conventions.html) where
+they map onto Zig:
+
+- file names use underscores; test files are `test_*.zig`; benchmark executables are `<name>_benchmark`;
+- `///` docstrings on every `pub` declaration, summary in the infinitive; `//` for ordinary comments;
+- no hidden work in constructors: anything that can fail or allocate is a `pub fn init(...) !T` factory;
+- public functions take an explicit `std.mem.Allocator` or an `ExecContext`, never a global;
+- errors are returned, invariants are asserted (section 5);
+- code must build on both supported Zig versions (see the README), so no builtins or std APIs that exist in
+  only one of them.
 
 ---
 
@@ -206,4 +318,9 @@ Readable mismatch diagnostics are available:
 ## 11. References
 
 - Example: [`examples/compute_lifecycle.zig`](../examples/compute_lifecycle.zig)
+- Reference kernels used for timing the framework: [`benchmarks/compute_benchmark.zig`](../benchmarks/compute_benchmark.zig)
+- Support status against the Arrow catalog: [compute-support-matrix.md](compute-support-matrix.md)
 - Readiness note: [ecosystem-readiness.md](ecosystem-readiness.md)
+- Arrow C++: [compute functions](https://arrow.apache.org/docs/cpp/compute.html),
+  [compute tutorial](https://arrow.apache.org/docs/cpp/tutorials/compute_tutorial.html),
+  [developer conventions](https://arrow.apache.org/docs/developers/cpp/conventions.html)
