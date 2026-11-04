@@ -1,6 +1,7 @@
 const std = @import("std");
 const zarrow = @import("zarrow");
 const csv_meta = @import("csv_meta.zig");
+const bench_allocator = @import("bench_allocator.zig");
 
 const Mode = enum { default, smoke, full, matrix, matrix_no_header, ci, ci_no_header };
 
@@ -71,10 +72,15 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     defer sink.deinit();
 
     var checksum: usize = 0;
-    const timer_start = std.Io.Timestamp.now(io, .awake);
+    var timer_start = std.Io.Timestamp.now(io, .awake);
 
+    // Iteration 0 is an untimed warm-up: the timed iterations reuse its output blocks (bench_allocator.zig).
     var iter: usize = 0;
-    while (iter < cfg.iterations) : (iter += 1) {
+    while (iter <= cfg.iterations) : (iter += 1) {
+        if (iter == 1) {
+            checksum = 0;
+            timer_start = std.Io.Timestamp.now(io, .awake);
+        }
         sink.clearRetainingCapacity();
         {
             var writer = zarrow.IpcStreamWriter.initWithBodyCompression(allocator, &sink.writer, .zstd);
@@ -125,8 +131,7 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // smp_allocator: small per-part/per-batch allocations; page_allocator would mostly measure syscalls.
-    const allocator = std.heap.smp_allocator;
+    const allocator = bench_allocator.allocator;
     const mode = try parseMode(init, allocator);
     const meta = try csv_meta.resolve(init, allocator);
     defer meta.deinit(allocator);

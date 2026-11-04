@@ -313,6 +313,12 @@ zig build benchmark
 zig build benchmark-full
 ```
 
+Benchmarks allocate through `benchmarks/bench_allocator.zig`, which keeps freed large blocks and hands them
+back to the next allocation of the same size, and run one untimed warm-up iteration, so output memory is
+reused across iterations and `ns_per_row` measures the kernel rather than first-touch page faults of fresh
+output buffers. Run one benchmark step at a time (`zig build benchmark-<name>_benchmark -Doptimize=ReleaseFast`)
+for stable numbers; `zig build benchmark` runs them concurrently.
+
 Run built-in fuzz corpus replay:
 
 ```sh
