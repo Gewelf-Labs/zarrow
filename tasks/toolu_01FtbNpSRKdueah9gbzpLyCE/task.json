@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01FtbNpSRKdueah9gbzpLyCE",
+  "agent_id": "a0e319773204adda6",
+  "task_description": "Opus-high: design zarrow fuzzing",
+  "token_usage": {
+    "input_tokens": 616,
+    "cache_creation_tokens": 1177645,
+    "cache_read_tokens": 121051740,
+    "output_tokens": 279406,
+    "api_call_count": 308
+  },
+  "started_at": "2026-10-31T10:30:57.307329-04:00",
+  "completed_at": "2026-10-31T12:27:14.1106029-04:00"
+}

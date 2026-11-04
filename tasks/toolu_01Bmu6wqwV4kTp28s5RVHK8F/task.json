@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01Bmu6wqwV4kTp28s5RVHK8F",
+  "agent_id": "ad28983e76bd86cd5",
+  "task_description": "Opus-high: plan round 3 perf",
+  "token_usage": {
+    "input_tokens": 364,
+    "cache_creation_tokens": 936162,
+    "cache_read_tokens": 60645036,
+    "output_tokens": 263325,
+    "api_call_count": 182
+  },
+  "started_at": "2026-10-31T08:18:51.704866-04:00",
+  "completed_at": "2026-10-31T10:04:54.8640216-04:00"
+}

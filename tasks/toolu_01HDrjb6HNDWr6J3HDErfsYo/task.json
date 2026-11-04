@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01HDrjb6HNDWr6J3HDErfsYo",
+  "agent_id": "a09b1711d8711c3d1",
+  "subagent_type": "claude",
+  "task_description": "Opus final review of branch",
+  "token_usage": {
+    "input_tokens": 52,
+    "cache_creation_tokens": 102482,
+    "cache_read_tokens": 2582706,
+    "output_tokens": 33790,
+    "api_call_count": 26
+  },
+  "started_at": "2026-10-30T20:33:53.4252476-04:00",
+  "completed_at": "2026-10-30T20:40:38.9888511-04:00"
+}

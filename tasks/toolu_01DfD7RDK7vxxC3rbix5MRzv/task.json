@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01DfD7RDK7vxxC3rbix5MRzv",
+  "agent_id": "ae089086bf8762fe9",
+  "task_description": "Opus-high: IPC compat gaps G1-G4",
+  "token_usage": {
+    "input_tokens": 198,
+    "cache_creation_tokens": 223576,
+    "cache_read_tokens": 15394739,
+    "output_tokens": 68121,
+    "api_call_count": 99
+  },
+  "started_at": "2026-11-01T11:07:41.0895798-05:00",
+  "completed_at": "2026-11-02T17:03:32.5166693-05:00"
+}

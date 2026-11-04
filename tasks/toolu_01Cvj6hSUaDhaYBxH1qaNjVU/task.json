@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01Cvj6hSUaDhaYBxH1qaNjVU",
+  "agent_id": "a912b7ddb7d2437a5",
+  "subagent_type": "claude",
+  "task_description": "Haiku fixes compat doc/CI findings",
+  "token_usage": {
+    "input_tokens": 16,
+    "cache_creation_tokens": 37895,
+    "cache_read_tokens": 522360,
+    "output_tokens": 8850,
+    "api_call_count": 8
+  },
+  "started_at": "2026-10-30T20:19:12.2222166-04:00",
+  "completed_at": "2026-10-30T20:20:00.2646759-04:00"
+}

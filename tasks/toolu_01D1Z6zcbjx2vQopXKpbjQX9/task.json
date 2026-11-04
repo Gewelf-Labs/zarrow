@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01D1Z6zcbjx2vQopXKpbjQX9",
+  "agent_id": "a097cbccbfc360873",
+  "subagent_type": "claude",
+  "task_description": "Opus reviews perf diff",
+  "token_usage": {
+    "input_tokens": 56,
+    "cache_creation_tokens": 82205,
+    "cache_read_tokens": 2651197,
+    "output_tokens": 23818,
+    "api_call_count": 28
+  },
+  "started_at": "2026-10-30T20:25:07.0843759-04:00",
+  "completed_at": "2026-10-30T20:30:41.9858392-04:00"
+}
