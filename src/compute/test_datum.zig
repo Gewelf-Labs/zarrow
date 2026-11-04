@@ -1152,42 +1152,39 @@ test "compute dense take and u32 filter kernels match the nullable path" {
 const ArrayData = array_mod.ArrayData;
 const concatArrayRefs = @import("../concat_array_refs.zig").concatArrayRefs;
 
-/// Per-row oracle for the take/concat kernels: logical row `i` of `a` equals row `j` of `b`.
-fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool {
-    const dt = if (a.data_type == .extension) a.data_type.extension.storage_type.* else a.data_type;
-    if (dt == .null) return b.data_type == .null; // a sliced null array has an unknown null_count
+/// Per-row oracle for the take/concat kernels (and the per-type IPC and C ABI round trips):
+/// logical row `i` of `a` equals row `j` of `b`. Covers every layout; expects validated input.
+pub fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool {
+    const dt = datatype.storageDataType(a.data_type);
+    if (dt == .null) return datatype.storageDataType(b.data_type) == .null; // a sliced null array has an unknown null_count
     if (a.isNull(i) != b.isNull(j)) return false;
     if (a.isNull(i)) return true;
     const ai = a.offset + i;
     const bj = b.offset + j;
+    if (dt == .bool) {
+        const x = (a.buffers[1].data[ai / 8] >> @intCast(ai % 8)) & 1;
+        const y = (b.buffers[1].data[bj / 8] >> @intCast(bj % 8)) & 1;
+        return x == y;
+    }
+    if (ArrayData.fixedWidthByteSize(dt)) |w| {
+        return std.mem.eql(u8, a.buffers[1].data[ai * w ..][0..w], b.buffers[1].data[bj * w ..][0..w]);
+    }
     switch (dt) {
-        .int32, .fixed_size_binary => {
-            const w: usize = if (dt == .int32) 4 else @intCast(dt.fixed_size_binary.byte_width);
-            return std.mem.eql(u8, a.buffers[1].data[ai * w ..][0..w], b.buffers[1].data[bj * w ..][0..w]);
-        },
-        .string => {
-            const x = (array_mod.StringArray{ .data = a }).value(i) catch return false;
-            const y = (array_mod.StringArray{ .data = b }).value(j) catch return false;
+        .string, .binary, .large_string, .large_binary => {
+            const ow: usize = if (dt == .large_string or dt == .large_binary) 8 else 4;
+            const x = a.buffers[2].data[intAt(a.buffers[1], ow, ai) orelse return false .. intAt(a.buffers[1], ow, ai + 1) orelse return false];
+            const y = b.buffers[2].data[intAt(b.buffers[1], ow, bj) orelse return false .. intAt(b.buffers[1], ow, bj + 1) orelse return false];
             return std.mem.eql(u8, x, y);
         },
-        .dictionary => {
-            const x: usize = @intCast((a.buffers[1].typedSlice(i32) catch return false)[ai]);
-            const y: usize = @intCast((b.buffers[1].typedSlice(i32) catch return false)[bj]);
+        .dictionary => |dict| {
+            const w = dict.index_type.bit_width / 8;
+            const x = intAt(a.buffers[1], w, ai) orelse return false;
+            const y = intAt(b.buffers[1], w, bj) orelse return false;
             return rowsEqual(a.dictionary.?.data(), x, b.dictionary.?.data(), y);
         },
-        .list, .map, .list_view, .fixed_size_list => {
-            var ra: [2]usize = undefined;
-            var rb: [2]usize = undefined;
-            for ([_]*const ArrayData{ a, b }, [_]usize{ ai, bj }, [_]*[2]usize{ &ra, &rb }) |d, k, r| {
-                if (dt == .fixed_size_list) {
-                    const size: usize = @intCast(dt.fixed_size_list.list_size);
-                    r.* = .{ k * size, k * size + size };
-                } else {
-                    const o = d.buffers[1].typedSlice(i32) catch return false;
-                    const lo: usize = @intCast(o[k]);
-                    r.* = if (dt == .list_view) .{ lo, lo + @as(usize, @intCast((d.buffers[2].typedSlice(i32) catch return false)[k])) } else .{ lo, @intCast(o[k + 1]) };
-                }
-            }
+        .list, .large_list, .map, .list_view, .large_list_view, .fixed_size_list => {
+            const ra = listRange(a, dt, ai) orelse return false;
+            const rb = listRange(b, dt, bj) orelse return false;
             if (ra[1] - ra[0] != rb[1] - rb[0]) return false;
             for (0..ra[1] - ra[0]) |k| {
                 if (!rowsEqual(a.children[0].data(), ra[0] + k, b.children[0].data(), rb[0] + k)) return false;
@@ -1218,8 +1215,38 @@ fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool 
     }
 }
 
+/// Little-endian signed integer `k` of a 2-, 4- or 8-byte wide buffer, as a usize (null if negative).
+fn intAt(buf: array_mod.SharedBuffer, width: usize, k: usize) ?usize {
+    const v: i64 = switch (width) {
+        2 => (buf.typedSlice(i16) catch return null)[k],
+        4 => (buf.typedSlice(i32) catch return null)[k],
+        8 => (buf.typedSlice(i64) catch return null)[k],
+        else => return null,
+    };
+    return std.math.cast(usize, v);
+}
+
+/// Child rows [start, end) of physical list row `k`.
+fn listRange(d: *const ArrayData, dt: DataType, k: usize) ?[2]usize {
+    switch (dt) {
+        .fixed_size_list => |fsl| {
+            const size: usize = @intCast(fsl.list_size);
+            return .{ k * size, k * size + size };
+        },
+        .list_view, .large_list_view => {
+            const w: usize = if (dt == .large_list_view) 8 else 4;
+            const lo = intAt(d.buffers[1], w, k) orelse return null;
+            return .{ lo, lo + (intAt(d.buffers[2], w, k) orelse return null) };
+        },
+        else => {
+            const w: usize = if (dt == .large_list) 8 else 4;
+            return .{ intAt(d.buffers[1], w, k) orelse return null, intAt(d.buffers[1], w, k + 1) orelse return null };
+        },
+    }
+}
+
 /// Child array and child row holding logical row `i` of a dense union (int32 offsets) or a
-/// run-end encoded array (int32 run ends).
+/// run-end encoded array (16-, 32- or 64-bit run ends).
 fn childRow(a: *const ArrayData, i: usize) struct { *const ArrayData, usize } {
     const ai = a.offset + i;
     if (a.data_type == .dense_union) {
@@ -1227,13 +1254,13 @@ fn childRow(a: *const ArrayData, i: usize) struct { *const ArrayData, usize } {
         return .{ a.children[c].data(), @intCast((a.buffers[1].typedSlice(i32) catch unreachable)[ai]) };
     }
     const re = a.children[0].data();
-    const ends = (re.buffers[1].typedSlice(i32) catch unreachable)[re.offset..][0..re.length];
+    const w = datatype.storageDataType(a.data_type).run_end_encoded.run_end_type.bit_width / 8;
     var k: usize = 0;
-    while (ends[k] <= ai) k += 1;
+    while ((intAt(re.buffers[1], w, re.offset + k) orelse unreachable) <= ai) k += 1;
     return .{ a.children[1].data(), k };
 }
 
-fn expectRowsMatchSource(out: *const ArrayData, src: *const ArrayData, indices: []const ?usize) !void {
+pub fn expectRowsMatchSource(out: *const ArrayData, src: *const ArrayData, indices: []const ?usize) !void {
     try out.validateFull();
     try std.testing.expectEqual(indices.len, out.length);
     for (indices, 0..) |maybe, i| {
@@ -1445,7 +1472,7 @@ test "compute datumTake nested kernels match the per-row oracle on sliced inputs
 
 /// Concats `full` cut into a full, sliced, empty and one-row parts; checks every row, validateFull
 /// and that one part still gives a fresh array at offset 0.
-fn expectConcatMatchesSource(allocator: std.mem.Allocator, full: ArrayRef) !void {
+pub fn expectConcatMatchesSource(allocator: std.mem.Allocator, full: ArrayRef) !void {
     const len = full.data().length;
     const cuts = [_][2]usize{ .{ 0, len }, .{ 0, 1 }, .{ 1, 3 }, .{ 3, 0 }, .{ 4, len - 4 }, .{ 1, len - 1 } };
     var parts: [cuts.len]ArrayRef = undefined;

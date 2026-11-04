@@ -274,6 +274,7 @@ test {
     _ = @import("array/array_data.zig");
     _ = @import("array/primitive_array.zig");
     _ = @import("array/test_builder_reuse.zig");
+    _ = @import("array/test_type_coverage.zig");
     _ = @import("array/null_array.zig");
     _ = @import("array/extension_array.zig");
     _ = @import("array/boolean_array.zig");
