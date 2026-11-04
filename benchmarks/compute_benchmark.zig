@@ -69,10 +69,14 @@ fn fold(d: Datum) u64 {
 }
 
 fn timeKernel(io: std.Io, ctx: *ExecContext, kind: compute.FunctionKind, bench_name: []const u8, fn_name: []const u8, args: []const Datum, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
+    return timeKernelWith(io, ctx, kind, bench_name, fn_name, args, Options.noneValue(), cfg, emit_csv, meta);
+}
+
+fn timeKernelWith(io: std.Io, ctx: *ExecContext, kind: compute.FunctionKind, bench_name: []const u8, fn_name: []const u8, args: []const Datum, options: Options, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
     var checksum: u64 = 0;
     const timer_start = std.Io.Timestamp.now(io, .awake);
     for (0..cfg.iterations) |_| {
-        var out = try ctx.invoke(fn_name, kind, args, Options.noneValue());
+        var out = try ctx.invoke(fn_name, kind, args, options);
         defer out.release();
         checksum +%= fold(out);
     }
@@ -148,6 +152,28 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     try timeKernel(io, &ctx, .scalar, "compute_logical_and_kleene", "and_kleene", &.{ .{ .array = bool_a }, .{ .array = bool_b } }, cfg, emit_csv, meta);
     try timeKernel(io, &ctx, .scalar, "compute_is_null", "is_null", &.{.{ .array = an }}, cfg, emit_csv, meta);
     try timeKernel(io, &ctx, .scalar, "compute_cmp_string", "less", &.{ .{ .array = str_a }, .{ .array = str_b } }, cfg, emit_csv, meta);
+
+    var ts = try buildTimestamp(allocator, cfg.rows, 9);
+    defer ts.release();
+    const to_int64 = Options{ .cast = .{ .to_type = .{ .int64 = {} } } };
+    const to_string = Options{ .cast = .{ .to_type = .{ .string = {} } } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_cast_int32_to_int64", "cast", &.{.{ .array = a }}, to_int64, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .scalar, "compute_cast_int32_to_string", "cast", &.{.{ .array = a }}, to_string, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_utf8_upper", "utf8_upper", &.{.{ .array = str_a }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_temporal_year", "year", &.{.{ .array = ts }}, cfg, emit_csv, meta);
+}
+
+/// timestamp[ms] array spread over about 1870..2070, every 10th row null.
+fn buildTimestamp(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    var b = try zarrow.TimestampBuilder(.millisecond, null).init(allocator, rows);
+    defer b.deinit();
+    var x: u32 = seed;
+    for (0..rows) |i| {
+        x = x *% 1664525 +% 1013904223;
+        const ms = (@as(i64, x) - (1 << 31)) * 1470;
+        if (i % 10 == 0) try b.appendNull() else try b.append(ms);
+    }
+    return b.finish();
 }
 
 /// Bool array with every `null_every`-th row null.

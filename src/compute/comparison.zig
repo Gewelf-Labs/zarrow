@@ -7,7 +7,6 @@ const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
 
-const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
 const DataType = core.DataType;
 const Datum = core.Datum;
@@ -31,7 +30,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         }
         try registry.registerScalarKernel(@tagName(op), kernel(.bool, Boolean(op).chunk));
         inline for (string_tags) |tag| {
-            try registry.registerScalarKernel(@tagName(op), kernel(tag, Strings(tag, op).chunk));
+            try registry.registerScalarKernel(@tagName(op), kernel(tag, Strings(op).chunk));
         }
     }
 }
@@ -136,65 +135,6 @@ fn Boolean(comptime op: Op) type {
     };
 }
 
-/// Byte-string operand: a scalar, or an array of string / large_string / string_view that passed
-/// `validateLayout` (offsets and views are in bounds, so rows are sliced without further checks).
-const StringOperand = union(enum) {
-    scalar: ScalarBytes,
-    offsets32: OffsetBytes(i32),
-    offsets64: OffsetBytes(i64),
-    views: ViewBytes,
-
-    fn init(comptime tag: TypeTag, v: ExecChunkValue) KernelError!StringOperand {
-        const data = switch (v) {
-            .scalar => |s| return switch (s.value) {
-                .string => |bytes| .{ .scalar = .{ .bytes = bytes } },
-                else => error.InvalidInput,
-            },
-            .array => |arr| arr.data(),
-        };
-        switch (tag) {
-            .string, .large_string => {
-                const O = if (tag == .string) i32 else i64;
-                const all = data.buffers[1].typedSlice(O) catch return error.InvalidInput;
-                const op: OffsetBytes(O) = .{ .offsets = all[data.offset..][0 .. data.length + 1], .data = data.buffers[2].data };
-                return if (O == i32) .{ .offsets32 = op } else .{ .offsets64 = op };
-            },
-            .string_view => return .{ .views = .{ .views = data.buffers[1].data[data.offset * 16 ..][0 .. data.length * 16], .data = data } },
-            else => comptime unreachable,
-        }
-    }
-};
-
-const ScalarBytes = struct {
-    bytes: []const u8,
-    inline fn get(self: ScalarBytes, _: usize) []const u8 {
-        return self.bytes;
-    }
-};
-
-fn OffsetBytes(comptime O: type) type {
-    return struct {
-        offsets: []const O,
-        data: []const u8,
-        inline fn get(self: @This(), i: usize) []const u8 {
-            return self.data[@intCast(self.offsets[i])..@intCast(self.offsets[i + 1])];
-        }
-    };
-}
-
-const ViewBytes = struct {
-    views: []const u8,
-    data: *const ArrayData,
-    inline fn get(self: ViewBytes, i: usize) []const u8 {
-        const view = self.views[i * 16 ..][0..16];
-        const len = std.mem.readInt(u32, view[0..4], .little);
-        if (len <= 12) return view[4..][0..len];
-        const buf = std.mem.readInt(u32, view[8..12], .little);
-        const off = std.mem.readInt(u32, view[12..16], .little);
-        return self.data.buffers[2 + buf].data[off..][0..len];
-    }
-};
-
 /// Return the byte-wise order of `a` and `b`, 8 bytes at a time (big-endian words order like bytes).
 fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
     const n = @min(a.len, b.len);
@@ -208,13 +148,13 @@ fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(a.len, b.len);
 }
 
-fn Strings(comptime tag: TypeTag, comptime op: Op) type {
+fn Strings(comptime op: Op) type {
     return struct {
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {
             var out = try boolOutput(ctx, values, len);
             errdefer out.deinit();
-            const lhs = try StringOperand.init(tag, values[0]);
-            const rhs = try StringOperand.init(tag, values[1]);
+            const lhs = try dense.StringOperand.init(values[0]);
+            const rhs = try dense.StringOperand.init(values[1]);
             switch (lhs) {
                 inline else => |x| switch (rhs) {
                     inline else => |y| packBits(out.values(), len, .{ x, y }, pred),

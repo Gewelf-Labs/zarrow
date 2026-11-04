@@ -55,6 +55,10 @@ EXPECTED_BENCHES = {
     "compute_logical_and_kleene",
     "compute_is_null",
     "compute_cmp_string",
+    "compute_cast_int32_to_int64",
+    "compute_cast_int32_to_string",
+    "compute_utf8_upper",
+    "compute_temporal_year",
 }
 
 

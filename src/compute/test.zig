@@ -9,4 +9,7 @@ test {
     _ = @import("test_logical.zig");
     _ = @import("test_is_null.zig");
     _ = @import("test_aggregate_basic.zig");
+    _ = @import("test_cast.zig");
+    _ = @import("test_string.zig");
+    _ = @import("test_temporal.zig");
 }

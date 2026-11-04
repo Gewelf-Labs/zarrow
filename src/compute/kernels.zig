@@ -8,6 +8,9 @@ pub const comparison = @import("comparison.zig");
 pub const logical = @import("logical.zig");
 pub const aggregate_basic = @import("aggregate_basic.zig");
 pub const is_null = @import("is_null.zig");
+pub const cast = @import("cast.zig");
+pub const string = @import("string.zig");
+pub const temporal = @import("temporal.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -16,4 +19,7 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try logical.register(registry);
     try aggregate_basic.register(registry);
     try is_null.register(registry);
+    try cast.register(registry);
+    try string.register(registry);
+    try temporal.register(registry);
 }
