@@ -6,7 +6,7 @@
 
 - `zarrow` 当前提供 **compute 框架层**：注册、调度、类型检查、结果类型推导、执行上下文、聚合生命周期。
 - `cast/add/filter/sum/...` 等具体 kernel 实现应由下游库（如 `zarrow-compute`）提供。
-- 与 Arrow C++ compute 函数目录的逐类对照见 [compute-support-matrix.md](compute-support-matrix.md)（英文）。
+- Support status against the Arrow C++ compute function catalog, category by category: [compute-support-matrix.md](compute-support-matrix.md) (English).
 
 ## 2. 核心类型
 
