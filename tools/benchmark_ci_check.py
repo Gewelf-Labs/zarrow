@@ -52,6 +52,9 @@ EXPECTED_BENCHES = {
     "compute_sum_int64",
     "compute_sum_float64",
     "compute_min_max_int32",
+    "compute_logical_and_kleene",
+    "compute_is_null",
+    "compute_cmp_string",
 }
 
 

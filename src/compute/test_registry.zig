@@ -469,3 +469,66 @@ test "compute beginAggregate returns MissingLifecycle when not provided" {
         ctx.beginAggregate("count_stateless_only", args[0..], Options.noneValue()),
     );
 }
+
+test "registerAll registers every kernel family function name with its kind" {
+    const allocator = std.testing.allocator;
+    var registry = FunctionRegistry.init(allocator);
+    defer registry.deinit();
+    try common.kernels.registerAll(&registry);
+
+    const scalar_names = [_][]const u8{
+        "add",       "add_checked",    "subtract", "subtract_checked", "multiply", "multiply_checked",
+        "divide",    "divide_checked", "negate",   "negate_checked",   "abs",      "abs_checked",
+        "equal",     "not_equal",      "less",     "less_equal",       "greater",  "greater_equal",
+        "and",       "or",             "xor",      "and_not",          "invert",   "and_kleene",
+        "or_kleene", "is_null",        "is_valid", "true_unless_null",
+    };
+    const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
+    for (scalar_names) |name| try std.testing.expect(registry.containsFunction(name, .scalar));
+    for (aggregate_names) |name| {
+        try std.testing.expect(registry.containsFunction(name, .aggregate));
+        // Every aggregate kernel also carries the init / update / merge / finalize lifecycle.
+        for (registry.findFunction(name, .aggregate).?.kernelsSlice()) |kernel| try std.testing.expect(kernel.supportsAggregateLifecycle());
+    }
+    try std.testing.expectEqual(scalar_names.len + aggregate_names.len, registry.functionCount());
+
+    // One kernel per input type: 10 numeric types; negate_checked has no unsigned kernels;
+    // comparisons add bool and the three string layouts.
+    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("add", .scalar));
+    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("negate_checked", .scalar));
+    try std.testing.expectEqual(@as(usize, 14), registry.kernelCount("less", .scalar));
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
+    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("min_max", .aggregate));
+    // Kinds are separate namespaces: no scalar "sum".
+    try std.testing.expect(!registry.containsFunction("sum", .scalar));
+}
+
+test "ExecContext.invoke add works end to end after registerAll" {
+    const allocator = std.testing.allocator;
+    var registry = FunctionRegistry.init(allocator);
+    defer registry.deinit();
+    try common.kernels.registerAll(&registry);
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var lhs = try common.makeInt32Array(allocator, &.{ 1, null, 3, 2147483647 });
+    defer lhs.release();
+    var rhs = try common.makeInt32Array(allocator, &.{ 10, 20, null, 1 });
+    defer rhs.release();
+    const args = [_]Datum{ .{ .array = lhs }, .{ .array = rhs } };
+    var out = try ctx.invoke("add", .scalar, &args, Options.noneValue());
+    defer out.release();
+    const values = try common.collectInt32ValuesFromDatum(allocator, out);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(?i32, &.{ 11, null, null, -2147483648 }, values);
+    try std.testing.expectError(error.Overflow, ctx.invoke("add_checked", .scalar, &args, Options.noneValue()));
+
+    try std.testing.expect((try registry.resolveResultType("add", .scalar, &args, Options.noneValue())) == .int32);
+    try std.testing.expect((try registry.resolveResultType("less", .scalar, &args, Options.noneValue())) == .bool);
+    try std.testing.expect((try registry.resolveResultType("sum", .aggregate, args[0..1], Options.noneValue())) == .int64);
+    try std.testing.expect((try registry.resolveResultType("mean", .aggregate, args[0..1], Options.noneValue())) == .double);
+    try std.testing.expectError(error.FunctionNotFound, ctx.invoke("power", .scalar, &args, Options.noneValue()));
+
+    var total = try ctx.invokeAggregate("sum", &.{.{ .array = out.array }}, Options.noneValue());
+    defer total.release();
+    try std.testing.expectEqual(@as(i64, 11 - 2147483648), total.scalar.value.i64);
+}

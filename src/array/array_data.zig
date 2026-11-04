@@ -29,6 +29,15 @@ pub const AccessorError = ValidationError || error{
     OutOfMemory,
 };
 
+/// Typed view of the whole elements of `buf`. A buffer may be longer than the elements it holds
+/// (validateLayout bounds it only from below), so a trailing partial element is ignored rather than
+/// rejected; a misaligned buffer is still an error.
+fn wholeElements(comptime T: type, buf: SharedBuffer) ![]const T {
+    var whole = buf;
+    whole.data = buf.data[0 .. buf.data.len - buf.data.len % @sizeOf(T)];
+    return whole.typedSlice(T);
+}
+
 /// Core Arrow array metadata and buffers.
 ///
 /// Field semantics:
@@ -94,7 +103,7 @@ pub const ArrayData = struct {
 
     pub fn typedBufferAt(self: Self, index: usize, comptime T: type) AccessorError![]const T {
         const buf = try self.bufferAt(index);
-        return buf.typedSlice(T) catch return error.InvalidOffsetBuffer;
+        return wholeElements(T, buf) catch return error.InvalidOffsetBuffer;
     }
 
     pub fn childAt(self: Self, index: usize) AccessorError!*const ArrayRef {
@@ -409,6 +418,21 @@ pub const ArrayData = struct {
         if (!entries_data.data_type.eql(expected_entries)) return error.InvalidChildren;
     }
 
+    /// True when every index in `[start, end)` read as unsigned `U` is below `dictionary_len`
+    /// (false also when the buffer is too short or misaligned: the exact check reports that).
+    fn maxIndexBelow(comptime U: type, buf: SharedBuffer, start: usize, end: usize, dictionary_len: usize) bool {
+        const indices = wholeElements(U, buf) catch return false;
+        if (indices.len < end) return false;
+        const window = indices[start..end];
+        const lanes = 64 / @sizeOf(U); // one cache line per step
+        var acc: @Vector(lanes, U) = @splat(0);
+        var i: usize = 0;
+        while (i + lanes <= window.len) : (i += lanes) acc = @max(acc, @as(@Vector(lanes, U), window[i..][0..lanes].*));
+        var max = @reduce(.Max, acc);
+        for (window[i..]) |v| max = @max(max, v);
+        return max < dictionary_len;
+    }
+
     fn validateDictionaryIndexSigned(
         self: Self,
         comptime T: type,
@@ -445,28 +469,41 @@ pub const ArrayData = struct {
         }
     }
 
+    /// Check every non-null index in `[start, end)` of the index buffer (start = the array
+    /// offset) against the dictionary length. One branch-free max over the window (signed indices
+    /// read as unsigned, so a negative one is huge) settles the common case; only a window whose
+    /// max is out of range is walked row by row, because null rows may hold any index.
     pub fn validateDictionaryIndices(self: Self, dict: datatype.DictionaryType, start: usize, end: usize) ValidationError!void {
         if (self.buffers.len < 2) return error.InvalidBufferCount;
         const dictionary_ref = self.dictionary orelse return error.MissingDictionary;
         const dictionary_len = dictionary_ref.data().length;
+        if (start > end) return error.InvalidOffsets;
+        const all_below = switch (dict.index_type.bit_width) {
+            8 => maxIndexBelow(u8, self.buffers[1], start, end, dictionary_len),
+            16 => maxIndexBelow(u16, self.buffers[1], start, end, dictionary_len),
+            32 => maxIndexBelow(u32, self.buffers[1], start, end, dictionary_len),
+            64 => maxIndexBelow(u64, self.buffers[1], start, end, dictionary_len),
+            else => return error.InvalidOffsetBuffer,
+        };
+        if (all_below) return;
 
         return switch (dict.index_type.bit_width) {
             8 => if (dict.index_type.signed)
-                self.validateDictionaryIndexSigned(i8, self.buffers[1].typedSlice(i8) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
+                self.validateDictionaryIndexSigned(i8, wholeElements(i8, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
             else
-                self.validateDictionaryIndexUnsigned(u8, self.buffers[1].typedSlice(u8) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
+                self.validateDictionaryIndexUnsigned(u8, wholeElements(u8, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
             16 => if (dict.index_type.signed)
-                self.validateDictionaryIndexSigned(i16, self.buffers[1].typedSlice(i16) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
+                self.validateDictionaryIndexSigned(i16, wholeElements(i16, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
             else
-                self.validateDictionaryIndexUnsigned(u16, self.buffers[1].typedSlice(u16) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
+                self.validateDictionaryIndexUnsigned(u16, wholeElements(u16, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
             32 => if (dict.index_type.signed)
-                self.validateDictionaryIndexSigned(i32, self.buffers[1].typedSlice(i32) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
+                self.validateDictionaryIndexSigned(i32, wholeElements(i32, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
             else
-                self.validateDictionaryIndexUnsigned(u32, self.buffers[1].typedSlice(u32) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
+                self.validateDictionaryIndexUnsigned(u32, wholeElements(u32, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
             64 => if (dict.index_type.signed)
-                self.validateDictionaryIndexSigned(i64, self.buffers[1].typedSlice(i64) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
+                self.validateDictionaryIndexSigned(i64, wholeElements(i64, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len)
             else
-                self.validateDictionaryIndexUnsigned(u64, self.buffers[1].typedSlice(u64) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
+                self.validateDictionaryIndexUnsigned(u64, wholeElements(u64, self.buffers[1]) catch return error.InvalidOffsetBuffer, start, end, dictionary_len),
             else => error.InvalidOffsetBuffer,
         };
     }
@@ -1904,4 +1941,39 @@ test "array data validateFull checks UTF-8 of non-null string values like a per-
         }
         try expectUtf8Validation(values[0..n], &valid_bits, off, len, expect_ok);
     }
+}
+
+test "array data typed accessors and dictionary checks ignore a trailing partial element of a longer buffer" {
+    // Fuzz finding (fuzz/corpus/ipc-stream/regress-a898c1f1.bin): an IPC body buffer of 17 bytes
+    // for 4 int32 values passes validateLayout (it is bounded only from below), but the typed
+    // accessor rejected it because 17 is not a multiple of 4.
+    const allocator = std.testing.allocator;
+    var bytes: [17]u8 align(buffer.ALIGNMENT) = @splat(0);
+    @memcpy(bytes[0..16], std.mem.sliceAsBytes(&[_]i32{ 1, 0, 2, 1 }));
+    const values = ArrayData{
+        .data_type = .{ .int32 = {} },
+        .length = 4,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(bytes[0..]) },
+    };
+    try values.validateFull();
+    try std.testing.expectEqualSlices(i32, &.{ 1, 0, 2, 1 }, try (@import("primitive_array.zig").PrimitiveArray(i32){ .data = &values }).values());
+    // Four values need 16 bytes: a 15-byte buffer is still too small.
+    var short = values;
+    short.buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(bytes[0..15]) };
+    try std.testing.expectError(error.BufferTooSmall, short.validateLayout());
+
+    // The same buffer as dictionary indices into a 3-value dictionary: valid, then out of range.
+    const value_type = DataType{ .int32 = {} };
+    const dict_type = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 32, .signed = true }, .value_type = &value_type } };
+    var dict_ref = try ArrayRef.fromBorrowed(allocator, .{ .data_type = value_type, .length = 3, .null_count = 0, .buffers = values.buffers });
+    defer dict_ref.release();
+    var indices = ArrayData{ .data_type = dict_type, .length = 4, .null_count = 0, .buffers = values.buffers, .dictionary = dict_ref };
+    try indices.validateFull();
+    indices.length = 3;
+    try indices.validateDictionaryIndices(dict_type.dictionary, 0, 3);
+    var two = try ArrayRef.fromBorrowed(allocator, .{ .data_type = value_type, .length = 2, .null_count = 0, .buffers = values.buffers });
+    defer two.release();
+    indices.dictionary = two;
+    try std.testing.expectError(error.InvalidOffsets, indices.validateDictionaryIndices(dict_type.dictionary, 0, 3));
 }

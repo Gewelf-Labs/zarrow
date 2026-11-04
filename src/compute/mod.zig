@@ -83,3 +83,7 @@ pub const concatArrayRefs = concat_array_refs.concatArrayRefs;
 pub const DenseBinaryOutput = dense.DenseBinaryOutput;
 pub const validityBits = dense.validityBits;
 pub const laneMask = dense.laneMask;
+/// Kernel families (`kernels.arithmetic.register`, ...) shipped in this repository.
+pub const kernels = @import("kernels.zig");
+/// Register every kernel family (the equivalent of `arrow::compute::Initialize()`).
+pub const registerAll = kernels.registerAll;

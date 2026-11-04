@@ -213,8 +213,9 @@ fn computeTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
     }
 }
 
-/// slice/take/filter/concat/dictionaryEncode on an array that passed validateFull; every output
-/// must validate and have the expected length, otherwise the kernel broke an invariant (a finding).
+/// slice/take/filter/concat/dictionaryEncode and the element-wise / aggregate kernels on an
+/// array that passed validateFull; every output must validate and have the expected length,
+/// otherwise the kernel broke an invariant (a finding).
 fn exerciseCompute(gpa: Allocator, arr: ArrayRef, rng: std.Random) !void {
     const len = arr.data().length;
     const off = rng.uintAtMost(usize, len);
@@ -222,6 +223,7 @@ fn exerciseCompute(gpa: Allocator, arr: ArrayRef, rng: std.Random) !void {
     var sliced = try arr.slice(off, sub_len);
     defer sliced.release();
     expectValid("slice", sliced, sub_len);
+    exerciseKernels(gpa, arr, sliced);
 
     var indices: [32]usize = undefined;
     const n_idx = if (len == 0) 0 else rng.uintAtMost(usize, indices.len);
@@ -279,6 +281,57 @@ fn expectValid(op: []const u8, arr: ArrayRef, expected_len: usize) void {
     arr.data().validateFull() catch |e| std.debug.panic("fuzz-invariant: {s} of a valid {s} array failed validateFull: {s}", .{ op, @tagName(arr.data().data_type.id()), @errorName(e) });
     if (arr.data().length != expected_len)
         std.debug.panic("fuzz-invariant: {s} returned {d} rows, expected {d}", .{ op, arr.data().length, expected_len });
+}
+
+/// Every kernel family, registered once per process (page allocator: outside the per-input cap).
+var kernel_registry: ?zarrow.compute.FunctionRegistry = null;
+
+fn kernelRegistry() *const zarrow.compute.FunctionRegistry {
+    if (kernel_registry == null) {
+        var registry = zarrow.compute.FunctionRegistry.init(std.heap.page_allocator);
+        zarrow.compute.registerAll(&registry) catch |e| std.debug.panic("registerAll failed: {s}", .{@errorName(e)});
+        kernel_registry = registry;
+    }
+    return &kernel_registry.?;
+}
+
+/// add / less / sum / min_max (numeric), and_kleene / any (bool), less (strings), is_null and
+/// count (any type) on a decoded array that passed validateFull and on a slice of it: the call must
+/// succeed and an array output must validate with the input length.
+fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
+    var ctx = zarrow.compute.ExecContext.initWithConfig(gpa, kernelRegistry(), .{ .overflow_mode = .wrapping });
+    for ([_]ArrayRef{ arr, sliced }) |a| {
+        const d: zarrow.compute.Datum = .{ .array = a };
+        const len = a.data().length;
+        const binary = [_]zarrow.compute.Datum{ d, d };
+        // is_null / count reject unions and run-end encoded arrays (NoMatchingKernel).
+        expectKernel(&ctx, "is_null", .scalar, &.{d}, len, true);
+        expectKernel(&ctx, "count", .aggregate, &.{d}, null, true);
+        switch (a.data().data_type) {
+            .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+                expectKernel(&ctx, "add", .scalar, &binary, len, false);
+                expectKernel(&ctx, "less", .scalar, &binary, len, false);
+                expectKernel(&ctx, "sum", .aggregate, &.{d}, null, false);
+                expectKernel(&ctx, "min_max", .aggregate, &.{d}, null, false);
+            },
+            .bool => {
+                expectKernel(&ctx, "and_kleene", .scalar, &binary, len, false);
+                expectKernel(&ctx, "less", .scalar, &binary, len, false);
+                expectKernel(&ctx, "any", .aggregate, &.{d}, null, false);
+            },
+            .string, .large_string, .string_view => expectKernel(&ctx, "less", .scalar, &binary, len, false),
+            else => {},
+        }
+    }
+}
+
+fn expectKernel(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, expected_len: ?usize, unsupported_ok: bool) void {
+    var out = ctx.invoke(name, kind, args, .none) catch |e| {
+        if (unsupported_ok and e == error.NoMatchingKernel) return;
+        std.debug.panic("fuzz-invariant: kernel {s} failed on a valid {s} array: {s}", .{ name, @tagName(args[0].dataType().id()), @errorName(e) });
+    };
+    defer out.release();
+    if (out.asArray()) |a| expectValid(name, a, expected_len orelse std.debug.panic("fuzz-invariant: {s} returned an array", .{name}));
 }
 
 // ---------------------------------------------------------------------------------------------

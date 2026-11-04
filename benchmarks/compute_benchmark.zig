@@ -6,7 +6,6 @@ const compute = zarrow.compute;
 const Datum = compute.Datum;
 const Options = compute.Options;
 const ExecContext = compute.ExecContext;
-const KernelError = compute.KernelError;
 
 const Mode = enum { default, smoke, full, matrix, matrix_no_header, ci, ci_no_header };
 
@@ -34,216 +33,6 @@ fn parseMode(init: std.process.Init, allocator: std.mem.Allocator) !Mode {
 fn printCsvHeader() void {
     std.debug.print("benchmark,rows,iterations,elapsed_ns,rows_per_sec,ns_per_row,checksum,git_sha,timestamp\n", .{});
 }
-
-// ---------------------------------------------------------------------------------------------
-// Reference kernels. zarrow ships the compute *framework* (registry, signatures, chunk iterators,
-// null propagation helpers), not a kernel catalog; these are the kernels a downstream library
-// would register, written the way docs/compute-api.md recommends, so the benchmark measures the
-// framework path end to end (resolve + exec + output array).
-// ---------------------------------------------------------------------------------------------
-
-const int32_type = zarrow.DataType{ .int32 = {} };
-const int64_type = zarrow.DataType{ .int64 = {} };
-const float64_type = zarrow.DataType{ .double = {} };
-const bool_type = zarrow.DataType{ .bool = {} };
-
-fn isInt32Pair(args: []const Datum) bool {
-    return args.len == 2 and args[0] == .array and args[1] == .array and
-        args[0].array.data().data_type == .int32 and args[1].array.data().data_type == .int32;
-}
-
-fn isInt32Array(args: []const Datum) bool {
-    return args.len == 1 and args[0] == .array and args[0].array.data().data_type == .int32;
-}
-
-fn isInt64Array(args: []const Datum) bool {
-    return args.len == 1 and args[0] == .array and args[0].array.data().data_type == .int64;
-}
-
-fn isFloat64Array(args: []const Datum) bool {
-    return args.len == 1 and args[0] == .array and args[0].array.data().data_type == .double;
-}
-
-fn int32ResultType(_: []const Datum, _: Options) KernelError!zarrow.DataType {
-    return int32_type;
-}
-
-fn boolResultType(_: []const Datum, _: Options) KernelError!zarrow.DataType {
-    return bool_type;
-}
-
-fn int64ResultType(_: []const Datum, _: Options) KernelError!zarrow.DataType {
-    return int64_type;
-}
-
-fn float64ResultType(_: []const Datum, _: Options) KernelError!zarrow.DataType {
-    return float64_type;
-}
-
-/// add_int32(array, array) -> int32 array; nulls propagate; overflow per ctx.overflowMode().
-fn addInt32Kernel(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-    const lhs = zarrow.Int32Array{ .data = args[0].array.data() };
-    const rhs = zarrow.Int32Array{ .data = args[1].array.data() };
-    const n = lhs.len();
-    if (rhs.len() != n) return error.InvalidInput;
-    const a = lhs.values() catch return error.InvalidInput;
-    const b = rhs.values() catch return error.InvalidInput;
-
-    var out = compute.DenseBinaryOutput(i32).init(ctx.allocator, args[0].array.data(), args[1].array.data(), int32_type) catch return error.OutOfMemory;
-    errdefer out.deinit();
-    const dst = out.values();
-    switch (ctx.overflowMode()) {
-        .wrapping => for (a, b, dst) |x, y, *d| {
-            d.* = x +% y;
-        },
-        .saturating => for (a, b, dst) |x, y, *d| {
-            d.* = x +| y;
-        },
-        .checked => {
-            // Dense pass: wrapping add plus a branch-free overflow flag (sign trick, vectorizes);
-            // only when some row overflowed, find out whether a valid one did.
-            var any: i32 = 0;
-            for (a, b, dst) |x, y, *d| {
-                const r = x +% y;
-                d.* = r;
-                any |= (x ^ r) & (y ^ r);
-            }
-            if (any < 0) {
-                for (a, b, 0..) |x, y, i| {
-                    if (@addWithOverflow(x, y)[1] != 0 and out.isValid(i)) return error.Overflow;
-                }
-            }
-        },
-    }
-    return .{ .array = out.finish() catch return error.OutOfMemory };
-}
-
-/// less_int32(array, array) -> bool array; nulls propagate.
-fn lessInt32Kernel(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-    const lhs = zarrow.Int32Array{ .data = args[0].array.data() };
-    const rhs = zarrow.Int32Array{ .data = args[1].array.data() };
-    const n = lhs.len();
-    if (rhs.len() != n) return error.InvalidInput;
-    const a = lhs.values() catch return error.InvalidInput;
-    const b = rhs.values() catch return error.InvalidInput;
-
-    var out = compute.DenseBinaryOutput(bool).init(ctx.allocator, args[0].array.data(), args[1].array.data(), bool_type) catch return error.OutOfMemory;
-    errdefer out.deinit();
-    const bits = out.values();
-    var i: usize = 0;
-    while (i + 8 <= n) : (i += 8) {
-        var byte: u8 = 0;
-        inline for (0..8) |k| byte |= @as(u8, @intFromBool(a[i + k] < b[i + k])) << k;
-        bits[i / 8] = byte;
-    }
-    if (i < n) {
-        var byte: u8 = 0;
-        for (i..n) |j| byte |= @as(u8, @intFromBool(a[j] < b[j])) << @as(u3, @intCast(j - i));
-        bits[i / 8] = byte;
-    }
-    return .{ .array = out.finish() catch return error.OutOfMemory };
-}
-
-/// Loads 8 values starting at `i` (zero past the end).
-inline fn lanes(comptime T: type, values: []const T, i: usize) @Vector(8, T) {
-    if (i + 8 <= values.len) return values[i..][0..8].*;
-    var tmp: [8]T = @splat(0);
-    @memcpy(tmp[0 .. values.len - i], values[i..]);
-    return tmp;
-}
-
-/// sum_int64(array) -> int64 scalar (null when every input is null); error on overflow of the sum.
-fn sumInt64Kernel(_: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-    const data = args[0].array.data();
-    const values = (zarrow.Int64Array{ .data = data }).values() catch return error.InvalidInput;
-    const bits = compute.validityBits(data);
-    const zero: @Vector(8, i64) = @splat(0);
-    var sum: i64 = 0;
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < values.len) : (i += 8) {
-        const mask = compute.laneMask(data, bits, i);
-        const v = @select(i64, mask, lanes(i64, values, i), zero);
-        count += @popCount(@as(u8, @bitCast(mask)));
-        // Checked: the running total must stay in i64 at every row (same as a serial checked sum).
-        inline for (0..8) |k| {
-            const r = @addWithOverflow(sum, v[k]);
-            if (r[1] != 0) return error.Overflow;
-            sum = r[0];
-        }
-    }
-    return .{ .scalar = compute.Scalar.init(int64_type, if (count == 0) .null else .{ .i64 = sum }) };
-}
-
-/// sum_float64(array) -> float64 scalar (null when every input is null).
-fn sumFloat64Kernel(_: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-    const data = args[0].array.data();
-    const values = (zarrow.Float64Array{ .data = data }).values() catch return error.InvalidInput;
-    const bits = compute.validityBits(data);
-    const zero: @Vector(8, f64) = @splat(0);
-    var acc = zero;
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < values.len) : (i += 8) {
-        const mask = compute.laneMask(data, bits, i);
-        acc += @select(f64, mask, lanes(f64, values, i), zero);
-        count += @popCount(@as(u8, @bitCast(mask)));
-    }
-    return .{ .scalar = compute.Scalar.init(float64_type, if (count == 0) .null else .{ .f64 = @reduce(.Add, acc) }) };
-}
-
-/// min_max_int32(array) -> int32 array [min, max] (both null when every input is null).
-fn minMaxInt32Kernel(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-    const data = args[0].array.data();
-    const values = (zarrow.Int32Array{ .data = data }).values() catch return error.InvalidInput;
-    const bits = compute.validityBits(data);
-    var lo: @Vector(8, i32) = @splat(std.math.maxInt(i32));
-    var hi: @Vector(8, i32) = @splat(std.math.minInt(i32));
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < values.len) : (i += 8) {
-        const mask = compute.laneMask(data, bits, i);
-        const v = lanes(i32, values, i);
-        lo = @min(lo, @select(i32, mask, v, lo));
-        hi = @max(hi, @select(i32, mask, v, hi));
-        count += @popCount(@as(u8, @bitCast(mask)));
-    }
-    var builder = zarrow.Int32Builder.init(ctx.allocator, 2) catch return error.OutOfMemory;
-    defer builder.deinit();
-    if (count == 0) {
-        builder.appendNull() catch return error.OutOfMemory;
-        builder.appendNull() catch return error.OutOfMemory;
-    } else {
-        builder.append(@reduce(.Min, lo)) catch return error.OutOfMemory;
-        builder.append(@reduce(.Max, hi)) catch return error.OutOfMemory;
-    }
-    return .{ .array = builder.finish() catch return error.OutOfMemory };
-}
-
-fn registerKernels(registry: *compute.FunctionRegistry) !void {
-    try registry.registerScalarKernel("add_int32", .{
-        .signature = .{ .arity = 2, .type_check = isInt32Pair, .result_type_fn = int32ResultType },
-        .exec = addInt32Kernel,
-    });
-    try registry.registerScalarKernel("less_int32", .{
-        .signature = .{ .arity = 2, .type_check = isInt32Pair, .result_type_fn = boolResultType },
-        .exec = lessInt32Kernel,
-    });
-    try registry.registerAggregateKernel("sum_int64", .{
-        .signature = .{ .arity = 1, .type_check = isInt64Array, .result_type_fn = int64ResultType },
-        .exec = sumInt64Kernel,
-    });
-    try registry.registerAggregateKernel("sum_float64", .{
-        .signature = .{ .arity = 1, .type_check = isFloat64Array, .result_type_fn = float64ResultType },
-        .exec = sumFloat64Kernel,
-    });
-    try registry.registerAggregateKernel("min_max_int32", .{
-        .signature = .{ .arity = 1, .type_check = isInt32Array, .result_type_fn = int32ResultType },
-        .exec = minMaxInt32Kernel,
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
 
 fn report(name: []const u8, cfg: BenchConfig, elapsed: u64, checksum: u64, emit_csv: bool, meta: csv_meta.CsvMeta) void {
     const elapsed_ns = @max(1, elapsed);
@@ -305,7 +94,7 @@ fn buildInt32(allocator: std.mem.Allocator, rows: usize, seed: u32, null_every: 
 fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
     var registry = compute.FunctionRegistry.init(allocator);
     defer registry.deinit();
-    try registerKernels(&registry);
+    try compute.registerAll(&registry);
     var ctx = ExecContext.initWithConfig(allocator, &registry, .{ .overflow_mode = .checked });
 
     var a = try buildInt32(allocator, cfg.rows, 1, 0);
@@ -340,13 +129,51 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var f64arr = try f64b.finish();
     defer f64arr.release();
 
+    var bool_a = try buildBool(allocator, cfg.rows, 5, 10);
+    defer bool_a.release();
+    var bool_b = try buildBool(allocator, cfg.rows, 6, 7);
+    defer bool_b.release();
+    var str_a = try buildString(allocator, cfg.rows, 7);
+    defer str_a.release();
+    var str_b = try buildString(allocator, cfg.rows, 8);
+    defer str_b.release();
+
     const nullable_cfg = BenchConfig{ .rows = cfg.rows - 3, .iterations = cfg.iterations };
-    try timeKernel(io, &ctx, .scalar, "compute_add_int32", "add_int32", &.{ .{ .array = a }, .{ .array = b } }, cfg, emit_csv, meta);
-    try timeKernel(io, &ctx, .scalar, "compute_add_int32_nullable", "add_int32", &.{ .{ .array = an_cut }, .{ .array = bn_shift } }, nullable_cfg, emit_csv, meta);
-    try timeKernel(io, &ctx, .scalar, "compute_cmp_lt_int32", "less_int32", &.{ .{ .array = a }, .{ .array = b } }, cfg, emit_csv, meta);
-    try timeKernel(io, &ctx, .aggregate, "compute_sum_int64", "sum_int64", &.{.{ .array = i64arr }}, cfg, emit_csv, meta);
-    try timeKernel(io, &ctx, .aggregate, "compute_sum_float64", "sum_float64", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
-    try timeKernel(io, &ctx, .aggregate, "compute_min_max_int32", "min_max_int32", &.{.{ .array = an }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_add_int32", "add_checked", &.{ .{ .array = a }, .{ .array = b } }, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_add_int32_nullable", "add_checked", &.{ .{ .array = an_cut }, .{ .array = bn_shift } }, nullable_cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_cmp_lt_int32", "less", &.{ .{ .array = a }, .{ .array = b } }, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .aggregate, "compute_sum_int64", "sum", &.{.{ .array = i64arr }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .aggregate, "compute_sum_float64", "sum", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .aggregate, "compute_min_max_int32", "min_max", &.{.{ .array = an }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_logical_and_kleene", "and_kleene", &.{ .{ .array = bool_a }, .{ .array = bool_b } }, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_is_null", "is_null", &.{.{ .array = an }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_cmp_string", "less", &.{ .{ .array = str_a }, .{ .array = str_b } }, cfg, emit_csv, meta);
+}
+
+/// Bool array with every `null_every`-th row null.
+fn buildBool(allocator: std.mem.Allocator, rows: usize, seed: u32, null_every: usize) !zarrow.ArrayRef {
+    var b = try zarrow.BooleanBuilder.init(allocator, rows);
+    defer b.deinit();
+    var x: u32 = seed;
+    for (0..rows) |i| {
+        x = x *% 1664525 +% 1013904223;
+        if (null_every != 0 and i % null_every == 0) try b.appendNull() else try b.append((x >> 16) & 1 == 1);
+    }
+    return b.finish();
+}
+
+/// Utf8 array of 4..19 byte values sharing an 8-byte prefix (comparisons look past it).
+fn buildString(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    var b = try zarrow.StringBuilder.init(allocator, rows, rows * 16);
+    defer b.deinit();
+    var x: u32 = seed;
+    var buf: [20]u8 = undefined;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        const s = std.fmt.bufPrint(&buf, "key-{d:0>4}{d}", .{ (x >> 20) % 16, x % 1000003 }) catch unreachable;
+        try b.append(s);
+    }
+    return b.finish();
 }
 
 pub fn main(init: std.process.Init) !void {
