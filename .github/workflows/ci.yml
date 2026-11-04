@@ -197,6 +197,9 @@ jobs:
           python3 tools/test_benchmark_ci_check.py
           python3 tools/test_benchmark_ci_regression_check.py
 
+      - name: Check doc evidence references (compute / compatibility claims)
+        run: python3 -I tools/check_doc_evidence.py
+
   pyarrow-fixture-check:
     name: PyArrow Fixture Check (${{ matrix.pyarrow_version }})
     runs-on: ubuntu-latest
