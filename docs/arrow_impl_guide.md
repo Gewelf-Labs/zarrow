@@ -1,138 +1,138 @@
-# Apache Arrow 实现原理详解：Rust 与 C++ 视角
+# Apache Arrow Implementation Principles Explained: Rust and C++ Perspectives
 
-本文档基于本项目（zarrow）源码，系统讲解 Apache Arrow 在 **Rust**（arrow-rs）和 **C++**（Apache Arrow C++）中的实现原理、核心数据结构、IPC 序列化、C Data Interface FFI 以及关键优化细节。
-
----
-
-## 目录
-
-1. [Arrow 列式存储核心原理](#1-arrow-列式存储核心原理)
-2. [内存模型与 Buffer 管理](#2-内存模型与-buffer-管理)
-3. [类型系统与 Schema](#3-类型系统与-schema)
-4. [Array 布局详解](#4-array-布局详解)
-5. [Builder 构造模式](#5-builder-构造模式)
-6. [IPC 序列化格式](#6-ipc-序列化格式)
-7. [C Data Interface（FFI）](#7-c-data-interfaceffi)
-8. [Rust 实现：arrow-rs](#8-rust-实现arrow-rs)
-9. [C++ 实现：Apache Arrow C++](#9-c-实现apache-arrow-c)
-10. [优化细节](#10-优化细节)
-11. [跨语言互操作总结](#11-跨语言互操作总结)
+This document is based on this project's source code (zarrow) and systematically explains the implementation principles of Apache Arrow in **Rust** (arrow-rs) and **C++** (Apache Arrow C++), covering the core data structures, IPC serialization, the C Data Interface FFI, and key optimization details.
 
 ---
 
-## 1. Arrow 列式存储核心原理
+## Table of Contents
 
-### 1.1 行式 vs 列式
+1. [Arrow Columnar Storage Core Principles](#1-arrow-columnar-storage-core-principles)
+2. [Memory Model and Buffer Management](#2-memory-model-and-buffer-management)
+3. [Type System and Schema](#3-type-system-and-schema)
+4. [Array Layout in Detail](#4-array-layout-in-detail)
+5. [Builder Construction Patterns](#5-builder-construction-patterns)
+6. [IPC Serialization Format](#6-ipc-serialization-format)
+7. [C Data Interface (FFI)](#7-c-data-interface-ffi)
+8. [Rust Implementation: arrow-rs](#8-rust-implementation-arrow-rs)
+9. [C++ Implementation: Apache Arrow C++](#9-c-implementation-apache-arrow-c)
+10. [Optimization Details](#10-optimization-details)
+11. [Cross-Language Interoperability Summary](#11-cross-language-interoperability-summary)
+
+---
+
+## 1. Arrow Columnar Storage Core Principles
+
+### 1.1 Row-Oriented vs. Column-Oriented
 
 ```
-行式存储（Row-oriented）:
+Row-oriented storage:
   Row0: [id=1, name="alice", age=30]
   Row1: [id=2, name="bob",   age=25]
 
-Arrow 列式存储（Column-oriented）:
-  id-buffer:   [1,   2  ]   <- 连续 int32 内存
+Arrow column-oriented storage:
+  id-buffer:   [1,   2  ]   <- contiguous int32 memory
   name-buffer: ["alice","bob"]
-  age-buffer:  [30,  25 ]   <- 连续 int32 内存
+  age-buffer:  [30,  25 ]   <- contiguous int32 memory
 ```
 
-列式布局的优势：
-- **SIMD 向量化**：对同一列批量运算时，CPU 可以用 AVX2/AVX-512 一次处理 8~16 个元素。
-- **压缩率更高**：同列数据类型相同、值域相近，Run-Length/字典编码效率极高。
-- **零拷贝共享**：多个消费者通过指针共享同一块内存，无需序列化。
+Advantages of the columnar layout:
+- **SIMD vectorization**: When operating on a column in bulk, the CPU can process 8 to 16 elements at once with AVX2/AVX-512.
+- **Higher compression ratio**: Columns share the same data type and similar value ranges, so run-length and dictionary encoding are highly efficient.
+- **Zero-copy sharing**: Multiple consumers share the same block of memory through pointers, with no serialization needed.
 
-### 1.2 物理布局层次
+### 1.2 Physical Layout Hierarchy
 
 ```
 Schema
-  └─ Field[]          <- 列名 + 类型 + nullable + metadata
+  └─ Field[]          <- column name + type + nullable + metadata
         │
         ▼
 RecordBatch
-  └─ ArrayData[]      <- 每列对应一个 ArrayData 树
+  └─ ArrayData[]      <- each column corresponds to one ArrayData tree
         │
         ▼
 ArrayData
-  ├─ data_type        <- 逻辑类型
-  ├─ length           <- 逻辑行数
-  ├─ offset           <- 切片偏移（支持零拷贝切片）
-  ├─ null_count       <- null 数量缓存
-  ├─ buffers[]        <- 原始字节缓冲区（validity/offsets/values）
-  ├─ children[]       <- 嵌套类型的子 ArrayData
-  └─ dictionary       <- 字典编码的字典 ArrayData
+  ├─ data_type        <- logical type
+  ├─ length           <- logical row count
+  ├─ offset           <- slice offset (supports zero-copy slicing)
+  ├─ null_count       <- cached null count
+  ├─ buffers[]        <- raw byte buffers (validity/offsets/values)
+  ├─ children[]       <- child ArrayData for nested types
+  └─ dictionary       <- dictionary ArrayData for dictionary encoding
 ```
 
 ---
 
-## 2. 内存模型与 Buffer 管理
+## 2. Memory Model and Buffer Management
 
-### 2.1 64 字节对齐
+### 2.1 64-Byte Alignment
 
-Arrow 规范要求所有 buffer **按 64 字节对齐**，并将实际长度 **向上取整到 64 字节的倍数**（padding）。
+The Arrow specification requires that all buffers be **aligned to 64 bytes**, and that the actual length be **rounded up to a multiple of 64 bytes** (padding).
 
 ```
-原因：
-  - AVX-512 SIMD 指令需要 64 字节对齐才能使用最快的 aligned load (_mm512_load_ps)
-  - Cache line 通常 64 字节，对齐保证单元素访问不跨 cache line
-  - Padding 保证 SIMD 读取尾部时不越界
+Reasons:
+  - AVX-512 SIMD instructions need 64-byte alignment to use the fastest aligned load (_mm512_load_ps)
+  - A cache line is typically 64 bytes; alignment ensures single-element accesses do not cross a cache line
+  - Padding ensures SIMD reads of the tail do not go out of bounds
 ```
 
-对齐计算（本项目 `src/buffer.zig`）：
+Alignment calculation (this project, `src/buffer.zig`):
 
 ```zig
 pub const ALIGNMENT: usize = 64;
 
 pub fn alignedSize(size: usize) usize {
-    // 向上取整到 64 的倍数
-    // 例：size=5  -> (5+63) & ~63 = 64
-    // 例：size=64 -> (64+63) & ~63 = 64
-    // 例：size=65 -> (65+63) & ~63 = 128
+    // round up to a multiple of 64
+    // e.g.: size=5  -> (5+63) & ~63 = 64
+    // e.g.: size=64 -> (64+63) & ~63 = 64
+    // e.g.: size=65 -> (65+63) & ~63 = 128
     return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 ```
 
-**Rust（arrow-rs）等价实现：**
+**Rust (arrow-rs) equivalent implementation:**
 
 ```rust
-// arrow-rs 内部使用 arrow_buffer::alloc::ALIGNMENT = 64
-// Buffer::from_vec 会自动对齐
+// arrow-rs internally uses arrow_buffer::alloc::ALIGNMENT = 64
+// Buffer::from_vec aligns automatically
 use arrow_buffer::Buffer;
 
-// 手动分配对齐内存
+// manually allocate aligned memory
 let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
 let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 ```
 
-**C++ 等价实现：**
+**C++ equivalent implementation:**
 
 ```cpp
 // arrow/memory_pool.h
-// DefaultMemoryPool 底层使用 posix_memalign 或 _aligned_malloc
+// DefaultMemoryPool uses posix_memalign or _aligned_malloc under the hood
 ARROW_ASSIGN_OR_RAISE(auto buffer,
     arrow::AllocateBuffer(byte_size, pool));
-// buffer->data() 保证 64-byte 对齐
+// buffer->data() is guaranteed to be 64-byte aligned
 assert(reinterpret_cast<uintptr_t>(buffer->data()) % 64 == 0);
 ```
 
-### 2.2 SharedBuffer：引用计数共享内存
+### 2.2 SharedBuffer: Reference-Counted Shared Memory
 
-Arrow 的核心特性是**零拷贝**。多个 ArrayData 可以共享同一块 buffer，只有最后一个引用释放时才真正 free 内存。
+A core feature of Arrow is **zero-copy**. Multiple ArrayData objects can share the same buffer, and the memory is only actually freed when the last reference is released.
 
-本项目 Zig 实现（`src/buffer.zig`）：
+This project's Zig implementation (`src/buffer.zig`):
 
 ```zig
-// 内部控制块（类似 C++ shared_ptr 的 control block）
+// internal control block (similar to the C++ shared_ptr control block)
 const BufferStorage = struct {
     allocator: std.mem.Allocator,
     data: []align(64) u8,
-    ref_count: std.atomic.Value(u32),   // 原子引用计数
-    release_fn: *const fn (*BufferStorage) void,  // 支持外部内存（FFI）
+    ref_count: std.atomic.Value(u32),   // atomic reference count
+    release_fn: *const fn (*BufferStorage) void,  // supports external memory (FFI)
 };
 
 pub const SharedBuffer = struct {
-    storage: ?*BufferStorage,  // null 表示借用（不拥有）
-    data: []const u8,          // 逻辑视图，可以是 storage.data 的子切片
+    storage: ?*BufferStorage,  // null means borrowed (not owned)
+    data: []const u8,          // logical view, may be a subslice of storage.data
 
-    // retain：增加引用计数
+    // retain: increment the reference count
     pub fn retain(self: Self) Self {
         if (self.storage) |storage| {
             _ = storage.ref_count.fetchAdd(1, .monotonic);
@@ -140,10 +140,10 @@ pub const SharedBuffer = struct {
         return self;
     }
 
-    // release：减少引用计数，为零时调用 release_fn 释放内存
+    // release: decrement the reference count; when it reaches zero, call release_fn to free the memory
     pub fn release(self: *Self) void {
         if (self.storage) |storage| {
-            // acq_rel 保证 release 前的写对 destroy 线程可见
+            // acq_rel ensures writes made before release are visible to the thread that destroys the buffer
             if (storage.ref_count.fetchSub(1, .acq_rel) == 1) {
                 storage.release_fn(storage);
             }
@@ -154,24 +154,24 @@ pub const SharedBuffer = struct {
 };
 ```
 
-**Rust 对应实现（arrow_buffer::Buffer）：**
+**Rust equivalent (arrow_buffer::Buffer):**
 
 ```rust
-// arrow-rs 中 Buffer 内部是 Arc<Bytes>
-// Arc 提供线程安全的引用计数
+// In arrow-rs, Buffer internally wraps Arc<Bytes>
+// Arc provides thread-safe reference counting
 #[derive(Clone, Debug, PartialEq)]
 pub struct Buffer {
-    data: Arc<Bytes>,      // 引用计数的底层字节块
-    ptr: *const u8,        // 指向 data 内部的指针（支持切片偏移）
+    data: Arc<Bytes>,      // reference-counted underlying byte block
+    ptr: *const u8,        // pointer into data (supports slice offsets)
     length: usize,
 }
 
-// 零拷贝切片：只改变 ptr 和 length，不复制数据
+// Zero-copy slicing: only changes ptr and length, does not copy data
 impl Buffer {
     pub fn slice(&self, offset: usize) -> Self {
         assert!(offset <= self.len());
         Buffer {
-            data: self.data.clone(),  // Arc clone：只增加引用计数
+            data: self.data.clone(),  // Arc clone: only increments the reference count
             ptr: unsafe { self.ptr.add(offset) },
             length: self.length - offset,
         }
@@ -179,24 +179,24 @@ impl Buffer {
 }
 ```
 
-**C++ 对应实现（arrow::Buffer）：**
+**C++ equivalent (arrow::Buffer):**
 
 ```cpp
 // arrow/buffer.h
 class Buffer {
  public:
-    // shared_ptr 提供引用计数
+    // shared_ptr provides reference counting
     static std::shared_ptr<Buffer> FromString(std::string data);
 
     const uint8_t* data() const { return data_; }
     int64_t size() const { return size_; }
 
-    // 零拷贝切片
+    // zero-copy slicing
     static std::shared_ptr<Buffer> SliceBuffer(
         const std::shared_ptr<Buffer>& buffer,
         int64_t offset, int64_t length) {
-        // 返回的 Buffer 持有原 buffer 的 shared_ptr，
-        // 内部 data_ 指针只是偏移，不分配新内存
+        // The returned Buffer holds a shared_ptr to the original buffer;
+        // its internal data_ pointer is just an offset, no new memory is allocated
         return std::make_shared<Buffer>(buffer, buffer->data() + offset, length);
     }
 };
@@ -204,53 +204,53 @@ class Buffer {
 
 ---
 
-## 3. 类型系统与 Schema
+## 3. Type System and Schema
 
-### 3.1 类型 ID 枚举
+### 3.1 Type ID Enumeration
 
-Arrow 定义了 45 种逻辑类型（本项目 `src/datatype.zig`）：
+Arrow defines 45 logical types (this project, `src/datatype.zig`):
 
 ```zig
 pub const TypeId = enum(u8) {
-    null = 0,          // 全 null 列
-    bool = 1,          // 位图存储
-    int8 = 3,          // 1 字节
-    int32 = 7,         // 4 字节
-    int64 = 9,         // 8 字节
-    float = 11,        // IEEE 754 单精度
-    double = 12,       // IEEE 754 双精度
-    string = 13,       // UTF-8 可变长，offsets i32
-    binary = 14,       // 任意字节序列
-    timestamp = 18,    // int64 + 时区 + 时间单位
-    list = 25,         // 变长嵌套列表
-    struct_ = 26,      // 命名字段结构体
-    dictionary = 29,   // 字典编码（索引 + 字典值）
-    run_end_encoded=38,// 游程编码
-    string_view = 39,  // Arrow 1.5+ 新格式，16字节固定头
-    // ...共 45 种
+    null = 0,          // all-null column
+    bool = 1,          // stored as a bitmap
+    int8 = 3,          // 1 byte
+    int32 = 7,         // 4 bytes
+    int64 = 9,         // 8 bytes
+    float = 11,        // IEEE 754 single precision
+    double = 12,       // IEEE 754 double precision
+    string = 13,       // UTF-8 variable length, i32 offsets
+    binary = 14,       // arbitrary byte sequence
+    timestamp = 18,    // int64 + timezone + time unit
+    list = 25,         // variable-length nested list
+    struct_ = 26,      // named-field struct
+    dictionary = 29,   // dictionary encoding (indices + dictionary values)
+    run_end_encoded=38,// run-end encoding
+    string_view = 39,  // new format since Arrow 1.5, 16-byte fixed header
+    // ...45 types in total
 };
 ```
 
-### 3.2 DataType 联合体
+### 3.2 DataType Union
 
 ```zig
 pub const DataType = union(TypeId) {
-    // 无参数类型直接用 void
+    // parameterless types use void directly
     int32: void,
     string: void,
 
-    // 带参数类型携带配置信息
+    // parameterized types carry their configuration
     timestamp: TimestampType,   // { unit: TimeUnit, timezone: ?[]u8 }
     decimal128: DecimalParams,  // { precision: u8, scale: i32 }
     list: ListType,             // { value_field: Field }
     struct_: StructType,        // { fields: []Field }
     dictionary: DictionaryType, // { index_type, value_type, ordered }
     run_end_encoded: RunEndEncodedType,
-    extension: ExtensionType,   // 用户自定义扩展类型
+    extension: ExtensionType,   // user-defined extension type
 };
 ```
 
-**Rust 中的类型系统（arrow_schema::DataType）：**
+**Type system in Rust (arrow_schema::DataType):**
 
 ```rust
 // arrow-rs: arrow_schema/src/datatype.rs
@@ -263,7 +263,7 @@ pub enum DataType {
     Float16, Float32, Float64,
     Utf8, LargeUtf8,
     Binary, LargeBinary,
-    // 带参数类型
+    // parameterized types
     Timestamp(TimeUnit, Option<Arc<str>>),  // unit + timezone
     Decimal128(u8, i8),                     // precision, scale
     List(Arc<Field>),
@@ -272,7 +272,7 @@ pub enum DataType {
     RunEndEncoded(Arc<Field>, Arc<Field>),
 }
 
-// Field 包含名称、类型、nullable、metadata
+// Field contains name, type, nullable, metadata
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
     name: Arc<str>,
@@ -281,18 +281,18 @@ pub struct Field {
     metadata: HashMap<String, String>,
 }
 
-// Schema 是 Field 的有序集合
+// Schema is an ordered collection of Fields
 pub struct Schema {
     fields: Fields,
     metadata: HashMap<String, String>,
 }
 ```
 
-**C++ 中的类型系统：**
+**Type system in C++:**
 
 ```cpp
 // arrow/type.h
-// C++ 使用继承体系，所有类型继承自 DataType
+// C++ uses an inheritance hierarchy; all types derive from DataType
 class DataType {
  public:
     virtual Type::type id() const = 0;
@@ -300,7 +300,7 @@ class DataType {
     virtual bool Equals(const DataType& other) const = 0;
 };
 
-// 具体类型示例
+// concrete type example
 class Int32Type : public NumberType<int32_t> {
  public:
     static constexpr Type::type type_id = Type::INT32;
@@ -315,9 +315,9 @@ class TimestampType : public TemporalType {
     const std::string& timezone() const { return timezone_; }
 };
 
-// 工厂函数（本项目 C++ interop 中使用的风格）
-auto int32_t  = arrow::int32();   // 返回 shared_ptr<Int32Type>
-auto utf8_t   = arrow::utf8();    // 返回 shared_ptr<StringType>
+// factory functions (the style used in this project's C++ interop)
+auto int32_t  = arrow::int32();   // returns shared_ptr<Int32Type>
+auto utf8_t   = arrow::utf8();    // returns shared_ptr<StringType>
 auto ts_type  = arrow::timestamp(arrow::TimeUnit::MICRO, "UTC");
 auto dict_t   = arrow::dictionary(arrow::int32(), arrow::utf8());
 auto ree_t    = arrow::run_end_encoded(arrow::int32(), arrow::int32());
@@ -325,43 +325,43 @@ auto ree_t    = arrow::run_end_encoded(arrow::int32(), arrow::int32());
 
 ---
 
-## 4. Array 布局详解
+## 4. Array Layout in Detail
 
-Arrow 为每种类型定义了精确的 buffer 布局。理解这些布局是实现高效计算的基础。
+Arrow defines a precise buffer layout for every type. Understanding these layouts is the foundation of efficient computation.
 
-### 4.1 Validity Bitmap（空值位图）
+### 4.1 Validity Bitmap (Null Bitmap)
 
-所有可空类型都有一个 validity bitmap，**每个 bit 对应一行**，1 = valid，0 = null。
-Arrow 使用 **LSB-first**（最低位优先）顺序。
+Every nullable type has a validity bitmap, **with one bit per row**: 1 = valid, 0 = null.
+Arrow uses **LSB-first** (least significant bit first) bit order.
 
 ```
-逻辑值:  [valid, null, valid, valid, null, valid, valid, valid]
-索引:      0      1     2      3      4      5      6      7
+Logical values:  [valid, null, valid, valid, null, valid, valid, valid]
+Index:             0      1     2      3      4      5      6      7
 
 Byte 0: bit0=1, bit1=0, bit2=1, bit3=1, bit4=0, bit5=1, bit6=1, bit7=1
         = 0b11011101 = 0xDD
 
-字节长度 = ceil(n / 8)，尾部填充位为 0
+Byte length = ceil(n / 8), trailing padding bits are 0
 ```
 
-本项目位图实现（`src/bitmap.zig`）：
+Bitmap implementation in this project (`src/bitmap.zig`):
 
 ```zig
-// 读取第 i 位：找到字节，然后检查对应 bit
+// Read bit i: locate the byte, then check the corresponding bit
 pub fn bitIsSet(data: []const u8, bit_index: usize) bool {
     const byte = data[bit_index >> 3];          // bit_index / 8
     const mask = @as(u8, 1) << @as(u3, @intCast(bit_index & 7));  // bit_index % 8
     return (byte & mask) != 0;
 }
 
-// 批量统计有效位数（使用 popcount 硬件指令）
+// Bulk count of valid bits (uses the popcount hardware instruction)
 pub fn countSetBit(data: []const u8, bit_len: usize) usize {
     var count: usize = 0;
     const full_bytes = bit_len >> 3;
     for (data[0..full_bytes]) |byte| {
-        count += @popCount(byte);  // 编译为 POPCNT 指令
+        count += @popCount(byte);  // compiles to a POPCNT instruction
     }
-    // 处理尾部不足一字节的部分
+    // Handle the trailing partial byte
     if (bit_len & 7 > 0) {
         const mask = (@as(u8, 1) << @as(u3, @intCast(bit_len & 7))) - 1;
         count += @popCount(data[full_bytes] & mask);
@@ -370,7 +370,7 @@ pub fn countSetBit(data: []const u8, bit_len: usize) usize {
 }
 ```
 
-**Rust 中：**
+**In Rust:**
 
 ```rust
 // arrow_buffer::bit_util
@@ -383,7 +383,7 @@ pub fn count_set_bits(data: &[u8]) -> usize {
 }
 ```
 
-**C++：**
+**In C++:**
 
 ```cpp
 // arrow/util/bit_util.h
@@ -391,24 +391,24 @@ inline bool GetBit(const uint8_t* bits, int64_t i) {
     return (bits[i >> 3] >> (i & 0x07)) & 1;
 }
 
-// SIMD 加速版本（内部使用 AVX2 ）
+// SIMD-accelerated version (uses AVX2 internally)
 int64_t CountSetBits(const uint8_t* data, int64_t bit_offset, int64_t length);
 ```
 
-### 4.2 Primitive Array（定长基础类型）
+### 4.2 Primitive Array (Fixed-Width Basic Types)
 
-布局：`[validity bitmap] [values buffer]`
+Layout: `[validity bitmap] [values buffer]`
 
 ```
-int32 数组 [1, null, 30]：
+int32 array [1, null, 30]:
 
-Buffer 0 (validity): 0b00000101 = 0x05  (bit0=1,bit1=0,bit2=1)
+Buffer 0 (validity): 0b00000101 = 0x05  (bit0=1, bit1=0, bit2=1)
 Buffer 1 (values):   [01 00 00 00] [00 00 00 00] [1E 00 00 00]
                       ^^^^^^^^^^^^   ^^^^^^^^^^^^   ^^^^^^^^^^^^
-                         i32=1         i32=0(无效)    i32=30
+                         i32=1         i32=0 (invalid)  i32=30
 ```
 
-本项目 Zig 实现（`src/array/primitive_array.zig`）：
+This project's Zig implementation (`src/array/primitive_array.zig`):
 
 ```zig
 pub fn PrimitiveArray(comptime T: type) type {
@@ -416,93 +416,93 @@ pub fn PrimitiveArray(comptime T: type) type {
         data: *const ArrayData,
 
         pub fn values(self: Self) []const T {
-            // Buffer[1] 是值缓冲区，按类型 T 解释字节
+            // Buffer[1] is the values buffer, interpreted as type T
             const raw = self.data.buffers[1].typedSlice(T);
-            // offset 支持切片视图（零拷贝）
+            // offset supports sliced views (zero-copy)
             return raw[self.data.offset .. self.data.offset + self.data.length];
         }
 
         pub fn isNull(self: Self, i: usize) bool {
-            return self.data.isNull(i);  // 读 validity bitmap
+            return self.data.isNull(i);  // reads the validity bitmap
         }
     };
 }
 ```
 
-**Rust 中（arrow_array::PrimitiveArray）：**
+**In Rust (arrow_array::PrimitiveArray):**
 
 ```rust
 // arrow_array::array::primitive_array.rs
 pub struct PrimitiveArray<T: ArrowPrimitiveType> {
     data: ArrayData,
-    raw_values: RawPtrBox<T::Native>,  // 指向 values buffer 的裸指针
+    raw_values: RawPtrBox<T::Native>,  // raw pointer into the values buffer
 }
 
 impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
-    // 零成本访问：直接指针偏移，无边界检查（unsafe 内部）
+    // Zero-cost access: direct pointer offset, no bounds check (unsafe internally)
     pub fn value(&self, i: usize) -> T::Native {
         assert!(i < self.len());
-        // SAFETY: i < len 已验证
+        // SAFETY: i < len has been verified
         unsafe { *self.raw_values.get().add(i) }
     }
 
     pub fn values(&self) -> &[T::Native] {
-        // 返回整个 values buffer 的切片引用
+        // Return a slice reference over the entire values buffer
         let len = self.len();
-        // SAFETY: ArrowPrimitiveType::Native 保证内存布局正确
+        // SAFETY: ArrowPrimitiveType::Native guarantees a correct memory layout
         unsafe {
             std::slice::from_raw_parts(self.raw_values.get(), len)
         }
     }
 }
 
-// 使用示例（来自本项目 tools/interop/arrow-rs/src/main.rs）
+// Usage example (from this project's tools/interop/arrow-rs/src/main.rs)
 let ids: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
 let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
 assert_eq!(ids.value(0), 1);
 assert!(ids.is_valid(0));
 ```
 
-**C++ 中：**
+**In C++:**
 
 ```cpp
 // arrow/array/array_primitive.h
-// 使用示例（来自本项目 tools/interop/cpp/interop.cpp）
+// Usage example (from this project's tools/interop/cpp/interop.cpp)
 arrow::Int32Builder id_builder;
 ARROW_RETURN_NOT_OK(id_builder.AppendValues({1, 2, 3}));
 std::shared_ptr<arrow::Array> ids;
 ARROW_RETURN_NOT_OK(id_builder.Finish(&ids));
 
-// 读取值
+// Read values
 auto int_arr = std::static_pointer_cast<arrow::Int32Array>(ids);
-int32_t val = int_arr->Value(0);  // 直接内存访问
+int32_t val = int_arr->Value(0);  // direct memory access
 bool is_null = int_arr->IsNull(1);
 ```
 
-### 4.3 String / Binary Array（变长类型）
+### 4.3 String / Binary Array (Variable-Length Types)
 
-布局：`[validity] [offsets: i32 × (n+1)] [data: bytes]`
+Layout: `[validity] [offsets: i32 × (n+1)] [data: bytes]`
 
 ```
-string 数组 ["alice", null, "bob"]：
+string array ["alice", null, "bob"]:
 
-offsets: [0,  5,  5,  8]    <- n+1=4 个 int32
+offsets: [0,  5,  5,  8]    <- n+1 = 4 int32 values
           |   |   |   |
 data:    "alice" "bob"
           0    5      8
 
 - row0: data[offsets[0]..offsets[1]] = data[0..5] = "alice"
-- row1: is_null (validity bit = 0)，data[5..5] = ""
+- row1: is_null (validity bit = 0), data[5..5] = ""
 - row2: data[offsets[2]..offsets[3]] = data[5..8] = "bob"
 ```
 
-**Rust 中：**
+**In Rust:**
 
 ```rust
-// arrow_array::StringArray 内部
+// arrow_array::StringArray internals
 pub struct GenericStringArray<O: OffsetSizeTrait> {
     data: ArrayData,
-    value_offsets: RawPtrBox<O>,  // i32 或 i64
+    value_offsets: RawPtrBox<O>,  // i32 or i64
     value_data: RawPtrBox<u8>,
 }
 
@@ -511,14 +511,14 @@ impl StringArray {
         let offsets = self.value_offsets();
         let start = offsets[i] as usize;
         let end = offsets[i + 1] as usize;
-        // SAFETY: Arrow 保证 UTF-8 有效性
+        // SAFETY: Arrow guarantees UTF-8 validity
         unsafe {
             std::str::from_utf8_unchecked(&self.value_data()[start..end])
         }
     }
 }
 
-// 使用示例（来自本项目 main.rs）
+// Usage example (from this project's main.rs)
 let names = Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob")]));
 let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
 assert_eq!(names.value(0), "alice");
@@ -526,10 +526,10 @@ assert!(names.is_null(1));
 assert_eq!(names.value(2), "bob");
 ```
 
-**C++ 中：**
+**In C++:**
 
 ```cpp
-// 使用示例（来自本项目 interop.cpp）
+// Usage example (from this project's interop.cpp)
 arrow::StringBuilder name_builder;
 ARROW_RETURN_NOT_OK(name_builder.Append("alice"));
 ARROW_RETURN_NOT_OK(name_builder.AppendNull());
@@ -538,39 +538,39 @@ std::shared_ptr<arrow::Array> names;
 ARROW_RETURN_NOT_OK(name_builder.Finish(&names));
 
 auto str_arr = std::static_pointer_cast<arrow::StringArray>(names);
-std::string_view val = str_arr->GetView(0);  // 零拷贝 string_view
+std::string_view val = str_arr->GetView(0);  // zero-copy string_view
 bool is_null = str_arr->IsNull(1);
 ```
 
-### 4.4 Dictionary Array（字典编码）
+### 4.4 Dictionary Array (Dictionary Encoding)
 
-布局：indices buffer + 独立 dictionary array，节省重复字符串存储。
+Layout: an indices buffer plus a separate dictionary array, which avoids storing repeated strings.
 
 ```
-颜色列 ["red","blue","red","green","blue"] 字典编码后：
+Color column ["red","blue","red","green","blue"] after dictionary encoding:
 
 dictionary (StringArray): ["red", "blue", "green"]
 indices   (Int32Array):   [0, 1, 0, 2, 1]
 
-内存节省：5 × 平均字符串长度 → 5 × 4字节(索引) + 1 × 字典
+Memory savings: 5 × average string length → 5 × 4 bytes (indices) + 1 × dictionary
 ```
 
-**Rust 实现（来自本项目 main.rs）：**
+**Rust implementation (from this project's main.rs):**
 
 ```rust
-// 构建字典数组
+// Build a dictionary array
 let mut builder = StringDictionaryBuilder::<Int32Type>::new();
 builder.append("red")?;
 builder.append("blue")?;
 let dict_array: ArrayRef = Arc::new(builder.finish());
 
-// 读取字典值：通过 key 查字典
+// Read dictionary values: look up the dictionary by key
 let dict = batch.column(0)
     .as_any()
     .downcast_ref::<DictionaryArray<Int32Type>>()
     .unwrap();
-let keys = dict.keys();                           // Int32Array（索引）
-let values = dict.values()                        // StringArray（字典）
+let keys = dict.keys();                           // Int32Array (indices)
+let values = dict.values()                        // StringArray (dictionary)
     .as_any()
     .downcast_ref::<StringArray>()
     .unwrap();
@@ -578,58 +578,58 @@ let key_for_row0 = keys.value(0) as usize;        // = 0
 let decoded = values.value(key_for_row0);          // = "red"
 ```
 
-**C++ 实现（来自本项目 interop.cpp）：**
+**C++ implementation (from this project's interop.cpp):**
 
 ```cpp
-// 通过 compute::dictionary_encode 从 StringArray 创建字典数组
+// Create a dictionary array from a StringArray via compute::dictionary_encode
 auto dict_type = arrow::dictionary(arrow::int32(), arrow::utf8(), false);
 ARROW_ASSIGN_OR_RAISE(
     auto encoded_datum,
     arrow::compute::CallFunction("dictionary_encode", {plain_string_array}));
 auto dict_encoded = encoded_datum.make_array();
 
-// 解码单行
+// Decode a single row
 auto dict_arr = std::static_pointer_cast<arrow::DictionaryArray>(column);
 auto keys    = std::static_pointer_cast<arrow::Int32Array>(dict_arr->indices());
 auto values  = std::static_pointer_cast<arrow::StringArray>(dict_arr->dictionary());
-int32_t key  = keys->Value(row);            // 索引
-auto decoded = values->GetString(key);      // 字典查找
+int32_t key  = keys->Value(row);            // index
+auto decoded = values->GetString(key);      // dictionary lookup
 ```
 
-### 4.5 Run-End Encoded Array（游程编码）
+### 4.5 Run-End Encoded Array (Run-Length Encoding)
 
-**REE** 将连续相同值压缩为 `(run_end, value)` 对，无独立 buffer，只有 2 个子数组。
+**REE** compresses consecutive equal values into `(run_end, value)` pairs. It has no independent buffer and only 2 child arrays.
 
 ```
-逻辑值:  [100, 100, 200, 200, 200]
+Logical values:  [100, 100, 200, 200, 200]
 
-run_ends (Int32Array): [2, 5]   <- 游程结束的行号（exclusive）
+run_ends (Int32Array): [2, 5]   <- row number where each run ends (exclusive)
 values   (Int32Array): [100, 200]
 
-读取第 i 行：二分查找 run_ends，找到第一个 >= i+1 的位置 j，
-            值为 values[j]
+To read row i: binary-search run_ends for the first position j where run_ends[j] >= i+1,
+            the value is values[j]
 ```
 
-**Rust 实现（来自本项目 main.rs）：**
+**Rust implementation (from this project's main.rs):**
 
 ```rust
-// 构建 REE
+// Build an REE array
 let run_ends = Int32Array::from(vec![2, 5]);
 let values   = Int32Array::from(vec![100, 200]);
 let ree: ArrayRef = Arc::new(
     RunArray::<Int32Type>::try_new(&run_ends, &values)?
 );
 
-// 迭代（自动展开游程）
+// Iterate (runs are expanded automatically)
 let typed = ree.downcast::<Int32Array>().unwrap();
 let actual: Vec<Option<i32>> = typed.into_iter().collect();
 // = [Some(100), Some(100), Some(200), Some(200), Some(200)]
 ```
 
-**C++ 实现（来自本项目 interop.cpp）：**
+**C++ implementation (from this project's interop.cpp):**
 
 ```cpp
-// 构建 REE
+// Build an REE array
 arrow::Int32Builder run_ends_builder, values_builder;
 ARROW_RETURN_NOT_OK(run_ends_builder.AppendValues({2, 5}));
 ARROW_RETURN_NOT_OK(values_builder.AppendValues({100, 200}));
@@ -637,43 +637,43 @@ std::shared_ptr<arrow::Array> run_ends, values;
 ARROW_RETURN_NOT_OK(run_ends_builder.Finish(&run_ends));
 ARROW_RETURN_NOT_OK(values_builder.Finish(&values));
 
-// 第三个参数是逻辑长度（5 而不是 2）
+// The third argument is the logical length (5, not 2)
 ARROW_ASSIGN_OR_RAISE(
     auto ree_arr,
     arrow::RunEndEncodedArray::Make(5, run_ends, values, /*offset=*/0));
 
-// 读取子数组（不展开）
+// Read the child arrays (not expanded)
 auto ree_data = batch->column(0)->data();
 auto run_ends_child = arrow::MakeArray(ree_data->child_data[0]);
 auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```
 
-### 4.6 StringView / BinaryView（Arrow 1.5+ 新格式）
+### 4.6 StringView / BinaryView (New Format in Arrow 1.5+)
 
-每个元素用 **16 字节固定头**表示，支持超过 12 字节的字符串存储在变长 data buffer 中。
+Each element is represented by a **fixed 16-byte header**. Strings longer than 12 bytes are stored in variadic data buffers.
 
 ```
-16字节 view 结构（若长度 <= 12，inline 存储）：
-  [length: i32][data: 12 bytes]   <- inline，不引用外部 buffer
+16-byte view structure (if length <= 12, stored inline):
+  [length: i32][data: 12 bytes]   <- inline, does not reference an external buffer
 
-若长度 > 12：
+If length > 12:
   [length: i32][prefix: 4 bytes][buf_index: i32][offset: i32]
                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                  指向 variadic data buffers
+                                  points into the variadic data buffers
 
-优势：短字符串（<=12字节）访问无需跳转，提升缓存命中率
+Advantage: short strings (<= 12 bytes) are accessed without a pointer jump, improving cache hit rates
 ```
 
-布局：`[validity] [views: u128 × n] [variadic data buffers…] [variadic lengths: i64 × n_bufs]`
+Layout: `[validity] [views: u128 × n] [variadic data buffers…] [variadic lengths: i64 × n_bufs]`
 
-### 4.7 所有类型内存图速查（45 种真实类型）
+### 4.7 Quick Reference: Memory Diagrams for All Types (45 Real Types)
 
-说明：
-- 图中 `B0/B1/B2...` 表示 `buffers[0]/buffers[1]/buffers[2]...`
-- `validity` 为可选：当 `null_count == 0` 时可省略
-- `offset` 存在时，逻辑索引 `i` 实际访问物理索引 `offset + i`
+Notes:
+- `B0/B1/B2...` in the diagrams means `buffers[0]/buffers[1]/buffers[2]...`
+- `validity` is optional: it can be omitted when `null_count == 0`
+- When `offset` is present, logical index `i` actually accesses physical index `offset + i`
 
-#### A. 无参数/基础类型族
+#### A. No-Parameter / Basic Type Families
 
 1) Null
 
@@ -716,7 +716,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌──── Primitive Fixed-Width Array ───┐
 │ B0: validity bitmap (optional)     │
-│ B1: values (little-endian, 固定宽) │
+│ B1: values (little-endian, fixed width) │
 │     byte_width = 1/2/4/8           │
 └─────────────────────────────────────┘
 ```
@@ -731,7 +731,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 │ B0: validity bitmap (optional)     │
 │ B1: values (little-endian integer) │
 │     width = 4/8/16/32 bytes        │
-│     逻辑值 = integer * 10^(-scale) │
+│     logical value = integer * 10^(-scale) │
 └─────────────────────────────────────┘
 ```
 
@@ -740,12 +740,12 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌────── FixedSizeBinaryArray ────────┐
 │ B0: validity bitmap (optional)     │
-│ B1: values, 每元素 byte_width 字节  │
+│ B1: values, byte_width bytes per element │
 │     [elem0][elem1]...[elemN-1]     │
 └─────────────────────────────────────┘
 ```
 
-#### B. 变长二进制/字符串族
+#### B. Variable-Length Binary / String Families
 
 25) String (Utf8)
 26) Binary
@@ -753,7 +753,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌──────── String/Binary Array ───────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets i32, 长度 n+1          │
+│ B1: offsets i32, length n+1        │
 │ B2: data bytes                     │
 │ row i = data[offsets[i]..offsets[i+1]]
 └─────────────────────────────────────┘
@@ -765,7 +765,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌────── LargeString/LargeBinary ─────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets i64, 长度 n+1          │
+│ B1: offsets i64, length n+1        │
 │ B2: data bytes                     │
 └─────────────────────────────────────┘
 ```
@@ -777,21 +777,21 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ┌────── StringView/BinaryView ───────┐
 │ B0: validity bitmap (optional)     │
 │ B1: views (16 bytes * n)           │
-│     <=12 字节: inline 存储          │
-│     >12 字节: [prefix, buf_idx, off] -> variadic buffers
+│     <=12 bytes: stored inline      │
+│     >12 bytes: [prefix, buf_idx, off] -> variadic buffers
 │ B2..Bk: variadic data buffers      │
-│ B(k+1): variadic lengths(i64 each) │
+│ B(k+1): variadic lengths (i64 each) │
 └─────────────────────────────────────┘
 ```
 
-#### C. 嵌套结构族
+#### C. Nested Structure Families
 
 31) List
 
 ```text
 ┌────────────── ListArray ───────────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets i32, 长度 n+1          │
+│ B1: offsets i32, length n+1        │
 │ children[0]: values child array    │
 │ row i -> child[offsets[i]..offsets[i+1]]
 └─────────────────────────────────────┘
@@ -802,7 +802,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌─────────── LargeListArray ─────────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets i64, 长度 n+1          │
+│ B1: offsets i64, length n+1        │
 │ children[0]: values child array    │
 └─────────────────────────────────────┘
 ```
@@ -813,8 +813,8 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌──────────── ListView Array ────────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets (i32 或 i64)           │
-│ B2: sizes   (i32 或 i64)           │
+│ B1: offsets (i32 or i64)           │
+│ B2: sizes   (i32 or i64)           │
 │ children[0]: values child array    │
 │ row i -> child[offsets[i] .. offsets[i] + sizes[i]]
 └─────────────────────────────────────┘
@@ -826,7 +826,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ┌───────── FixedSizeListArray ───────┐
 │ B0: validity bitmap (optional)     │
 │ children[0]: values child array    │
-│ 每行长度固定 = list_size            │
+│ fixed length per row = list_size   │
 │ row i -> child[i*list_size .. (i+1)*list_size]
 └─────────────────────────────────────┘
 ```
@@ -836,8 +836,8 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌──────────── StructArray ───────────┐
 │ B0: validity bitmap (optional)     │
-│ children[k]: 每个字段一列 child     │
-│ row i 的 struct = 同索引聚合各 child │
+│ children[k]: one child per field   │
+│ row i's struct = aggregate of each child at the same index │
 └─────────────────────────────────────┘
 ```
 
@@ -846,10 +846,10 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌────────────── MapArray ────────────┐
 │ B0: validity bitmap (optional)     │
-│ B1: offsets i32, 长度 n+1          │
-│ children[0]: entries StructArray    │
-│   entries.children[0] = key array   │
-│   entries.children[1] = item array  │
+│ B1: offsets i32, length n+1        │
+│ children[0]: entries StructArray   │
+│   entries.children[0] = key array  │
+│   entries.children[1] = item array │
 │ row i -> entries[offsets[i]..offsets[i+1]]
 └─────────────────────────────────────┘
 ```
@@ -859,9 +859,9 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌─────────── SparseUnionArray ───────┐
 │ B0: type_ids (i8 * n)              │
-│ children[k]: 所有 child 长度都为 n   │
-│ row i: 依据 type_ids[i] 选择 child  │
-│ (无 validity bitmap)               │
+│ children[k]: every child has length n │
+│ row i: selects a child based on type_ids[i] │
+│ (no validity bitmap)               │
 └─────────────────────────────────────┘
 ```
 
@@ -871,13 +871,13 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ┌──────────── DenseUnionArray ───────┐
 │ B0: type_ids (i8 * n)              │
 │ B1: value_offsets (i32 * n)        │
-│ children[k]: 各 child 可为紧凑长度   │
+│ children[k]: each child may have a compact length │
 │ row i -> child(type_ids[i])[value_offsets[i]]
-│ (无 validity bitmap)               │
+│ (no validity bitmap)               │
 └─────────────────────────────────────┘
 ```
 
-#### D. 编码/扩展族
+#### D. Encoded / Extension Families
 
 40) Dictionary
 
@@ -885,8 +885,8 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ┌────────── DictionaryArray ─────────┐
 │ B0: validity bitmap (optional)     │
 │ B1: indices (int8/16/32/64)        │
-│ dictionary: 独立 values array       │
-│ row i -> dictionary[indices[i]]     │
+│ dictionary: separate values array  │
+│ row i -> dictionary[indices[i]]    │
 └─────────────────────────────────────┘
 ```
 
@@ -894,11 +894,11 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 
 ```text
 ┌────── RunEndEncodedArray (REE) ────┐
-│ buffers: []                         │
-│ children[0]: run_ends (递增, >0)    │
-│ children[1]: values                 │
-│ row i: 找最小 j 使 run_ends[j] > i  │
-│        返回 values[j]               │
+│ buffers: []                        │
+│ children[0]: run_ends (increasing, >0) │
+│ children[1]: values                │
+│ row i: find the smallest j such that run_ends[j] > i │
+│        return values[j]            │
 └─────────────────────────────────────┘
 ```
 
@@ -906,13 +906,13 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 
 ```text
 ┌────────── ExtensionArray ──────────┐
-│ 物理布局完全等同 storage_type        │
-│ 额外元数据: extension_name/metadata  │
-│ 计算与传输按 storage_type 执行       │
+│ physical layout is exactly the same as storage_type │
+│ extra metadata: extension_name/metadata │
+│ computation and transport follow storage_type │
 └─────────────────────────────────────┘
 ```
 
-#### E. Interval 三种物理布局
+#### E. Interval: Three Physical Layouts
 
 43) Interval[Months]
 
@@ -928,7 +928,7 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌────── Interval(DayTime) Array ─────┐
 │ B0: validity bitmap (optional)     │
-│ B1: values, 每元素 8 bytes          │
+│ B1: values, 8 bytes per element    │
 │     {days:i32, milliseconds:i32}   │
 └─────────────────────────────────────┘
 ```
@@ -938,16 +938,16 @@ auto values_child   = arrow::MakeArray(ree_data->child_data[1]);
 ```text
 ┌── Interval(MonthDayNano) Array ────┐
 │ B0: validity bitmap (optional)     │
-│ B1: values, 每元素 16 bytes         │
+│ B1: values, 16 bytes per element   │
 │     {months:i32, days:i32, nanos:i64}
 └─────────────────────────────────────┘
 ```
 
-注：本节共覆盖 45 种真实数据类型；上界哨兵已改为独立常量 `max_type_id`，不是可实例化类型。
+Note: this section covers 45 real data types; the upper-bound sentinel is now a separate constant `max_type_id`, not an instantiable type.
 
-### 4.8 单页速查表（打印版）
+### 4.8 One-Page Cheat Sheet (Print Version)
 
-用途：将 45 种类型压缩到一页内，先按“布局模板”记忆，再按“类型映射”查表。
+Purpose: compress all 45 types onto one page. Memorize by "layout template" first, then look up via "type mapping".
 
 ```text
 Arrow Memory Layout One-Page Cheat Sheet
@@ -957,7 +957,7 @@ Legend:
   V = validity bitmap (optional when null_count==0)
   off = offset(s), val = values, ch = children, dict = dictionary
 
-Templates (按出现频率排序)
+Templates (sorted by frequency of occurrence)
 
 T0  []
     Null
@@ -1027,59 +1027,59 @@ T21 [V][{months:i32, days:i32, nanos:i64} * n]
     Interval[MonthDayNano]
 
 Quick Rules:
-  1) 可变长 = offsets + data
-  2) 嵌套 = parent 描述切片范围，真实值在 children
-  3) 编码 = Dictionary/REE 通过“索引或游程”间接取值
-  4) Union 无 validity，null 语义由类型系统/约定表达
-  5) `max_type_id` 是内部上界哨兵，不是可实例化类型
+  1) Variable-length = offsets + data
+  2) Nested = the parent describes the slice range; the real values are in the children
+  3) Encoded = Dictionary/REE fetch values indirectly via "index or run"
+  4) Unions have no validity; null semantics are expressed by the type system/convention
+  5) `max_type_id` is an internal upper-bound sentinel, not an instantiable type
 ```
 
 ---
 
-## 5. Builder 构造模式
+## 5. Builder Construction Patterns
 
-Builder 是构建不可变 Array 的工厂，内部维护**可变** buffer，`finish()` 时转换为不可变 SharedBuffer。
+A Builder is a factory that constructs immutable Arrays. Internally it maintains **mutable** buffers, and `finish()` converts them into immutable SharedBuffers.
 
 ### 5.1 Rust Builder
 
 ```rust
-// Rust：类型安全的 Builder API
+// Rust: type-safe Builder API
 use arrow_array::builder::Int32Builder;
 
 let mut builder = Int32Builder::with_capacity(1024);
-builder.append_value(1);       // 追加有效值
-builder.append_null();         // 追加 null
-builder.append_value(30);      // 追加有效值
+builder.append_value(1);       // append a valid value
+builder.append_null();         // append a null
+builder.append_value(30);      // append a valid value
 
-// finish() 消耗 builder，返回 Arc<Int32Array>
+// finish() consumes the builder and returns Arc<Int32Array>
 let array: Int32Array = builder.finish();
-// 内存已从可变 Vec 转移到不可变 Buffer（Arc）
+// Memory has moved from the mutable Vec into an immutable Buffer (Arc)
 ```
 
-**StringDictionaryBuilder（来自本项目 main.rs）：**
+**StringDictionaryBuilder (from this project's main.rs):**
 
 ```rust
-// 自动维护字典，对重复值使用相同 key
+// Automatically maintains the dictionary; repeated values use the same key
 let mut builder = StringDictionaryBuilder::<Int32Type>::new();
 builder.append("red")?;
 builder.append("blue")?;
-// batch 2：使用已有字典的 delta 追加
+// batch 2: append a delta using an existing dictionary
 let bootstrap = StringArray::from(vec!["red", "blue"]);
 let mut builder2 = StringDictionaryBuilder::<Int32Type>::new_with_dictionary(
-    1,            // 初始化容量
-    &bootstrap    // 继承已有字典
+    1,            // initial capacity
+    &bootstrap    // inherit the existing dictionary
 )?;
-builder2.append("green")?;  // 只添加新词到字典
+builder2.append("green")?;  // only new words are added to the dictionary
 ```
 
 ### 5.2 C++ Builder
 
 ```cpp
-// C++ Builder API（来自本项目 interop.cpp）
+// C++ Builder API (from this project's interop.cpp)
 arrow::Int32Builder id_builder;
 ARROW_RETURN_NOT_OK(id_builder.AppendValues({1, 2, 3}));
 std::shared_ptr<arrow::Array> ids;
-ARROW_RETURN_NOT_OK(id_builder.Finish(&ids));  // 消耗 builder
+ARROW_RETURN_NOT_OK(id_builder.Finish(&ids));  // consumes the builder
 
 // StringBuilder
 arrow::StringBuilder name_builder;
@@ -1089,30 +1089,30 @@ ARROW_RETURN_NOT_OK(name_builder.Append("bob"));
 std::shared_ptr<arrow::Array> names;
 ARROW_RETURN_NOT_OK(name_builder.Finish(&names));
 
-// 批量追加（更高效，内部一次性扩容）
+// Bulk append (more efficient; capacity is grown once internally)
 ARROW_RETURN_NOT_OK(id_builder.AppendValues(
     std::vector<int32_t>{1, 2, 3, 4, 5},
     std::vector<bool>{true, false, true, true, true}  // validity
 ));
 ```
 
-### 5.3 Zig Builder 内部机制（本项目）
+### 5.3 Zig Builder Internals (This Project)
 
 ```zig
 // src/array/primitive_array.zig
 pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
     return struct {
-        values: OwnedBuffer,          // 可变值缓冲区
-        validity: ?OwnedBuffer = null, // 懒初始化：全有效时不分配
+        values: OwnedBuffer,          // mutable value buffer
+        validity: ?OwnedBuffer = null, // lazily initialized: not allocated when all values are valid
         len: usize = 0,
         null_count: usize = 0,
 
         pub fn append(self: *Self, value: T) !void {
             const next_len = self.len + 1;
-            try self.ensureValuesCapacity(next_len);  // 动态扩容（2倍）
+            try self.ensureValuesCapacity(next_len);  // dynamic growth (2x)
             const slice = std.mem.bytesAsSlice(T, self.values.data);
             slice[self.len] = value;
-            // validity 为 null 时隐含全有效，无需写位图
+            // When validity is null, all values are implicitly valid, so no bitmap write is needed
             try self.setValidBit(self.len);
             self.len = next_len;
         }
@@ -1120,87 +1120,87 @@ pub fn PrimitiveBuilder(comptime T: type, comptime dtype: DataType) type {
         pub fn appendNull(self: *Self) !void {
             const next_len = self.len + 1;
             try self.ensureValuesCapacity(next_len);
-            // 首个 null：懒初始化 validity bitmap，
-            // 将已有元素全部标为有效（memset 0xFF）
+            // First null: lazily initialize the validity bitmap,
+            // marking all existing elements as valid (memset 0xFF)
             try self.ensureValidityForNull(next_len);
             self.len = next_len;
         }
 
         pub fn finish(self: *Self) !ArrayRef {
-            // OwnedBuffer -> SharedBuffer（转移所有权，自身置空）
+            // OwnedBuffer -> SharedBuffer (transfers ownership and empties self)
             const validity_buf = if (self.validity) |*buf|
                 try buf.toShared(bitmap.byteLength(self.len))
             else
                 SharedBuffer.empty;
             const values_buf = try self.values.toShared(self.len * @sizeOf(T));
-            // 构造不可变 ArrayData
+            // Construct immutable ArrayData
             // ...
         }
     };
 }
 ```
 
-**关键优化：Lazy Validity（懒初始化有效性位图）**
+**Key optimization: Lazy Validity (lazily initialized validity bitmap)**
 
-只有当第一个 null 出现时才分配 validity bitmap，全部有效的情况下 bitmap 为空，节省内存且加速处理。
+The validity bitmap is allocated only when the first null appears. If all values are valid, the bitmap stays empty, which saves memory and speeds up processing.
 
 ---
 
-## 6. IPC 序列化格式
+## 6. IPC Serialization Format
 
-Arrow 定义了两种 IPC 格式，用于跨进程/跨网络传递数据，无需反序列化即可使用（zero-copy read）。
+Arrow defines two IPC formats for passing data across processes and networks. The data can be used without deserialization (zero-copy read).
 
-### 6.1 Stream 格式
+### 6.1 Stream Format
 
 ```
 +------------------+
-| Schema Message   |  <- 描述列名和类型（FlatBuffers 编码）
+| Schema Message   |  <- describes column names and types (FlatBuffers encoded)
 +------------------+
-| RecordBatch Msg  |  <- 第一批数据
+| RecordBatch Msg  |  <- first batch of data
 +------------------+
-| RecordBatch Msg  |  <- 更多批次...
+| RecordBatch Msg  |  <- more batches...
 +------------------+
-| EOS (4 零字节)   |  <- 流结束标记
+| EOS (4 zero bytes) |  <- end-of-stream marker
 +------------------+
 
-每条消息结构：
+Structure of each message:
   [0xFFFFFFFF]       <- continuation marker (4 bytes)
-  [metadata_len]     <- FlatBuffers 元数据长度 (4 bytes, little-endian)
-  [metadata]         <- FlatBuffers 编码的消息头（对齐到 8 字节）
-  [body buffers]     <- 原始数据 buffer（每个 buffer 8 字节对齐）
+  [metadata_len]     <- FlatBuffers metadata length (4 bytes, little-endian)
+  [metadata]         <- FlatBuffers-encoded message header (aligned to 8 bytes)
+  [body buffers]     <- raw data buffers (each buffer 8-byte aligned)
 ```
 
-**Rust Stream 写入（来自本项目 main.rs）：**
+**Rust Stream write (from this project's main.rs):**
 
 ```rust
 use arrow_ipc::writer::StreamWriter;
 
-// 创建流写入器，自动写入 Schema 消息
+// Create the stream writer; it writes the Schema message automatically
 let mut writer = StreamWriter::try_new(file, &schema)?;
 
-// 写入每个 RecordBatch
+// Write each RecordBatch
 writer.write(&batch)?;
 
-// 写入 EOS 标记并 flush
+// Write the EOS marker and flush
 writer.finish()?;
 ```
 
-**Rust Stream 读取：**
+**Rust Stream read:**
 
 ```rust
 use arrow_ipc::reader::StreamReader;
 
-// 自动读取并解析 Schema
+// Reads and parses the Schema automatically
 let mut reader = StreamReader::try_new(file, None)?;
 let schema: Arc<Schema> = reader.schema();
 
-// 迭代所有 RecordBatch（实现了 Iterator<Item=Result<RecordBatch>>）
+// Iterate over all RecordBatches (implements Iterator<Item=Result<RecordBatch>>)
 while let Some(batch) = reader.next().transpose()? {
     println!("rows: {}", batch.num_rows());
 }
 ```
 
-**C++ Stream 写入（来自本项目 interop.cpp）：**
+**C++ Stream write (from this project's interop.cpp):**
 
 ```cpp
 ARROW_ASSIGN_OR_RAISE(auto out, arrow::io::FileOutputStream::Open(path));
@@ -1213,7 +1213,7 @@ ARROW_RETURN_NOT_OK(writer->Close());
 ARROW_RETURN_NOT_OK(out->Close());
 ```
 
-**C++ Stream 读取（来自本项目 interop.cpp）：**
+**C++ Stream read (from this project's interop.cpp):**
 
 ```cpp
 ARROW_ASSIGN_OR_RAISE(auto in, arrow::io::ReadableFile::Open(path));
@@ -1223,14 +1223,14 @@ ARROW_ASSIGN_OR_RAISE(
 
 std::shared_ptr<arrow::Schema> schema = reader->schema();
 std::shared_ptr<arrow::RecordBatch> batch;
-ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));  // null 表示 EOS
+ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));  // null indicates EOS
 ```
 
-### 6.2 File 格式（随机访问）
+### 6.2 File Format (Random Access)
 
 ```
 +------------------+
-| "ARROW1\0"       |  <- 魔数 (8 bytes)
+| "ARROW1\0"       |  <- magic number (8 bytes)
 +------------------+
 | Schema Message   |
 +------------------+
@@ -1238,40 +1238,40 @@ ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));  // null 表示 EOS
 | RecordBatch Msg  |
 | ...              |
 +------------------+
-| Footer           |  <- 包含所有 RecordBatch 的文件偏移索引
+| Footer           |  <- contains the file offset index of all RecordBatches
 +------------------+
 | Footer length    |  <- i32 (4 bytes)
 +------------------+
-| "ARROW1\0"       |  <- 尾魔数 (8 bytes)
+| "ARROW1\0"       |  <- trailing magic number (8 bytes)
 +------------------+
 
-File 格式支持随机访问：
-  reader->num_record_batches()    <- 总批次数
-  reader->ReadRecordBatch(i)      <- 按索引读取任意批次（seek + read）
+The File format supports random access:
+  reader->num_record_batches()    <- total number of batches
+  reader->ReadRecordBatch(i)      <- read any batch by index (seek + read)
 ```
 
-**C++ File 读取（来自本项目 interop.cpp）：**
+**C++ File read (from this project's interop.cpp):**
 
 ```cpp
 ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchFileReader::Open(in));
 int n = reader->num_record_batches();
 std::shared_ptr<arrow::RecordBatch> batch;
-ARROW_ASSIGN_OR_RAISE(batch, reader->ReadRecordBatch(0));  // 随机访问
+ARROW_ASSIGN_OR_RAISE(batch, reader->ReadRecordBatch(0));  // random access
 ```
 
-### 6.3 消息对齐与 Padding
+### 6.3 Message Alignment and Padding
 
-本项目 `src/ipc/format.zig`：
+This project's `src/ipc/format.zig`:
 
 ```zig
-pub const Alignment: usize = 8;  // IPC 消息体按 8 字节对齐
+pub const Alignment: usize = 8;  // IPC message body is aligned to 8 bytes
 
 pub fn padLen(len: usize) usize {
     const rem = len % Alignment;
     return if (rem == 0) 0 else Alignment - rem;
 }
 
-// 写入消息时在 metadata 和 body 之间插入填充字节
+// When writing a message, insert padding bytes between metadata and body
 pub fn writePadding(writer: anytype, pad_len: usize) !void {
     var zeros: [Alignment]u8 = [_]u8{0} ** Alignment;
     // ...
@@ -1280,36 +1280,36 @@ pub fn writePadding(writer: anytype, pad_len: usize) !void {
 
 ---
 
-## 7. C Data Interface（FFI）
+## 7. C Data Interface (FFI)
 
-Arrow C Data Interface 允许**不同运行时之间零拷贝传递** Arrow 数据，无需任何序列化。
-规范定义了两个 C 结构体：`ArrowSchema` 和 `ArrowArray`。
+The Arrow C Data Interface allows **zero-copy transfer** of Arrow data between different runtimes, without any serialization.
+The specification defines two C structs: `ArrowSchema` and `ArrowArray`.
 
-### 7.1 C 结构体定义
+### 7.1 C Struct Definitions
 
-本项目 `src/ffi/c_data.zig`：
+This project's `src/ffi/c_data.zig`:
 
 ```zig
-// 完全匹配 Arrow C Data Interface 规范的 extern struct
+// extern structs that exactly match the Arrow C Data Interface specification
 pub const ArrowSchema = extern struct {
-    format: [*c]const u8,      // 类型格式字符串（如 "i"=int32, "+s"=struct）
-    name: [*c]const u8,        // 字段名
-    metadata: [*c]const u8,    // 二进制 key-value 元数据（自定义格式）
+    format: [*c]const u8,      // type format string (e.g. "i"=int32, "+s"=struct)
+    name: [*c]const u8,        // field name
+    metadata: [*c]const u8,    // binary key-value metadata (custom format)
     flags: i64,                // NULLABLE=2, DICT_ORDERED=1, MAP_KEYS_SORTED=4
     n_children: i64,
     children: [*c]?*ArrowSchema,
-    dictionary: ?*ArrowSchema, // 字典类型的值 schema
-    release: ?*const fn (?*ArrowSchema) callconv(.c) void,  // 生命周期回调
-    private_data: ?*anyopaque, // 实现内部使用
+    dictionary: ?*ArrowSchema, // value schema for dictionary types
+    release: ?*const fn (?*ArrowSchema) callconv(.c) void,  // lifetime callback
+    private_data: ?*anyopaque, // used internally by the implementation
 };
 
 pub const ArrowArray = extern struct {
     length: i64,
-    null_count: i64,           // -1 表示未知
-    offset: i64,               // 切片偏移
+    null_count: i64,           // -1 means unknown
+    offset: i64,               // slice offset
     n_buffers: i64,
     n_children: i64,
-    buffers: [*c]?*const anyopaque,  // 指向原始内存的指针数组
+    buffers: [*c]?*const anyopaque,  // array of pointers to the raw memory
     children: [*c]?*ArrowArray,
     dictionary: ?*ArrowArray,
     release: ?*const fn (?*ArrowArray) callconv(.c) void,
@@ -1317,10 +1317,10 @@ pub const ArrowArray = extern struct {
 };
 ```
 
-### 7.2 格式字符串（Format Strings）
+### 7.2 Format Strings
 
 ```
-基础类型：
+Primitive types:
   "n" = null,    "b" = bool
   "c" = int8,    "C" = uint8
   "s" = int16,   "S" = uint16
@@ -1331,131 +1331,131 @@ pub const ArrowArray = extern struct {
   "z" = binary,  "Z" = large_binary
   "vu"= utf8_view, "vz"= binary_view
 
-时间类型：
+Temporal types:
   "tss:UTC"  = timestamp[second, "UTC"]
   "tsm:"     = timestamp[ms, no timezone]
   "ttu"      = time64[microsecond]
   "tDn"      = duration[nanosecond]
   "tiM"      = interval[months]
 
-精度类型：
+Precision types:
   "d:20,4"       = decimal128(precision=20, scale=4)
   "d:9,2,32"     = decimal32(9,2)
   "w:16"         = fixed_size_binary(16 bytes)
 
-嵌套类型：
+Nested types:
   "+l"       = list
   "+L"       = large_list
   "+s"       = struct
   "+m"       = map
   "+r"       = run_end_encoded
-  "+us:0,1"  = sparse_union（type_ids=0,1）
+  "+us:0,1"  = sparse_union (type_ids=0,1)
   "+ud:0,1"  = dense_union
   "+w:4"     = fixed_size_list(4)
 ```
 
-### 7.3 所有权转移语义
+### 7.3 Ownership Transfer Semantics
 
-C Data Interface 核心规则：**谁调用 release，谁持有所有权**。
+Core rule of the C Data Interface: **whoever calls release owns the data**.
 
 ```zig
-// 导出（Producer：Zig -> 外部）
+// Export (Producer: Zig -> external)
 pub fn exportArray(allocator: std.mem.Allocator, arr: ArrayRef) Error!ArrowArray {
     const priv = try allocator.create(ExportedArrayPrivate);
     priv.* = .{
-        .retained_ref = arr.retain(),   // 增加引用计数，防止提前释放
+        .retained_ref = arr.retain(),   // increment reference count to prevent premature release
         .buffers_ptrs = ...,
     };
     return ArrowArray{
         .buffers = priv.buffers_ptrs.ptr,
-        .release = releaseExportedArray,  // 设置释放回调
+        .release = releaseExportedArray,  // set the release callback
         .private_data = priv,
     };
-    // 注意：exportArray 返回后，原 arr 和导出的 ArrowArray 共享同一内存
+    // Note: after exportArray returns, the original arr and the exported ArrowArray share the same memory
 }
 
-// 释放回调（当消费方调用 release 时触发）
+// Release callback (triggered when the consumer calls release)
 fn releaseExportedArray(raw: ?*ArrowArray) callconv(.c) void {
     const priv: *ExportedArrayPrivate = @ptrCast(@alignCast(raw.?.private_data.?));
-    // 释放子数组
+    // Release child arrays
     for (priv.children_storage) |*child| {
         if (child.release) |r| r(child);
     }
-    // 释放 Zig 侧引用（可能触发 buffer 释放）
+    // Release the Zig-side reference (may trigger buffer deallocation)
     var retained = priv.retained_ref;
-    retained.release();  // 减少引用计数
+    retained.release();  // decrement reference count
     priv.allocator.destroy(priv);
-    raw.?.release = null;  // 标记为已释放，防止双重释放
+    raw.?.release = null;  // mark as released to prevent double release
 }
 
-// 导入（Consumer：外部 -> Zig，零拷贝）
+// Import (Consumer: external -> Zig, zero-copy)
 pub fn importArray(...) Error!ArrayRef {
-    // 接管 release 责任（将原 c_array.release 清零）
-    c_array.release = null;  // <- 关键：转移所有权
+    // Take over release responsibility (clear the original c_array.release)
+    c_array.release = null;  // <- key: transfers ownership
 
-    // 直接包装外部指针为 SharedBuffer，不复制数据
+    // Wrap the external pointer directly as a SharedBuffer without copying data
     const ptr: [*]const u8 = @ptrCast(c_array.buffers[i].?);
     buffers[i] = SharedBuffer.init(ptr[0..needed_len]);
 
-    // 创建 owner 对象，ref_count 追踪所有衍生 ArrayRef
-    // 当最后一个 ArrayRef 释放时，调用原始 release 函数
+    // Create an owner object; ref_count tracks all derived ArrayRefs
+    // When the last ArrayRef is released, the original release function is called
 }
 ```
 
-**Rust 中的 FFI（arrow-rs FFI 模块）：**
+**FFI in Rust (arrow-rs FFI module):**
 
 ```rust
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::ArrowArrayStreamReader;
 
-// 导出到 C
+// Export to C
 let ffi_schema = FFI_ArrowSchema::try_from(&schema)?;
 let ffi_array  = FFI_ArrowArray::try_from(&array_data)?;
 
-// 传递裸指针给 C 代码
+// Pass raw pointers to C code
 let schema_ptr = &ffi_schema as *const FFI_ArrowSchema;
 let array_ptr  = &ffi_array  as *const FFI_ArrowArray;
 
-// 从 C 导入（转移所有权）
+// Import from C (transfers ownership)
 let array_data = unsafe {
     arrow_array::ffi::from_ffi(ffi_array, &ffi_schema)?
 };
 ```
 
-**C++ 中的 FFI：**
+**FFI in C++:**
 
 ```cpp
 // arrow/c/bridge.h
-// 导出
+// Export
 struct ArrowArray c_array;
 struct ArrowSchema c_schema;
 ARROW_RETURN_NOT_OK(arrow::ExportArray(*array, &c_array, &c_schema));
 
-// 传递给外部后，外部调用 c_array.release(&c_array) 释放
+// After handing off to external code, the external code calls c_array.release(&c_array) to free it
 
-// 导入
+// Import
 std::shared_ptr<arrow::Array> imported;
 ARROW_ASSIGN_OR_RAISE(imported,
-    arrow::ImportArray(&c_array, &c_schema));  // 接管所有权
+    arrow::ImportArray(&c_array, &c_schema));  // takes ownership
 ```
 
 ---
 
-## 8. Rust 实现：arrow-rs
+## 8. Rust Implementation: arrow-rs
 
-### 8.1 Crate 结构
+### 8.1 Crate Structure
 
 ```
-arrow/               <- 主 facade crate（re-exports 所有子 crate）
+arrow/               <- Main facade crate (re-exports all sub-crates)
 ├── arrow_buffer     <- Buffer, MutableBuffer, ScalarBuffer
-├── arrow_data       <- ArrayData（原始布局容器）
+├── arrow_data       <- ArrayData (raw layout container)
 ├── arrow_schema     <- DataType, Field, Schema
-├── arrow_array      <- 各类型 Array + Builder
-└── arrow_ipc        <- IPC Stream/File 读写器
-    └── arrow_schema (FlatBuffers 生成)
+├── arrow_array      <- Array types + Builders
+└── arrow_ipc        <- IPC Stream/File reader and writer
+    └── arrow_schema (FlatBuffers generated)
 ```
 
-### 8.2 ArrayData：通用布局容器
+### 8.2 ArrayData: General-Purpose Layout Container
 
 ```rust
 // arrow_data/src/data.rs
@@ -1463,19 +1463,19 @@ pub struct ArrayData {
     data_type: DataType,
     len: usize,
     null_count: usize,
-    offset: usize,               // 支持切片视图
-    buffers: Vec<Buffer>,        // 原始字节 buffer
-    child_data: Vec<ArrayData>,  // 嵌套类型子数组
-    nulls: Option<NullBuffer>,   // 封装了 validity bitmap
+    offset: usize,               // supports sliced views
+    buffers: Vec<Buffer>,        // raw byte buffers
+    child_data: Vec<ArrayData>,  // child arrays for nested types
+    nulls: Option<NullBuffer>,   // wraps the validity bitmap
 }
 
 impl ArrayData {
-    // 零拷贝切片：只改变 offset 和 len
+    // Zero-copy slice: only changes offset and len
     pub fn slice(&self, offset: usize, length: usize) -> Self {
         ArrayData {
             offset: self.offset + offset,
             len: length,
-            // 所有 buffer 都是 Clone（Arc::clone）
+            // All buffers are Clone (Arc::clone)
             buffers: self.buffers.clone(),
             ..self.clone()
         }
@@ -1483,38 +1483,38 @@ impl ArrayData {
 }
 ```
 
-### 8.3 类型安全的 Array 访问
+### 8.3 Type-Safe Array Access
 
-arrow-rs 使用 Rust trait 系统保证类型安全：
+arrow-rs uses Rust's trait system to guarantee type safety:
 
 ```rust
-// ArrowPrimitiveType trait 绑定 Rust 原生类型和 Arrow 类型
+// The ArrowPrimitiveType trait binds a Rust native type to an Arrow type
 pub trait ArrowPrimitiveType: 'static + Send + Sync + Clone {
     type Native: NativeType;
     const DATA_TYPE: DataType;
 }
 
-// 具体实现
+// Concrete implementation
 impl ArrowPrimitiveType for Int32Type {
     type Native = i32;
     const DATA_TYPE: DataType = DataType::Int32;
 }
 
-// PrimitiveArray<T> 在编译时确定类型，运行时无动态分派
+// PrimitiveArray<T> resolves its type at compile time, with no runtime dynamic dispatch
 let arr: Int32Array = Int32Array::from(vec![1, 2, 3]);
-let v: i32 = arr.value(0);  // 编译时知道返回 i32
+let v: i32 = arr.value(0);  // The compiler knows this returns i32
 
-// 动态分派时需要 downcast
+// Dynamic dispatch requires a downcast
 let arr: &dyn Array = batch.column(0).as_ref();
 let int_arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
 ```
 
-### 8.4 Error 处理：Result 链
+### 8.4 Error Handling: The Result Chain
 
-arrow-rs 全面使用 `Result<T, ArrowError>`：
+arrow-rs uses `Result<T, ArrowError>` throughout:
 
 ```rust
-// 示例（来自本项目 main.rs 的错误传播）
+// Example (error propagation from this project's main.rs)
 fn generate(path: &Path, container: ContainerMode)
     -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1523,7 +1523,7 @@ fn generate(path: &Path, container: ContainerMode)
     let names: ArrayRef = Arc::new(
         StringArray::from(vec![Some("alice"), None, Some("bob")]));
 
-    // ? 操作符：错误自动向上传播
+    // ? operator: errors propagate upward automatically
     let batch = RecordBatch::try_new(schema.clone(), vec![ids, names])?;
     let file  = File::create(path)?;
     let mut writer = StreamWriter::try_new(file, &schema)?;
@@ -1535,12 +1535,12 @@ fn generate(path: &Path, container: ContainerMode)
 
 ---
 
-## 9. C++ 实现：Apache Arrow C++
+## 9. C++ Implementation: Apache Arrow C++
 
-### 9.1 核心类层次
+### 9.1 Core Class Hierarchy
 
 ```
-arrow::Array               <- 所有数组的基类（虚函数接口）
+arrow::Array               <- Base class for all arrays (virtual interface)
 ├── arrow::PrimitiveArray<T>
 │   ├── Int32Array
 │   ├── DoubleArray
@@ -1553,31 +1553,31 @@ arrow::Array               <- 所有数组的基类（虚函数接口）
 ├── arrow::StructArray
 └── arrow::ListArray
 
-arrow::ArrayBuilder         <- Builder 基类
+arrow::ArrayBuilder         <- Base class for builders
 ├── Int32Builder
 ├── StringBuilder
 ├── DictionaryBuilder<>
 └── ...
 ```
 
-### 9.2 Status 和 Result 错误处理
+### 9.2 Status and Result Error Handling
 
-C++ 使用 `arrow::Status` + `arrow::Result<T>` 代替异常：
+C++ uses `arrow::Status` + `arrow::Result<T>` instead of exceptions:
 
 ```cpp
-// 宏展开简化错误处理（来自本项目 interop.cpp）
+// Macros that simplify error handling (from this project's interop.cpp)
 
-// ARROW_RETURN_NOT_OK(expr)：等价于 if (!st.ok()) return st;
+// ARROW_RETURN_NOT_OK(expr): equivalent to if (!st.ok()) return st;
 ARROW_RETURN_NOT_OK(builder.Append(42));
 
-// ARROW_ASSIGN_OR_RAISE(var, expr)：相当于 Result 的 map/and_then
+// ARROW_ASSIGN_OR_RAISE(var, expr): similar to map/and_then on Result
 ARROW_ASSIGN_OR_RAISE(auto out, arrow::io::FileOutputStream::Open(path));
-// 展开为：
+// Expands to:
 // auto result = arrow::io::FileOutputStream::Open(path);
 // if (!result.ok()) return result.status();
 // auto out = result.MoveValueUnsafe();
 
-// 也可以显式处理
+// Handling it explicitly is also possible
 arrow::Status st = builder.Finish(&array);
 if (!st.ok()) {
     std::cerr << "Error: " << st.ToString() << std::endl;
@@ -1585,37 +1585,37 @@ if (!st.ok()) {
 }
 ```
 
-### 9.3 内存管理：MemoryPool
+### 9.3 Memory Management: MemoryPool
 
 ```cpp
-// C++ 通过 MemoryPool 抽象内存分配
+// C++ abstracts memory allocation through MemoryPool
 arrow::MemoryPool* pool = arrow::default_memory_pool();
 
-// 自定义内存池（用于跟踪、限制或使用 jemalloc/mimalloc）
+// Custom memory pool (for tracking, limiting, or using jemalloc/mimalloc)
 arrow::MemoryPool* jemalloc_pool = arrow::jemalloc_memory_pool();
 
-// 分配对齐 buffer
+// Allocate an aligned buffer
 ARROW_ASSIGN_OR_RAISE(
     std::unique_ptr<arrow::Buffer> buf,
     arrow::AllocateBuffer(size_bytes, pool));
-// buf->data() 对齐到 64 字节
+// buf->data() is aligned to 64 bytes
 
-// Builder 接受可选的 MemoryPool
+// Builders accept an optional MemoryPool
 arrow::Int32Builder builder(pool);
 ```
 
-### 9.4 Compute 函数框架
+### 9.4 Compute Function Framework
 
-C++ 提供向量化计算函数（来自本项目 interop.cpp 中使用）：
+C++ provides vectorized compute functions (as used in this project's interop.cpp):
 
 ```cpp
 // arrow/compute/api.h
-// 通过名称动态分派到注册的函数
+// Dynamically dispatches to a registered function by name
 ARROW_ASSIGN_OR_RAISE(
     auto result_datum,
     arrow::compute::CallFunction("dictionary_encode", {plain_array}));
 
-// 也可以使用类型安全的 API
+// Type-safe APIs are also available
 ARROW_ASSIGN_OR_RAISE(
     auto filtered,
     arrow::compute::Filter(array, boolean_filter));
@@ -1624,90 +1624,90 @@ ARROW_ASSIGN_OR_RAISE(
     auto sorted,
     arrow::compute::SortIndices(array));
 
-// 内置了 SIMD 加速实现：
-// - sum/mean/min/max（使用 AVX2）
-// - cast（类型转换，向量化）
-// - compare（比较，生成 boolean bitmap）
-// - filter（根据 bitmap 选取行）
+// Built-in SIMD-accelerated implementations:
+// - sum/mean/min/max (using AVX2)
+// - cast (type conversion, vectorized)
+// - compare (produces a boolean bitmap)
+// - filter (selects rows based on a bitmap)
 ```
 
 ---
 
-## 10. 优化细节
+## 10. Optimization Details
 
-### 10.1 内存对齐与 SIMD
-
-```
-64字节对齐 + 64字节 padding 的作用：
-
-普通加法（标量）：每次处理 1 个 int32
-for (int i = 0; i < n; i++) out[i] = a[i] + b[i];  // n 次操作
-
-AVX2 向量化（无对齐保证）：每次处理 8 个 int32，但需 vmovdqu（非对齐）
-AVX2 向量化（64字节对齐）：每次处理 16 个 int32，使用 vmovdqa（对齐，更快）
-AVX-512（64字节对齐）：每次处理 16 个 int32，最高吞吐
-
-实测加速比（int32 数组求和，n=1M）：
-  标量:  ~2ms
-  AVX2:  ~0.3ms  (约 7x)
-  AVX-512: ~0.15ms (约 13x)
-```
-
-### 10.2 Validity Bitmap 的 Lazy 初始化
+### 10.1 Memory Alignment and SIMD
 
 ```
-传统做法：
-  每次 append 都写 validity bit -> 即使全部有效也耗费内存带宽
+Purpose of 64-byte alignment + 64-byte padding:
 
-Arrow 做法（本项目 PrimitiveBuilder）：
-  - validity buffer 初始为 null
-  - 第一次 appendNull() 时才分配 bitmap
-  - 此时将 [0, len) 全部标为有效（memset 0xFF）
-  - 再将当前位清零
+Plain addition (scalar): processes 1 int32 per operation
+for (int i = 0; i < n; i++) out[i] = a[i] + b[i];  // n operations
 
-优势：
-  - 全有效列：0 内存开销 + 0 bitmap 写入
-  - 读取时：null_count==0 可跳过 bitmap 检查
-  - SIMD 处理时：无 null 的列可用更激进的无分支实现
+AVX2 vectorized (no alignment guarantee): processes 8 int32 per operation, but needs vmovdqu (unaligned)
+AVX2 vectorized (64-byte aligned): processes 16 int32 per operation, using vmovdqa (aligned, faster)
+AVX-512 (64-byte aligned): processes 16 int32 per operation, highest throughput
+
+Measured speedup (int32 array sum, n=1M):
+  Scalar:    ~2ms
+  AVX2:      ~0.3ms  (about 7x)
+  AVX-512:   ~0.15ms (about 13x)
 ```
 
-### 10.3 零拷贝切片（Slice without Copy）
+### 10.2 Lazy Initialization of the Validity Bitmap
 
 ```
-切片操作只修改 offset 和 length，所有 buffer 引用计数 +1：
+Traditional approach:
+  Every append writes a validity bit -> wastes memory bandwidth even when all values are valid
 
-original: offset=0, length=100, buffer=[0..6400字节]
-sliced:   offset=10, length=20, buffer=[同一块内存]
+Arrow approach (this project's PrimitiveBuilder):
+  - The validity buffer starts as null
+  - The bitmap is allocated only on the first appendNull() call
+  - At that point, all of [0, len) is marked valid (memset 0xFF)
+  - Then the current bit is cleared
 
-读取第 i 个元素：
-  values()[i] = buffer[（offset + i）× sizeof(T)]
-
-零拷贝的代价：
-  - buffer 必须保持对齐（slice 前已对齐，偏移可能非对齐）
-  - 处理非对齐偏移时需要额外的 copy kernel（compute 层处理）
+Benefits:
+  - All-valid column: zero memory overhead + zero bitmap writes
+  - On read: when null_count==0, the bitmap check can be skipped
+  - During SIMD processing: columns without nulls can use more aggressive branch-free implementations
 ```
 
-### 10.4 原子引用计数与内存序
+### 10.3 Zero-Copy Slicing (Slice without Copy)
 
-本项目 buffer 的引用计数使用了正确的内存序：
+```
+A slice operation only modifies offset and length; the reference count of every buffer is incremented by 1:
+
+original: offset=0, length=100, buffer=[0..6400 bytes]
+sliced:   offset=10, length=20, buffer=[same memory block]
+
+Reading the i-th element:
+  values()[i] = buffer[(offset + i) × sizeof(T)]
+
+Costs of zero-copy:
+  - The buffer must stay aligned (it was aligned before slicing, but the offset may be unaligned)
+  - Handling unaligned offsets requires an extra copy kernel (handled in the compute layer)
+```
+
+### 10.4 Atomic Reference Counting and Memory Ordering
+
+This project's buffer reference counting uses correct memory ordering:
 
 ```zig
-// retain：只需 monotonic（不需要同步任何数据）
+// retain: only monotonic is needed (no data synchronization required)
 _ = storage.ref_count.fetchAdd(1, .monotonic);
 
-// release：需要 acq_rel
-// - release 语义：确保 release 前的所有写操作对 destroy 线程可见
-// - acquire 语义：当 fetchSub 返回 1 时（即将 destroy），
-//                看到所有其他线程在 release 前的写
+// release: requires acq_rel
+// - release semantics: ensure all writes before the release are visible to the destroying thread
+// - acquire semantics: when fetchSub returns 1 (about to destroy),
+//                      see all writes other threads made before their releases
 if (storage.ref_count.fetchSub(1, .acq_rel) == 1) {
     storage.release_fn(storage);
 }
 ```
 
-等价于 Rust 中 `Arc<T>` 的实现：
+Equivalent to the implementation of `Arc<T>` in Rust:
 
 ```rust
-// std::sync::Arc 源码等价逻辑
+// Logic equivalent to the std::sync::Arc source
 fn drop(&mut self) {
     // Release: fetch_sub with Release ordering
     if self.inner().strong.fetch_sub(1, Release) != 1 {
@@ -1715,87 +1715,87 @@ fn drop(&mut self) {
     }
     // Acquire fence: synchronize with all Release decrements
     fence(Acquire);
-    // 现在安全地销毁数据
+    // Now it is safe to destroy the data
     unsafe { self.drop_slow() }
 }
 ```
 
-### 10.5 Dictionary Encoding 优化
+### 10.5 Dictionary Encoding Optimization
 
 ```
-基数低的字符串列（如 status: "active"/"inactive"/"deleted"）：
+String column with low cardinality (e.g. status: "active"/"inactive"/"deleted"):
 
-原始存储：
-  N 行 × 平均 8 字节 = 8N 字节
-  每次比较：strcmp（O(len)）
+Raw storage:
+  N rows × average 8 bytes = 8N bytes
+  Each comparison: strcmp (O(len))
 
-字典编码后：
-  indices: N × 4 字节（int32）= 4N 字节
-  dictionary: 3 × 8 字节 = 24 字节
-  总计：4N + 24 字节（~50% 节省）
+After dictionary encoding:
+  indices: N × 4 bytes (int32) = 4N bytes
+  dictionary: 3 × 8 bytes = 24 bytes
+  Total: 4N + 24 bytes (~50% savings)
 
-  比较变为：整数比较（O(1)）
-  Group by 变为：索引 group by（比字符串 hash 快 3-5x）
+  Comparison becomes: integer comparison (O(1))
+  Group by becomes: group by indices (3-5x faster than string hashing)
 ```
 
-### 10.6 Run-End Encoding 压缩效果
+### 10.6 Run-End Encoding Compression Effect
 
 ```
-时间序列数据（100万行，每个值连续出现 1000 次）：
+Time-series data (1 million rows, each value repeated consecutively 1000 times):
 
-原始 int32：100万 × 4字节 = 4MB
-REE：1000对 × (4+4)字节 = 8KB（节省 99.8%）
+Raw int32: 1 million × 4 bytes = 4MB
+REE: 1000 pairs × (4+4) bytes = 8KB (99.8% savings)
 
-随机访问第 i 行：
-  二分查找 run_ends 数组（1000元素），O(log 1000) ≈ 10次比较
-  远比顺序扫描快
+Random access to row i:
+  Binary search over the run_ends array (1000 elements), O(log 1000) ≈ 10 comparisons
+  Far faster than a sequential scan
 ```
 
-### 10.7 IPC 零拷贝读取
+### 10.7 IPC Zero-Copy Reads
 
 ```
-Stream/File 格式的 body buffers 直接 mmap 到内存：
+The body buffers of the Stream/File formats are mmap'ed directly into memory:
 
-传统反序列化：
-  文件字节 -> 解析 -> 分配新内存 -> 复制数据 -> 使用
+Traditional deserialization:
+  File bytes -> parse -> allocate new memory -> copy data -> use
+  
+Arrow IPC zero-copy:
+  mmap file -> validate metadata -> access directly via pointers
+  (no extra memory allocated)
 
-Arrow IPC 零拷贝：
-  mmap 文件 -> 验证 metadata -> 直接用指针访问
-  （不分配任何额外内存）
-
-C++ 实现：
+C++ implementation:
   auto mmap = arrow::io::MemoryMappedFile::Open(path, arrow::io::FileMode::READ);
-  // reader 内部直接持有 mmap 的 Buffer slice
-  // RecordBatch 的 column buffers 指向 mmap 内存
+  // The reader directly holds slices of the mmap'ed Buffer internally
+  // RecordBatch column buffers point into the mmap'ed memory
 ```
 
-### 10.8 Padding 字节的 SIMD 安全读取
+### 10.8 Safe SIMD Reads of Padding Bytes
 
 ```
-Arrow 规定：padding 字节必须为 0
+Arrow requires that padding bytes be 0
 
-原因：SIMD 操作常常以 64 字节为单位读取，即使只有部分元素有效。
-如果 padding 字节随机，则：
-  - sum 操作会读入垃圾值
-  - bitmap 操作会读入无效 bit
+Reason: SIMD operations often read in 64-byte units, even when only some elements are valid.
+If padding bytes were random, then:
+  - sum operations would read in garbage values
+  - bitmap operations would read in invalid bits
 
-本项目 OwnedBuffer 分配时确保清零：
+This project's OwnedBuffer allocation ensures zeroing:
   const data = try allocator.alignedAlloc(...);
-  @memset(data, 0);  // <- 关键：全部清零，确保 padding 为 0
+  @memset(data, 0);  // <- Key: zero everything so padding is 0
 ```
 
 ---
 
-## 11. 跨语言互操作总结
+## 11. Cross-Language Interoperability Summary
 
-本项目通过 IPC 格式和 C Data Interface 实现了 Zig / Rust / C++ / Python 的互操作：
+This project achieves interoperability between Zig / Rust / C++ / Python through the IPC format and the C Data Interface:
 
 ```
                  ┌─────────────┐
-                 │   zarrow    │  <- 本项目（Zig）
+                 │   zarrow    │  <- This project (Zig)
                  │  (writer)   │
                  └──────┬──────┘
-                        │ IPC Stream/File (.arrow 文件)
+                        │ IPC Stream/File (.arrow files)
            ┌────────────┼────────────┐
            ▼            ▼            ▼
     ┌─────────────┐ ┌─────────┐ ┌──────────┐
@@ -1804,31 +1804,31 @@ Arrow 规定：padding 字节必须为 0
     │ (validator) │ │(validor)│ │(generat.)│
     └─────────────┘ └─────────┘ └──────────┘
 
-C Data Interface 路径（零拷贝，进程内）：
+C Data Interface path (zero-copy, in-process):
   Zig exportArray() -> ArrowArray struct -> C++ ImportArray()
                                          -> Rust from_ffi()
                                          -> Python pa.Array._import_from_c()
 ```
 
-### 互操作中的关键一致性点
+### Key Consistency Points in Interoperability
 
-| 点 | Zig | Rust | C++ |
+| Point | Zig | Rust | C++ |
 |---|---|---|---|
-| buffer 对齐 | 64 字节 | 64 字节 | 64 字节 |
-| IPC 对齐 | 8 字节 | 8 字节 | 8 字节 |
-| 位图顺序 | LSB-first | LSB-first | LSB-first |
-| 字节序 | little-endian | little-endian | little-endian |
-| offset 类型 | i32（string）/ i64（large_string）| 同左 | 同左 |
-| padding | 填充 0 | 填充 0 | 填充 0 |
-| REE 子数组顺序 | [run_ends, values] | [run_ends, values] | [run_ends, values] |
+| Buffer alignment | 64 bytes | 64 bytes | 64 bytes |
+| IPC alignment | 8 bytes | 8 bytes | 8 bytes |
+| Bitmap order | LSB-first | LSB-first | LSB-first |
+| Byte order | little-endian | little-endian | little-endian |
+| Offset type | i32 (string) / i64 (large_string) | Same as left | Same as left |
+| Padding | Filled with 0 | Filled with 0 | Filled with 0 |
+| REE child order | [run_ends, values] | [run_ends, values] | [run_ends, values] |
 
 ---
 
-## 参考资料
+## References
 
-- [Apache Arrow 列格式规范](https://arrow.apache.org/docs/format/Columnar.html)
-- [Arrow IPC 格式规范](https://arrow.apache.org/docs/format/IPC.html)
-- [Arrow C Data Interface 规范](https://arrow.apache.org/docs/format/CDataInterface.html)
-- [arrow-rs 源码](https://github.com/apache/arrow-rs)
-- [Apache Arrow C++ 文档](https://arrow.apache.org/docs/cpp/)
-- 本项目源码：`src/` `tools/interop/`
+- [Apache Arrow Columnar Format Specification](https://arrow.apache.org/docs/format/Columnar.html)
+- [Arrow IPC Format Specification](https://arrow.apache.org/docs/format/IPC.html)
+- [Arrow C Data Interface Specification](https://arrow.apache.org/docs/format/CDataInterface.html)
+- [arrow-rs source code](https://github.com/apache/arrow-rs)
+- [Apache Arrow C++ Documentation](https://arrow.apache.org/docs/cpp/)
+- Project source code: `src/` `tools/interop/`
