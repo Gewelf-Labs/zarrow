@@ -1,6 +1,7 @@
 const std = @import("std");
 const zarrow = @import("zarrow");
 const csv_meta = @import("csv_meta.zig");
+const bench_allocator = @import("bench_allocator.zig");
 
 const Mode = enum { default, smoke, full, matrix, matrix_no_header, ci, ci_no_header };
 
@@ -117,8 +118,7 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // smp_allocator: per-batch builder allocations are small; page_allocator would mostly measure syscalls.
-    const allocator = std.heap.smp_allocator;
+    const allocator = bench_allocator.allocator;
     const mode = try parseMode(init, allocator);
     const meta = try csv_meta.resolve(init, allocator);
     defer meta.deinit(allocator);

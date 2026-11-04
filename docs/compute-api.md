@@ -334,9 +334,10 @@ translated to this repository's layout. Kernels are added here, not in a separat
    versus chunked equivalence with chunk boundaries that do not align; empty input; all-null input; the
    error cases of step 6. Register the test file in the family's `test.zig`.
 8. **Benchmark.** One case per kernel and type at 200k rows in `benchmarks/<family>_benchmark.zig`,
-   printing the common CSV line; register the case name in `tools/benchmark_ci_check.py`
-   (`EXPECTED_BENCHES`), `tools/benchmark_ci_thresholds.json` and `tools/test_benchmark_ci_check.py`
-   (`VALID_ROWS`) so the CI smoke run covers it.
+   printing the common CSV line; allocate through `benchmarks/bench_allocator.zig` and make one untimed
+   warm-up call so output memory is reused across iterations (as `compute_benchmark.zig` does); register
+   the case name in `tools/benchmark_ci_check.py` (`EXPECTED_BENCHES`), `tools/benchmark_ci_thresholds.json`
+   and `tools/test_benchmark_ci_check.py` (`VALID_ROWS`) so the CI smoke run covers it.
 9. **Document.** Add a `///` docstring on the public entry point (summary line in the infinitive, as in
    Arrow: "Add two numeric arrays", not "Adds"), and flip the function's row in
    [compute-support-matrix.md](compute-support-matrix.md).

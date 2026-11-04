@@ -1,6 +1,7 @@
 const std = @import("std");
 const zarrow = @import("zarrow");
 const csv_meta = @import("csv_meta.zig");
+const bench_allocator = @import("bench_allocator.zig");
 
 const compute = zarrow.compute;
 const Datum = compute.Datum;
@@ -73,6 +74,9 @@ fn timeKernel(io: std.Io, ctx: *ExecContext, kind: compute.FunctionKind, bench_n
 }
 
 fn timeKernelWith(io: std.Io, ctx: *ExecContext, kind: compute.FunctionKind, bench_name: []const u8, fn_name: []const u8, args: []const Datum, options: Options, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
+    // Untimed warm-up: the timed iterations reuse its output blocks (bench_allocator.zig).
+    var warm_up = try ctx.invoke(fn_name, kind, args, options);
+    warm_up.release();
     var checksum: u64 = 0;
     const timer_start = std.Io.Timestamp.now(io, .awake);
     for (0..cfg.iterations) |_| {
@@ -204,7 +208,7 @@ fn buildString(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.Arr
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const allocator = std.heap.smp_allocator;
+    const allocator = bench_allocator.allocator;
     const mode = try parseMode(init, allocator);
     const meta = try csv_meta.resolve(init, allocator);
     defer meta.deinit(allocator);

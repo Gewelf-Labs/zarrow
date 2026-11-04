@@ -1,6 +1,7 @@
 const std = @import("std");
 const zarrow = @import("zarrow");
 const csv_meta = @import("csv_meta.zig");
+const bench_allocator = @import("bench_allocator.zig");
 
 const Mode = enum { default, smoke, full, matrix, matrix_no_header, ci, ci_no_header };
 
@@ -31,6 +32,9 @@ fn printCsvHeader() void {
 
 /// Times dictionaryEncode of `arr` (int32 indices into its distinct values).
 fn timeEncode(io: std.Io, allocator: std.mem.Allocator, name: []const u8, arr: zarrow.ArrayRef, value_type: *const zarrow.DataType, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
+    // Untimed warm-up: the timed iterations reuse its output blocks (bench_allocator.zig).
+    var warm_up = try zarrow.dictionaryEncode(allocator, arr, value_type);
+    warm_up.release();
     var checksum: usize = 0;
     const timer_start = std.Io.Timestamp.now(io, .awake);
     for (0..cfg.iterations) |_| {
@@ -79,7 +83,7 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const allocator = std.heap.smp_allocator;
+    const allocator = bench_allocator.allocator;
     const mode = try parseMode(init, allocator);
     const meta = try csv_meta.resolve(init, allocator);
     defer meta.deinit(allocator);
