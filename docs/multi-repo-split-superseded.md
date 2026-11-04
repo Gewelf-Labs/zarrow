@@ -1,3 +1,10 @@
+# Superseded: multi-repository split plan
+
+> This plan is no longer followed. Core and compute are one repository; see [repo-layout.md](repo-layout.md).
+> Parquet and Flight remain separate projects. The original (Chinese) text is kept below for history only.
+
+---
+
 # zarrow 分库方案（compute / flight / parquet）
 
 本文档给出把 `zarrow-compute`、`zarrow-flight`、`zarrow-parquet` 拆分为独立仓库时的依赖与发布约定。

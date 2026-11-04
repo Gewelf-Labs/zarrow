@@ -17,6 +17,12 @@ A claim with no test is not "yes"; downgrade it to "partial" and say that the te
 `yes` / `partial` row in `docs/compute-support-matrix.md` carries both kinds; CI runs it. Update the
 references when code moves.
 
+## Repository scope
+
+Core and compute are one repository. Compute kernels belong in `src/compute/` (one file per family) with
+their tests and benchmarks here; never describe kernels as belonging to a downstream `zarrow-compute`
+repository. Parquet and Flight stay separate projects. See `docs/repo-layout.md`.
+
 ## Language
 
 Write all new documentation, comments, commit messages and reports in English. The existing `*-zh.md`
