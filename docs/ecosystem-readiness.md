@@ -1,111 +1,121 @@
-# zarrow 生态扩展就绪性（Compute 刷新）
+# zarrow ecosystem extension readiness (compute refresh)
 
-> 刷新日期：2026-05-02  
-> 范围：compute core 与下游 kernel 扩展边界（zarrow-compute 等）
-
----
-
-## 0. 执行结论
-
-当前结论：**compute 框架已具备 array/scalar/chunked 三态数据入口，且已提供 chunk-aware permutation 基础能力；下游仓库应在此基础上实现具体业务 kernel。**
-
-- `Datum` 现状是 `array / scalar / chunked` 三态，不再是单 chunk 限制。
-- compute core 的职责是：类型与调度框架 + 通用 helper + options 规范；不负责承诺完整函数目录（例如所有 cast/aggregate/sort 内核实现）。
-- `sort/take/filter` 方向建议优先复用 core 的 chunk-aware helper，避免下游在 kernel 中先 `concat` 再处理。
-- options 家族已含 `sort`（`order/null_placement/nan_placement/stable`），可用于统一排序语义。
+> Refresh date: 2026-05-02  
+> Scope: the compute core and the boundary for downstream kernel extensions (zarrow-compute and similar)
 
 ---
 
-## 1. 当前 Compute 模块结构（公开 API 视角）
+## 0. Executive conclusion
 
-`src/compute/` 已按职责拆分，`core.zig` 作为统一入口导出：
+Current conclusion: **the compute framework has array / scalar / chunked entry points for data and provides
+chunk-aware permutation primitives; downstream repositories should implement concrete business kernels on top
+of it.**
 
-- `core.zig`：统一 public API 导出（类型、注册表、context、helpers）
-- `options.zig`：`OptionsTag` 与各 options payload
-- `signature.zig`：`KernelSignature` 与匹配/推导逻辑
-- `registry.zig`：`FunctionRegistry / Kernel / ExecContext`
-- `datum*.zig`：Datum 访问、构建、permutation 辅助
-- `iterators.zig`：array/chunked/scalar 执行迭代器
-- `helpers.zig`：对外 helper 聚合导出
-
----
-
-## 2. Datum 当前状态（array/scalar/chunked）
-
-`Datum` 当前定义与行为：
-
-- 变体：`array: ArrayRef`、`scalar: Scalar`、`chunked: ChunkedArray`
-- 生命周期：`retain()` / `release()` 覆盖三种变体
-- 类型获取：`dataType()` 覆盖三种变体
-- 判别与提取：`isArray/isScalar/isChunked`、`asArray/asScalar/asChunked`
-
-这意味着：
-
-- 下游 kernel 可以直接接收 `chunked` 输入；
-- 不需要把“支持 chunked”作为前置改造任务；
-- 重点应转向“如何高效利用 chunked helper”而非“是否有 chunked 入口”。
+- `Datum` is now three-state (`array / scalar / chunked`); it is no longer limited to a single chunk.
+- The compute core is responsible for the type and dispatch framework, shared helpers and the options
+  conventions. It does not promise a complete function catalog (for example every cast / aggregate / sort
+  kernel implementation).
+- For `sort / take / filter`, reuse the core's chunk-aware helpers first; avoid kernels that `concat` chunked
+  input before processing it.
+- The options family already includes `sort` (`order / null_placement / nan_placement / stable`), which gives
+  one shared sort semantics.
 
 ---
 
-## 3. Compute Core vs 下游仓库职责边界
+## 1. Current compute module structure (public API view)
 
-### 3.1 compute core 已提供
+`src/compute/` is split by responsibility, with `core.zig` as the single export entry point:
 
-- 调度与注册框架：`FunctionRegistry`、`Kernel`、`KernelSignature`、`ExecContext`
-- 统一错误域：`KernelError`（含 `InvalidOptions/InvalidInput/UnsupportedType` 等）
-- 执行辅助：`unary/binary/nary` 迭代与 null 传播 helper
-- Datum helper：
-  - 访问类：`datumListValueAt`、`datumStructField` 等
-  - 构建类：`datumBuildNullLike`、`datumBuildEmptyLike`
-  - permutation 类：`datumTake`、`datumTakeNullable`、`datumSelect`、`datumFilterSelectionIndices`、`datumFilterChunkAware`
-- chunk-aware 基础能力：
+- `core.zig`: unified public API exports (types, registry, context, helpers)
+- `options.zig`: `OptionsTag` and each options payload
+- `signature.zig`: `KernelSignature` with matching and inference logic
+- `registry.zig`: `FunctionRegistry / Kernel / ExecContext`
+- `datum*.zig`: Datum access, construction and permutation helpers
+- `iterators.zig`: array / chunked / scalar execution iterators
+- `helpers.zig`: aggregated helper exports
+
+---
+
+## 2. Current state of Datum (array / scalar / chunked)
+
+Current definition and behavior of `Datum`:
+
+- Variants: `array: ArrayRef`, `scalar: Scalar`, `chunked: ChunkedArray`
+- Lifecycle: `retain()` / `release()` cover all three variants
+- Type access: `dataType()` covers all three variants
+- Discrimination and extraction: `isArray / isScalar / isChunked`, `asArray / asScalar / asChunked`
+
+This means:
+
+- downstream kernels can accept `chunked` input directly;
+- "support chunked" is not a prerequisite refactoring task;
+- the focus shifts to "how to use the chunked helpers efficiently" rather than "is there a chunked entry
+  point".
+
+---
+
+## 3. Responsibility boundary: compute core vs downstream repositories
+
+### 3.1 What the compute core already provides
+
+- Dispatch and registration framework: `FunctionRegistry`, `Kernel`, `KernelSignature`, `ExecContext`
+- One error domain: `KernelError` (including `InvalidOptions / InvalidInput / UnsupportedType` and others)
+- Execution helpers: `unary / binary / nary` iteration and null-propagation helpers
+- Datum helpers:
+  - access: `datumListValueAt`, `datumStructField` and others
+  - construction: `datumBuildNullLike`, `datumBuildEmptyLike`
+  - permutation: `datumTake`, `datumTakeNullable`, `datumSelect`, `datumFilterSelectionIndices`,
+    `datumFilterChunkAware`
+- Chunk-aware primitives:
   - `chunkedResolveLogicalIndices`
-  - chunked take/filter 路径中的一致索引与 null 处理
+  - consistent index and null handling on the chunked take / filter paths
 
-### 3.2 下游仓库应负责
+### 3.2 What downstream repositories own
 
-- 具体业务 kernel 的语义与实现（例如 sort keys 解释、聚合策略、表达式级优化）
-- 函数目录与命名约定（哪些函数作为稳定 API 暴露）
-- 性能策略（并行度、局部排序算法、跨 chunk 合并策略）
-- 与上层引擎/执行计划的集成
-
----
-
-## 4. sort / take / filter 扩展建议路径
-
-### 4.1 sort（推荐）
-
-1. 在下游实现 `sort_indices`（array 与 chunked 共用一套逻辑语义）。
-2. 复用 core `Datum`/chunk helper 构建逻辑索引到 chunk-local 的映射。
-3. 用 `SortOptions` 驱动排序行为，不在 kernel 内硬编码“升序 + nulls last”。
-4. 若需要 `array_sort_indices`，建议作为 `sort_indices` 的 array 特化包装，而非复制语义分支。
-
-### 4.2 take（推荐）
-
-- 优先调用 `datumTake` / `datumTakeNullable`。
-- 对 chunked 输入保持 chunked 输出，避免“先 concat 再 gather”。
-- 对 nullable index 路径沿用 core 的 null 行输出语义。
-
-### 4.3 filter（推荐）
-
-- 谓词到选择向量：`datumFilterSelectionIndices`
-- chunk-aware 执行：`datumFilterChunkAware`
-- 若需要历史数组输出形态，可使用 `datumFilter`（兼容路径）
-
-### 4.4 一致性检查清单（下游实现时）
-
-- array 与 chunked 输入是否得到一致逻辑结果
-- misaligned chunk 边界场景（跨 chunk 连续/非连续索引）
-- null 与 NaN 语义是否仅由 options 驱动
-- 越界索引与非法 options 是否返回一致错误
+- The semantics and implementation of concrete business kernels (for example sort key interpretation,
+  aggregation strategy, expression-level optimization)
+- The function catalog and naming conventions (which functions are exposed as stable API)
+- Performance strategy (parallelism, local sort algorithms, cross-chunk merge strategy)
+- Integration with higher-level engines and execution plans
 
 ---
 
-## 5. Options 家族现状与方向
+## 4. Recommended extension path for sort / take / filter
 
-### 5.1 当前已公开的 options 家族
+### 4.1 sort (recommended)
 
-`OptionsTag`：
+1. Implement `sort_indices` downstream, with one logical semantics shared by array and chunked input.
+2. Reuse the core `Datum` and chunk helpers to map logical indices to chunk-local ones.
+3. Drive sort behavior through `SortOptions`; do not hard-code "ascending + nulls last" inside the kernel.
+4. If `array_sort_indices` is needed, make it an array specialization wrapping `sort_indices` rather than a
+   copied semantic branch.
+
+### 4.2 take (recommended)
+
+- Call `datumTake` / `datumTakeNullable` first.
+- Keep chunked output for chunked input; avoid "concat first, then gather".
+- On the nullable-index path, keep the core's null-row output semantics.
+
+### 4.3 filter (recommended)
+
+- Predicate to selection vector: `datumFilterSelectionIndices`
+- Chunk-aware execution: `datumFilterChunkAware`
+- When the legacy array output shape is required, use `datumFilter` (compatibility path)
+
+### 4.4 Consistency checklist (for downstream implementations)
+
+- Do array and chunked inputs yield the same logical result?
+- Misaligned chunk boundaries (contiguous and non-contiguous indices across chunks)
+- Are null and NaN semantics driven only by options?
+- Do out-of-range indices and invalid options return consistent errors?
+
+---
+
+## 5. Options family: current state and direction
+
+### 5.1 Options families exposed today
+
+`OptionsTag`:
 
 - `none`
 - `cast`
@@ -114,7 +124,7 @@
 - `sort`
 - `custom`
 
-对应 payload：
+Matching payloads:
 
 - `CastOptions`
 - `ArithmeticOptions`
@@ -122,37 +132,41 @@
 - `SortOptions`
 - `CustomOptions`
 
-### 5.2 SortOptions 当前字段
+### 5.2 Current SortOptions fields
 
 - `order`: `ascending | descending`
 - `null_placement`: `at_start | at_end`
 - `nan_placement`: `?at_start | ?at_end`
 - `stable`: `bool`
 
-### 5.3 近期开扩方向（兼容当前模型）
+### 5.3 Near-term extension directions (compatible with the current model)
 
-- 多 key 排序（上层组合多个 `SortOptions` 或扩展自定义 payload）
-- 与执行计划层对齐的排序元数据（例如列选择、比较器配置）
-- 在不破坏 `Options.noneValue()` 兼容性的前提下持续扩展
+- Multi-key sort (compose several `SortOptions` at a higher level, or extend a custom payload)
+- Sort metadata aligned with the execution-plan layer (for example column selection, comparator
+  configuration)
+- Keep extending without breaking `Options.noneValue()` compatibility
 
 ---
 
-## 6. 下游仓库接入建议（简版）
+## 6. Onboarding advice for downstream repositories (short version)
 
-- 第一步：仅依赖 `compute/core.zig` 导出的框架与 helper。
-- 第二步：先落地 `sort_indices + take + filter` 三条路径，复用现有 chunk-aware 基建。
-- 第三步：把 options 校验放在 `KernelSignature.options_check`，避免在 exec 内散落类型判断。
-- 第四步：补齐回归测试：
+- Step 1: depend only on the framework and helpers exported by `compute/core.zig`.
+- Step 2: land the three paths `sort_indices + take + filter` first, reusing the existing chunk-aware
+  infrastructure.
+- Step 3: put options validation in `KernelSignature.options_check` instead of scattering type checks
+  inside exec.
+- Step 4: fill in regression tests:
   - defaults
   - tag dispatch
   - invalid option mismatch
-  - array/chunked 一致性
+  - array / chunked consistency
 
 ---
 
-## 7. 本次刷新后的事实对齐点
+## 7. Facts aligned by this refresh
 
-- 文档已与当前 compute public API 对齐：`Datum` 为 `array/scalar/chunked`。
-- 已去除“缺失 chunked datum 支持”的旧表述。
-- 已明确：compute core 提供框架与 helper，下游仓库实现具体 kernel。
-- 已补充：`sort/take/filter` 推荐扩展路径与 options 家族（含 `sort`）。
+- The document matches the current compute public API: `Datum` is `array / scalar / chunked`.
+- The old statement "chunked datum support is missing" has been removed.
+- Clarified: the compute core provides the framework and helpers; downstream repositories implement concrete
+  kernels.
+- Added: the recommended extension path for `sort / take / filter` and the options family (including `sort`).
