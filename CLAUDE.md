@@ -17,6 +17,12 @@ A claim with no test is not "yes"; downgrade it to "partial" and say that the te
 `yes` / `partial` row in `docs/compute-support-matrix.md` carries both kinds; CI runs it. Update the
 references when code moves.
 
+## Language
+
+Write all new documentation, comments, commit messages and reports in English. The existing `*-zh.md`
+files are legacy mirrors; do not add Chinese text to them or anywhere else, and link to the English
+page instead of translating.
+
 ## Toolchains
 
 Code must build on Zig 0.16 and 0.17 (see README). Run `zig build test -j2` on both before claiming
