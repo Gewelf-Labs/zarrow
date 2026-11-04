@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOCS = ["docs/compute-support-matrix.md", "docs/compute-api.md"]
+DEFAULT_DOCS = ["docs/compute-support-matrix.md", "docs/canonical-extensions.md", "docs/compute-api.md"]
 STATUS_NEEDING_EVIDENCE = ("| yes", "| partial")
 
 SRC_REF = re.compile(r"`([\w./-]+\.(?:zig|py|json)):(\d+)`")
@@ -52,7 +52,7 @@ def check_doc(doc: Path) -> list[str]:
             if needle not in content:
                 problems.append(f'{where}: {path} has no test "{name}"')
         is_claim_row = line.startswith("|") and any(s in line for s in STATUS_NEEDING_EVIDENCE)
-        if is_claim_row and doc.name == "compute-support-matrix.md":
+        if is_claim_row and doc.name != "compute-api.md":
             if not srcs:
                 problems.append(f"{where}: claim row cites no source reference")
             if not tests:

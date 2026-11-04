@@ -249,6 +249,7 @@ For the downstream API boundary, see:
 - [docs/compute-api.md](docs/compute-api.md)
 - [docs/compute-api-zh.md](docs/compute-api-zh.md)
 - [docs/compute-support-matrix.md](docs/compute-support-matrix.md): status of every Arrow C++ compute function category here
+- [docs/canonical-extensions.md](docs/canonical-extensions.md): coverage of Arrow's canonical extension types
 - [docs/ecosystem-readiness.md](docs/ecosystem-readiness.md)
 - Example: [`examples/compute_lifecycle.zig`](examples/compute_lifecycle.zig)
 
