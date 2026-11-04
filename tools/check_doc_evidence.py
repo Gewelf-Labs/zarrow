@@ -6,6 +6,7 @@ Rule (docs/compute-support-matrix.md, "Evidence rule"): a table row whose status
 the checked docs must resolve:
 
 - source reference  `path/to/file.zig:LINE`   -> the file exists and has at least LINE lines
+  (also .py, .json, .yml, .go, .rs, .cpp, .h: CI jobs and interop runners)
 - test reference    `path/to/file.zig:"test name"` -> the file contains  test "test name"
 - build step        `build.zig:"step-name"`    -> build.zig mentions the step name
 
@@ -17,10 +18,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOCS = ["docs/compute-support-matrix.md", "docs/canonical-extensions.md", "docs/compute-api.md"]
+DEFAULT_DOCS = [
+    "docs/compute-support-matrix.md",
+    "docs/canonical-extensions.md",
+    "docs/compute-api.md",
+    "docs/type-coverage.md",
+    "docs/interop-c-abi.md",
+    "docs/interop-arrow-go.md",
+]
 STATUS_NEEDING_EVIDENCE = ("| yes", "| partial")
 
-SRC_REF = re.compile(r"`([\w./-]+\.(?:zig|py|json)):(\d+)`")
+SRC_REF = re.compile(r"`([\w./-]+\.(?:zig|py|json|yml|go|rs|cpp|h)):(\d+)`")
 TEST_REF = re.compile(r"`([\w./-]+\.zig):\"([^\"`]+)\"`")
 
 

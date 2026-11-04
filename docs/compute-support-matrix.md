@@ -42,7 +42,7 @@ empty: there is no built-in kernel catalog, and `arrow::compute::Initialize()` h
 
 ## Function catalog
 
-| Arrow category | Arrow functions (abridged) | zarrow | Notes | Source | Tests |
+| Arrow category | Arrow functions (abridged) | Status | Notes | Source | Tests |
 |---|---|---|---|---|---|
 | Aggregations | all, any, count, count_distinct, first, last, index, max, mean, min, min_max, mode, product, quantile, stddev, sum, tdigest, variance, approximate_median, kurtosis, skew, pivot_wider | no | `AggregateLifecycle` is the hook (see Calling model). `benchmarks/compute_benchmark.zig` carries reference `sum_int64`, `sum_float64`, `min_max_int32` kernels that are not part of the library. | | |
 | Grouped aggregations | hash_* | no | No hash aggregate kind in `FunctionKind`. | | |
