@@ -391,3 +391,128 @@ test "temporal rounding and differences errors: options, timezone, mismatched ty
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("floor_temporal", &.{.{ .array = malformed }}, none));
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("days_between", &.{ .{ .array = malformed }, .{ .array = malformed } }, none));
 }
+
+/// day_time_interval as stored: days in the low 32 bits, milliseconds in the high 32.
+fn dayTime(d: i32, millis: i32) i64 {
+    return @bitCast(@as(u64, @as(u32, @bitCast(millis))) << 32 | @as(u32, @bitCast(d)));
+}
+
+/// month_day_nano_interval as stored: months, days, then nanoseconds in the high 64 bits.
+fn monthDayNano(months: i32, d: i32, nanos: i64) i128 {
+    return @bitCast(@as(u128, @as(u64, @bitCast(nanos))) << 64 | @as(u128, @as(u32, @bitCast(d))) << 32 | @as(u32, @bitCast(months)));
+}
+
+test "temporal time32 / time64 inputs, us_year and interval differences (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // Time parts of time32 / time64 (pyarrow 26; a value past a day or below zero wraps).
+    const t32s = DataType{ .time32 = .{ .unit = .second } };
+    const t32ms = DataType{ .time32 = .{ .unit = .millisecond } };
+    const t64us = DataType{ .time64 = .{ .unit = .microsecond } };
+    const t64ns = DataType{ .time64 = .{ .unit = .nanosecond } };
+    var s = try common.makeTyped(i32, t32s, allocator, &.{ 3723, -1, 90000, null });
+    defer s.release();
+    var m = try common.makeTyped(i32, t32ms, allocator, &.{ 3723, -1, 90000, null });
+    defer m.release();
+    var u = try common.makeTyped(i64, t64us, allocator, &.{ 3723, -1, 90000, null });
+    defer u.release();
+    var n = try common.makeTyped(i64, t64ns, allocator, &.{ 3723, -1, 90000, null });
+    defer n.release();
+    const P = struct { name: []const u8, want: [4][4]?i64 };
+    for ([_]P{
+        .{ .name = "hour", .want = .{ .{ 1, 23, 1, null }, .{ 0, 23, 0, null }, .{ 0, 23, 0, null }, .{ 0, 23, 0, null } } },
+        .{ .name = "minute", .want = .{ .{ 2, 59, 0, null }, .{ 0, 59, 1, null }, .{ 0, 59, 0, null }, .{ 0, 59, 0, null } } },
+        .{ .name = "second", .want = .{ .{ 3, 59, 0, null }, .{ 3, 59, 30, null }, .{ 0, 59, 0, null }, .{ 0, 59, 0, null } } },
+        .{ .name = "millisecond", .want = .{ .{ 0, 0, 0, null }, .{ 723, 999, 0, null }, .{ 3, 999, 90, null }, .{ 0, 999, 0, null } } },
+        .{ .name = "microsecond", .want = .{ .{ 0, 0, 0, null }, .{ 0, 0, 0, null }, .{ 723, 999, 0, null }, .{ 3, 999, 90, null } } },
+        .{ .name = "nanosecond", .want = .{ .{ 0, 0, 0, null }, .{ 0, 0, 0, null }, .{ 0, 0, 0, null }, .{ 723, 999, 0, null } } },
+    }) |p| {
+        for ([_]ArrayRef{ s, m, u, n }, p.want) |arr, want| try common.expectInvoke(i64, &ctx, .scalar, p.name, &.{.{ .array = arr }}, &want);
+    }
+    try common.expectInvoke(f64, &ctx, .scalar, "subsecond", &.{.{ .array = m }}, &.{ 0.723, 0.999, 0.0, null });
+    try common.expectInvoke(f64, &ctx, .scalar, "subsecond", &.{.{ .array = n }}, &.{ 3.723e-06, 0.999999999, 9e-05, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "hour", &.{.{ .scalar = Scalar.init(t32s, .{ .time32 = 7200 }) }}, &.{2});
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("year", &.{.{ .array = m }}, none));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("days_between", &.{ .{ .array = m }, .{ .array = m } }, none));
+
+    // Differences of time-of-day units on time32[ms] (pyarrow 26).
+    var from = try common.makeTyped(i32, t32ms, allocator, &.{ 3723000, -1, null });
+    defer from.release();
+    var to = try common.makeTyped(i32, t32ms, allocator, &.{ 0, 86399999, 5 });
+    defer to.release();
+    const ft = [_]Datum{ .{ .array = from }, .{ .array = to } };
+    try common.expectInvoke(i64, &ctx, .scalar, "hours_between", &ft, &.{ -1, 24, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "minutes_between", &ft, &.{ -62, 1440, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "seconds_between", &ft, &.{ -3723, 86400, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "milliseconds_between", &ft, &.{ -3723000, 86400000, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "nanoseconds_between", &ft, &.{ -3723000000000, 86400000000000, null });
+
+    // Rounding a time like a timestamp of its unit (pyarrow 26).
+    var r = try common.makeTyped(i32, t32ms, allocator, &.{ 3723456, -1 });
+    defer r.release();
+    try common.expectInvokeWith(i32, &ctx, "floor_temporal", &.{.{ .array = r }}, round(1, .minute), &.{ 3720000, -60000 });
+    try common.expectInvokeWith(i32, &ctx, "ceil_temporal", &.{.{ .array = r }}, round(2, .hour), &.{ 7200000, 0 });
+    try common.expectInvokeWith(i32, &ctx, "floor_temporal", &.{.{ .array = r }}, round(1, .day), &.{ 0, -86400000 });
+    try common.expectInvokeWith(i32, &ctx, "ceil_temporal", &.{.{ .array = r }}, round(1, .day), &.{ 86400000, 0 });
+
+    var ru = try common.makeTyped(i64, t64us, allocator, &.{3723456});
+    defer ru.release();
+    try common.expectInvokeWith(i64, &ctx, "round_temporal", &.{.{ .array = ru }}, round(1, .second), &.{4000000});
+
+    // month_day_nano_interval_between: months, then days of the month, then nanoseconds of the day (pyarrow 26).
+    var d1 = try common.makeTyped(i32, date32, allocator, &.{ 0, 40, -1, null });
+    defer d1.release();
+    var d2 = try common.makeTyped(i32, date32, allocator, &.{ 31, 1, 59, 0 });
+    defer d2.release();
+    try common.expectInvoke(i128, &ctx, .scalar, "month_day_nano_interval_between", &.{ .{ .array = d1 }, .{ .array = d2 } }, &.{ monthDayNano(1, 0, 0), monthDayNano(-1, -8, 0), monthDayNano(3, -30, 0), null });
+    const ts_us = DataType{ .timestamp = .{ .unit = .microsecond, .timezone = null } };
+    var us_a = try common.makeTyped(i64, ts_us, allocator, &.{ 0, 1500 });
+    defer us_a.release();
+    var us_b = try common.makeTyped(i64, ts_us, allocator, &.{ 2678400000001, 0 });
+    defer us_b.release();
+    try common.expectInvoke(i128, &ctx, .scalar, "month_day_nano_interval_between", &.{ .{ .array = us_a }, .{ .array = us_b } }, &.{ monthDayNano(1, 0, 1000), monthDayNano(0, 0, -1500000) });
+    var s1 = try common.makeTyped(i64, ts_s, allocator, &.{-1});
+    defer s1.release();
+    var s2 = try common.makeTyped(i64, ts_s, allocator, &.{86400 * 40});
+    defer s2.release();
+    try common.expectInvoke(i128, &ctx, .scalar, "month_day_nano_interval_between", &.{ .{ .array = s1 }, .{ .array = s2 } }, &.{monthDayNano(2, -21, -86399000000000)});
+    var tm1 = try common.makeTyped(i32, t32ms, allocator, &.{3723000});
+    defer tm1.release();
+    var tm2 = try common.makeTyped(i32, t32ms, allocator, &.{0});
+    defer tm2.release();
+    try common.expectInvoke(i128, &ctx, .scalar, "month_day_nano_interval_between", &.{ .{ .array = tm1 }, .{ .array = tm2 } }, &.{monthDayNano(0, 0, -3723000000000)});
+    try common.expectInvokeWith(i32, &ctx, "floor_temporal", &.{.{ .array = tm1 }}, round(1, .month), &.{0});
+
+    // day_time_interval_between: whole days, then milliseconds of the day (Arrow C++'s
+    // DayTimeBetween; pyarrow 26 cannot materialize a day_time_interval array to compare).
+    var m1 = try common.makeTyped(i64, ts_ms, allocator, &.{ 0, 86400001, -1, 172800000, null });
+    defer m1.release();
+    var m2 = try common.makeTyped(i64, ts_ms, allocator, &.{ 90061001, 0, 1, 86400000 * 3 + 5, 0 });
+    defer m2.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "day_time_interval_between", &.{ .{ .array = m1 }, .{ .array = m2 } }, &.{ dayTime(1, 3661001), dayTime(-1, -1), dayTime(1, -86399998), dayTime(1, 5), null });
+    try common.expectInvoke(i64, &ctx, .scalar, "day_time_interval_between", &.{ .{ .array = d1 }, .{ .array = d2 } }, &.{ dayTime(31, 0), dayTime(-39, 0), dayTime(60, 0), null });
+    try common.expectInvoke(i64, &ctx, .scalar, "day_time_interval_between", &.{ .{ .array = tm1 }, .{ .array = tm2 } }, &.{dayTime(0, -3723000)});
+    // Scalars give interval scalars.
+    var sc = try ctx.invokeScalar("day_time_interval_between", &.{ .{ .scalar = Scalar.init(date32, .{ .date32 = 0 }) }, .{ .scalar = Scalar.init(date32, .{ .date32 = 2 }) } }, none);
+    defer sc.release();
+    try std.testing.expectEqual(dayTime(2, 0), sc.scalar.value.interval_day_time);
+    var mc = try common.chunkedAt(allocator, m1, &.{2});
+    defer mc.release();
+    var chunked = try ctx.invokeScalar("month_day_nano_interval_between", &.{ .{ .chunked = mc }, .{ .array = m2 } }, none);
+    defer chunked.release();
+    try std.testing.expectEqual(@as(usize, 2), chunked.chunked.numChunks());
+
+    // us_year: the year of the Sunday-based us_week (pyarrow 26).
+    var ud = try common.makeTyped(i32, date32, allocator, &.{ 0, 3, 4, 365, -1, 10957, 10962, null });
+    defer ud.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "us_year", &.{.{ .array = ud }}, &.{ 1969, 1970, 1970, 1970, 1969, 1999, 2000, null });
+    var ut = try common.makeTyped(i64, ts_ms, allocator, &.{ 0, 3 * 86400000 });
+    defer ut.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "us_year", &.{.{ .array = ut }}, &.{ 1969, 1970 });
+    var ud64 = try common.makeTyped(i64, date64, allocator, &.{ 0, 3 * 86400000 });
+    defer ud64.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "us_year", &.{.{ .array = ud64 }}, &.{ 1969, 1970 });
+}

@@ -485,31 +485,38 @@ test "registerAll registers every kernel family function name with its kind" {
         "ascii_is_decimal",       "ascii_is_space",         "utf8_is_alpha",        "utf8_is_digit",
         "utf8_is_space",          "utf8_length",            "binary_length",        "binary_join_element_wise",
         "ascii_swapcase",         "utf8_swapcase",          "ascii_capitalize",     "utf8_capitalize",
+        "ascii_title",            "utf8_title",             "ascii_reverse",        "utf8_trim",
+        "utf8_ltrim",             "utf8_rtrim",             "ascii_is_alnum",       "ascii_is_lower",
+        "ascii_is_printable",     "ascii_is_title",         "ascii_is_upper",       "utf8_is_alnum",
+        "utf8_is_decimal",        "utf8_is_lower",          "utf8_is_numeric",      "utf8_is_printable",
+        "utf8_is_title",          "utf8_is_upper",
     };
     const string_transform_names = [_][]const u8{
         "replace_substring", "split_pattern", "ascii_split_whitespace", "utf8_split_whitespace",
         "ascii_lpad",        "ascii_rpad",    "ascii_center",           "utf8_lpad",
         "utf8_rpad",         "utf8_center",   "count_substring",        "find_substring",
-        "binary_slice",      "binary_repeat", "binary_reverse",
+        "binary_slice",      "binary_repeat", "binary_reverse",         "utf8_replace_slice",
+        "utf8_zero_fill",    "binary_join",   "binary_replace_slice",
     };
     const temporal_names = [_][]const u8{
         "year",        "month",       "day",        "day_of_week",    "day_of_year", "hour",         "minute",  "second",
         "millisecond", "microsecond", "nanosecond", "iso_year",       "iso_week",    "iso_calendar", "quarter", "is_leap_year",
-        "week",        "us_week",     "subsecond",  "year_month_day",
+        "week",        "us_week",     "subsecond",  "year_month_day", "us_year",
     };
     const temporal_round_names = [_][]const u8{
-        "floor_temporal",       "ceil_temporal",          "round_temporal",  "years_between",
-        "quarters_between",     "month_interval_between", "weeks_between",   "days_between",
-        "hours_between",        "minutes_between",        "seconds_between", "milliseconds_between",
-        "microseconds_between", "nanoseconds_between",
+        "floor_temporal",       "ceil_temporal",          "round_temporal",            "years_between",
+        "quarters_between",     "month_interval_between", "weeks_between",             "days_between",
+        "hours_between",        "minutes_between",        "seconds_between",           "milliseconds_between",
+        "microseconds_between", "nanoseconds_between",    "day_time_interval_between", "month_day_nano_interval_between",
     };
     const scalar_names = [_][]const u8{
-        "add",       "add_checked",    "subtract", "subtract_checked", "multiply", "multiply_checked",
-        "divide",    "divide_checked", "negate",   "negate_checked",   "abs",      "abs_checked",
-        "equal",     "not_equal",      "less",     "less_equal",       "greater",  "greater_equal",
-        "and",       "or",             "xor",      "and_not",          "invert",   "and_kleene",
-        "or_kleene", "is_null",        "is_valid", "true_unless_null", "cast",     "is_in",
-        "index_in",
+        "add",            "add_checked",    "subtract",  "subtract_checked", "multiply",         "multiply_checked",
+        "divide",         "divide_checked", "negate",    "negate_checked",   "abs",              "abs_checked",
+        "equal",          "not_equal",      "less",      "less_equal",       "greater",          "greater_equal",
+        "and",            "or",             "xor",       "and_not",          "invert",           "and_kleene",
+        "or_kleene",      "is_null",        "is_valid",  "true_unless_null", "cast",             "is_in",
+        "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
+        "and_not_kleene",
     } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names;
     const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
     const hash_names = [_][]const u8{ "hash_sum", "hash_mean", "hash_min", "hash_max", "hash_min_max", "hash_count", "hash_count_all", "hash_any", "hash_all", "hash_count_distinct", "hash_distinct" };
@@ -526,10 +533,18 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(scalar_names.len + aggregate_names.len + hash_names.len, registry.functionCount());
 
     // One kernel per input type: 10 numeric types; negate_checked has no unsigned kernels;
-    // comparisons add bool and the three string layouts.
+    // comparisons add bool, the string and binary layouts, six temporal types, four decimal
+    // types and fixed_size_binary; min / max_element_wise numbers, temporal, strings, binaries.
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("add", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("negate_checked", .scalar));
-    try std.testing.expectEqual(@as(usize, 14), registry.kernelCount("less", .scalar));
+    try std.testing.expectEqual(@as(usize, 28), registry.kernelCount("less", .scalar));
+    try std.testing.expectEqual(@as(usize, 22), registry.kernelCount("min_element_wise", .scalar));
+    try std.testing.expectEqual(@as(usize, 15), registry.kernelCount("is_nan", .scalar));
+    try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("count_all", .aggregate));
+    // Implicit numeric casts: binary arithmetic and the comparisons, not negate / abs.
+    try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("add_checked", .scalar).?.implicit_cast);
+    try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("greater", .scalar).?.implicit_cast);
+    try std.testing.expectEqual(common.core.ImplicitCast.none, registry.findFunction("negate", .scalar).?.implicit_cast);
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("min_max", .aggregate));
     // One cast kernel for every pair; string kernels per string layout (binary_length also for the
@@ -538,11 +553,14 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("utf8_upper", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("binary_length", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("year", .scalar));
-    try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("hour", .scalar));
-    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("subsecond", .scalar));
+    try std.testing.expectEqual(@as(usize, 4), registry.kernelCount("hour", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("subsecond", .scalar));
+    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("hours_between", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("years_between", .scalar));
+    try std.testing.expectEqual(@as(usize, 8), registry.kernelCount("binary_join", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("replace_substring", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("binary_slice", .scalar));
-    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("floor_temporal", .scalar));
+    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("hash_sum", .hash_aggregate));
     // Kinds are separate namespaces: no scalar "sum".

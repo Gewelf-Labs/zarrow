@@ -36,15 +36,15 @@ defer sum.release();
 | Family | File | Functions |
 |---|---|---|
 | Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` and their `_checked` variants (int8..int64, uint8..uint64, float32/64) |
-| Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string, large_string, string_view) |
-| Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene` |
-| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `count`, `count_all`, `any`, `all` |
-| Categorizations | `is_null.zig` | `is_null`, `is_valid`, `true_unless_null` |
-| Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp units, dictionary decode and encode, the null type |
-| Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `utf8_upper`, `utf8_lower`, `ascii_swapcase`, `utf8_swapcase`, `ascii_capitalize`, `utf8_capitalize` (ASCII letters), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_space`, `utf8_is_alpha`, `utf8_is_digit`, `utf8_is_space` (string, large_string, string_view) |
-| String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding and whitespace splits on the string layouts), `binary_slice`, `binary_reverse` (binary layouts) |
-| Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp); `subsecond` (timestamp) |
-| Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between`, `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between` (date32, date64, timestamp) |
+| Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string and binary layouts, fixed_size_binary, temporal, decimal); `min_element_wise`, `max_element_wise` (numeric, temporal, string and binary layouts; `ElementWiseAggregateOptions`) |
+| Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene`, `and_not_kleene` |
+| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`), `count` (`CountOptions`), `count_all` (one argument or none) |
+| Categorizations | `is_null.zig` | `is_null` (`NullOptions`), `is_valid`, `true_unless_null`, `is_nan`, `is_finite`, `is_inf` |
+| Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp / time32 / time64 / duration units, timestamp to time of day, same-width integers and temporal types, dictionary decode and encode (every index width), the null type |
+| Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `ascii_swapcase`, `ascii_capitalize`, `ascii_title`, `ascii_reverse` (ASCII letters), `utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title` (Unicode simple case mappings), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `utf8_trim`, `utf8_ltrim`, `utf8_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alnum`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_lower`, `ascii_is_printable`, `ascii_is_space`, `ascii_is_title`, `ascii_is_upper`, `utf8_is_alnum`, `utf8_is_alpha`, `utf8_is_decimal`, `utf8_is_digit`, `utf8_is_lower`, `utf8_is_numeric`, `utf8_is_printable`, `utf8_is_space`, `utf8_is_title`, `utf8_is_upper` (string, large_string, string_view) |
+| String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `utf8_zero_fill`, `utf8_replace_slice`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding, zero fill, replace_slice and whitespace splits on the string layouts), `binary_slice`, `binary_reverse`, `binary_replace_slice` (binary layouts), `binary_join` (`list<T>` / `large_list<T>` with a `T` separator) |
+| Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `us_year`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp, time32, time64); `subsecond` (timestamp, time32, time64) |
+| Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between` (date32, date64, timestamp); `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between`, `day_time_interval_between`, `month_day_nano_interval_between` and the rounding functions (also time32, time64) |
 | Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, string and binary layouts) |
 | Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy`; kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_count`, `hash_count_all`, `hash_any`, `hash_all`, `hash_count_distinct`, `hash_distinct` (values plus uint32 group ids, one row per group) |
 
@@ -62,8 +62,39 @@ var batch = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = keys }}, &.{
 defer batch.deinit(); // columns: k (one row per group, first-seen order), total, rows
 ```
 
-Operands of a binary function must have the same type: there are no implicit casts (call `cast`). Exact semantics,
-including the differences from Arrow C++, are in [compute-support-matrix.md](compute-support-matrix.md).
+### Implicit casts
+
+Arrow C++ functions pick a kernel with `DispatchBest`, which may cast arguments first. Here a function
+registered with `ImplicitCast.numeric` (`FunctionRegistry.setImplicitCast`) does the numeric part of it:
+when no kernel matches and every argument is int8..int64, uint8..uint64, float32 or float64, the arguments
+are cast with the `cast` function to their common type (`commonNumericType`, Arrow's `CommonNumeric`) and
+the call is resolved again. The rule: any float64 gives float64, else any float32 gives float32 (even for
+int64, as Arrow); integers of one signedness give the widest; signed with unsigned gives the signed type
+wider than every unsigned one (int8 + uint8 is int16, int32 + uint32 is int64, uint64 + int64 is int64).
+The cast is safe unless `ExecConfig.safe_cast` is false, so a value the common type cannot hold (2^60 to
+float64, 2^63 as int64) is `InvalidCast`, as in Arrow. `add`, `subtract`, `multiply`, `divide` (and
+`_checked`), the six comparisons and `min_element_wise` / `max_element_wise` cast this way;
+`resolveResultType` reports the type of the cast call. Other mismatches stay `NoMatchingKernel` (Arrow
+also unifies string / binary layouts, timestamp units and decimal scales; call `cast` for those). Exact
+semantics, including the differences from Arrow C++, are in
+[compute-support-matrix.md](compute-support-matrix.md).
+
+### Unicode
+
+The `utf8_*` case functions and predicates read `unicode_tables.zig`, generated from the Unicode
+Character Database (`UnicodeData.txt`, Unicode 17.0.0, the version of pyarrow 26's utf8proc) by
+`python -I tools/gen_unicode_tables.py UnicodeData.txt 17.0.0`: general-category runs (4144) and
+simple upper / lower case ranges with one delta and stride 1 or 2 (205 and 186), each with a bucket
+index of 128 code points below U+20000, about 26 KiB of data. A lookup binary-searches between two
+bucket entries (code points past U+20000 search the tail of the category runs); about 25 KiB in all. The case kernels
+also build, at compile time, a direct table of the 1- and 2-byte code points (U+0000..U+07FF, 8 KiB
+per direction) from those ranges. Mappings are simple (one code point to one), as in Arrow's utf8proc
+kernels, with the one Arrow difference from UnicodeData.txt (U+00DF uppercases to U+1E9E); special
+casing (`ß` to `SS`, final sigma, ligatures) is not applied, in Arrow neither. A mapping may change a
+row's UTF-8 length (at most 3/2 of it; the generator checks this and that every mapping stays a scalar
+value), so the output is always valid UTF-8. To move to a newer Unicode version, download that
+UnicodeData.txt into an empty directory, rerun the generator with the version and check the
+`string Unicode case mapping` test against pyarrow.
 
 This repository also ships take/filter/select (`datumTake`, `datumFilter`,
 `datumSelect`), concatenation (`concatArrayRefs`), slicing, `dictionaryEncode`, validation and null-like /
@@ -132,6 +163,12 @@ Compute options are type-safe and tag-based.
 - `round_temporal`
 - `week`
 - `set_lookup`
+- `null_options`
+- `scalar_aggregate`
+- `count`
+- `element_wise_aggregate`
+- `replace_slice`
+- `zero_fill`
 - `custom`
 
 ### Payload types
@@ -153,11 +190,19 @@ Compute options are type-safe and tag-based.
 - `WeekOptions` (`week_starts_monday`, `count_from_zero`, `first_week_is_fully_in_year`)
 - `SetLookupOptions` (`value_set`: a borrowed array or chunked array `Datum`, `null_matching_behavior`:
   `match | skip | emit_null | inconclusive`)
+- `NullOptions` (`nan_is_null`) for `is_null`
+- `ScalarAggregateOptions` (`skip_nulls` = true, `min_count` = 1) for `sum`, `mean`, `min`, `max`,
+  `min_max`, `any`, `all`
+- `CountOptions` (`mode`: `only_valid | only_null | all`) for `count`
+- `ElementWiseAggregateOptions` (`skip_nulls` = true) for `min_element_wise`, `max_element_wise`
+- `ReplaceSliceOptions` (`start`, `stop`, `replacement`) for `utf8_replace_slice`, `binary_replace_slice`
+- `ZeroFillOptions` (`width`, `padding` = `"0"`) for `utf8_zero_fill`
+- `TrimOptions` also serves `utf8_trim` / `utf8_ltrim` / `utf8_rtrim` (`characters` as UTF-8 code points)
 - `CustomOptions`
 
 Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`, `week`,
-`weeks_between`, the whitespace splits and the `*_temporal` rounding functions) also accept `.none` for
-the defaults.
+`weeks_between`, the whitespace splits, the `*_temporal` rounding functions, `is_null`, the scalar
+aggregates, `count` and `min_element_wise` / `max_element_wise`) also accept `.none` for the defaults.
 
 Use `KernelSignature.options_check` to validate allowed option families for each kernel.
 

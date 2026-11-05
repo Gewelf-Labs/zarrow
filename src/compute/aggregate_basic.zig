@@ -1,19 +1,28 @@
 //! Basic scalar aggregates (Arrow C++ "Aggregations"): sum, mean, min, max, min_max, count,
-//! count_all, any and all. Every function takes one array, chunked array or scalar, skips nulls
-//! (Arrow's `ScalarAggregateOptions` defaults: `skip_nulls = true`, `min_count = 1`) and returns a
+//! count_all, any and all. Every function takes one array, chunked array or scalar and returns a
 //! scalar. Each kernel also has an `AggregateLifecycle`, so a chunked input or a stream of batches
 //! can be consumed with `beginAggregate` / `update` / `merge` / `finalize`.
+//!
+//! sum, mean, min, max, min_max, any and all take `ScalarAggregateOptions` (Arrow defaults when
+//! `none`: `skip_nulls = true`, `min_count = 1`): the result is null when a row is null and
+//! `skip_nulls` is false, or when fewer than `min_count` rows are valid; any / all with
+//! `skip_nulls = false` use Kleene logic instead (any: true if a row is true, else null if a row
+//! is null; all: false if a row is false, else null if a row is null). count takes `CountOptions`
+//! (`only_valid`, `only_null`, `all`).
 //!
 //! - sum: int -> int64, uint -> uint64, float -> float64. Integer sums are exact (128-bit) until
 //!   finalize, which applies `ExecConfig.overflow_mode` once: `checked` returns `Overflow` when the
 //!   total does not fit, `wrapping` keeps the low 64 bits (Arrow C++ behaviour), `saturating` clamps.
-//!   Null when no row is valid.
-//! - mean: float64 of the exact sum over the valid count; null when no row is valid.
+//!   0 when no row is valid and `min_count` is 0.
+//! - mean: float64 of the exact sum over the valid count; NaN when no row is valid and
+//!   `min_count` is 0.
 //! - min / max / min_max: the input type; NaN is ignored unless every valid value is NaN; null (both
-//!   fields null for min_max) when no row is valid. min_max returns a struct scalar `{min, max}`.
-//! - count: valid rows; count_all: all rows (Arrow's count_all is nullary; here it counts the rows of
-//!   its one argument). Both int64, never null.
-//! - any / all: bool input; null when no row is valid.
+//!   fields null for min_max) when no row is valid, whatever `min_count`. min_max returns a struct
+//!   scalar `{min, max}`.
+//! - count: valid, null or all rows (`CountOptions.mode`); count_all: all rows of its one
+//!   argument, or 0 when called with no argument (Arrow's nullary calling convention: no batch, no
+//!   rows). Both int64, never null.
+//! - any / all: bool input; with no valid row (and `min_count` 0) any is false and all is true.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const buffer = @import("../buffer.zig");
@@ -39,22 +48,47 @@ const Bits = dense.Bits;
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     inline for (dense.numeric_types) |T| {
         const check = comptime dense.argsOfType(std.meta.activeTag(dense.dataTypeOf(T)), 1);
-        try add(registry, "sum", check, Sum(T, .sum));
-        try add(registry, "mean", check, Sum(T, .mean));
-        try add(registry, "min", check, MinMax(T, .min));
-        try add(registry, "max", check, MinMax(T, .max));
-        try add(registry, "min_max", check, MinMax(T, .min_max));
+        try add(registry, "sum", 1, check, scalarAggregateOptions, Sum(T, .sum));
+        try add(registry, "mean", 1, check, scalarAggregateOptions, Sum(T, .mean));
+        try add(registry, "min", 1, check, scalarAggregateOptions, MinMax(T, .min));
+        try add(registry, "max", 1, check, scalarAggregateOptions, MinMax(T, .max));
+        try add(registry, "min_max", 1, check, scalarAggregateOptions, MinMax(T, .min_max));
     }
-    try add(registry, "count", is_null.hasValidityBitmap, Count(.count));
-    try add(registry, "count_all", is_null.hasValidityBitmap, Count(.count_all));
-    try add(registry, "any", dense.argsOfType(.bool, 1), AnyAll(.any));
-    try add(registry, "all", dense.argsOfType(.bool, 1), AnyAll(.all));
+    try add(registry, "count", 1, is_null.hasValidityBitmap, countOptions, Count(.count));
+    try add(registry, "count_all", 1, is_null.hasValidityBitmap, dense.noOptions, Count(.count_all));
+    try add(registry, "count_all", 0, noArgs, dense.noOptions, Count(.count_all));
+    try add(registry, "any", 1, dense.argsOfType(.bool, 1), scalarAggregateOptions, AnyAll(.any));
+    try add(registry, "all", 1, dense.argsOfType(.bool, 1), scalarAggregateOptions, AnyAll(.all));
 }
 
-fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime check: TypeCheckFn, comptime Impl: type) KernelError!void {
+fn noArgs(args: []const Datum) bool {
+    return args.len == 0;
+}
+
+/// `none` (Arrow defaults) or `ScalarAggregateOptions`.
+fn scalarAggregateOptions(options: Options) bool {
+    return options == .none or options == .scalar_aggregate;
+}
+
+/// `none` (only_valid) or `CountOptions`.
+fn countOptions(options: Options) bool {
+    return options == .none or options == .count;
+}
+
+fn aggregateOptions(options: Options) core.ScalarAggregateOptions {
+    return if (options == .scalar_aggregate) options.scalar_aggregate else .{};
+}
+
+/// Whether the options make the result null: a null row with `skip_nulls` false, or fewer valid
+/// rows than `min_count` (Arrow C++).
+fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
+    return (!o.skip_nulls and nulls > 0) or count < o.min_count;
+}
+
+fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime arity: usize, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime Impl: type) KernelError!void {
     const A = Aggregate(Impl);
     try registry.registerAggregateKernel(name, .{
-        .signature = .{ .arity = 1, .type_check = check, .options_check = dense.noOptions, .result_type_fn = dense.resultTypeOf(Impl.out_type) },
+        .signature = .{ .arity = arity, .type_check = check, .options_check = options_check, .result_type_fn = dense.resultTypeOf(Impl.out_type) },
         .exec = A.exec,
         .aggregate_lifecycle = .{ .init = A.init, .update = A.update, .merge = A.merge, .finalize = A.finalize, .deinit = A.deinit },
     });
@@ -78,12 +112,12 @@ fn Aggregate(comptime Impl: type) type {
             try Impl.update(state, data);
         }
 
-        /// Aggregate one array, chunked array or scalar into a scalar.
-        fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
-            if (args.len != 1) return error.InvalidArity;
+        /// Aggregate one array, chunked array or scalar into a scalar (count_all: also none).
+        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+            if (args.len > 1) return error.InvalidArity;
             var state: State = .{};
-            try consume(&state, args[0]);
-            return Impl.finalize(ctx, &state);
+            if (args.len == 1) try consume(&state, args[0]);
+            return Impl.finalize(ctx, &state, options);
         }
 
         fn init(ctx: *ExecContext, _: Options) KernelError!*anyopaque {
@@ -93,16 +127,16 @@ fn Aggregate(comptime Impl: type) type {
         }
 
         fn update(_: *ExecContext, state: *anyopaque, args: []const Datum, _: Options) KernelError!void {
-            if (args.len != 1) return error.InvalidArity;
-            try consume(cast(state), args[0]);
+            if (args.len > 1) return error.InvalidArity;
+            if (args.len == 1) try consume(cast(state), args[0]);
         }
 
         fn merge(_: *ExecContext, state: *anyopaque, other: *anyopaque, _: Options) KernelError!void {
             Impl.merge(cast(state), cast(other));
         }
 
-        fn finalize(ctx: *ExecContext, state: *anyopaque, _: Options) KernelError!Datum {
-            return Impl.finalize(ctx, cast(state));
+        fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
+            return Impl.finalize(ctx, cast(state), options);
         }
 
         fn deinit(ctx: *ExecContext, state: *anyopaque) void {
@@ -142,12 +176,14 @@ fn Sum(comptime T: type, comptime which: enum { sum, mean }) type {
     const Exact = if (is_float) f64 else if (signed) i128 else u128;
     const Out = if (which == .mean or is_float) f64 else if (signed) i64 else u64;
     return struct {
-        const State = struct { sum: Exact = 0, count: u64 = 0 };
+        const State = struct { sum: Exact = 0, count: u64 = 0, nulls: u64 = 0 };
         const out_type = dense.dataTypeOf(Out);
 
         fn update(state: *State, data: *const ArrayData) KernelError!void {
             const vals = try values(T, data);
             const bits = dense.validityBits(data);
+            const before = state.count;
+            defer state.nulls += data.length - (state.count - before);
             // Blocks of 2^31 rows: the 64-bit lane sums of 32-bit halves below cannot overflow.
             var start: usize = 0;
             while (start < vals.len) {
@@ -193,7 +229,10 @@ fn Sum(comptime T: type, comptime which: enum { sum, mean }) type {
         }
 
         fn updateScalar(state: *State, s: Scalar) KernelError!void {
-            if (s.isNull()) return;
+            if (s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
             const v = try dense.scalarAs(T, s);
             state.sum += if (is_float) @as(f64, @floatCast(v)) else v;
             state.count += 1;
@@ -202,10 +241,11 @@ fn Sum(comptime T: type, comptime which: enum { sum, mean }) type {
         fn merge(state: *State, other: *const State) void {
             state.sum += other.sum;
             state.count += other.count;
+            state.nulls += other.nulls;
         }
 
-        fn finalize(ctx: *ExecContext, state: *const State) KernelError!Datum {
-            if (state.count == 0) return nullScalar(out_type);
+        fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            if (nullByOptions(aggregateOptions(options), state.count, state.nulls)) return nullScalar(out_type);
             const result: Out = if (which == .mean)
                 (if (is_float) state.sum else @as(f64, @floatFromInt(state.sum))) / @as(f64, @floatFromInt(state.count))
             else if (is_float)
@@ -227,7 +267,7 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
     const min_start: T = if (is_float) std.math.nan(T) else std.math.maxInt(T);
     const max_start: T = if (is_float) std.math.nan(T) else std.math.minInt(T);
     return struct {
-        const State = struct { min: T = min_start, max: T = max_start, count: u64 = 0 };
+        const State = struct { min: T = min_start, max: T = max_start, count: u64 = 0, nulls: u64 = 0 };
         const elem_type = dense.dataTypeOf(T);
         const fields = [_]datatype.Field{
             .{ .name = "min", .data_type = &elem_type },
@@ -253,10 +293,14 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
             state.min = @min(state.min, @reduce(.Min, lo));
             state.max = @max(state.max, @reduce(.Max, hi));
             state.count += count;
+            state.nulls += data.length - count;
         }
 
         fn updateScalar(state: *State, s: Scalar) KernelError!void {
-            if (s.isNull()) return;
+            if (s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
             const v = try dense.scalarAs(T, s);
             state.min = @min(state.min, v);
             state.max = @max(state.max, v);
@@ -267,14 +311,15 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
             state.min = @min(state.min, other.min);
             state.max = @max(state.max, other.max);
             state.count += other.count;
+            state.nulls += other.nulls;
         }
 
-        fn finalize(ctx: *ExecContext, state: *const State) KernelError!Datum {
+        fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            const valid = state.count != 0 and !nullByOptions(aggregateOptions(options), state.count, state.nulls);
             if (which != .min_max) {
-                if (state.count == 0) return nullScalar(out_type);
+                if (!valid) return nullScalar(out_type);
                 return .{ .scalar = Scalar.init(out_type, dense.scalarValueOf(T, if (which == .min) state.min else state.max)) };
             }
-            const valid = state.count != 0;
             var mins = try oneValue(ctx.allocator, valid, state.min);
             var maxs = oneValue(ctx.allocator, valid, state.max) catch |err| {
                 mins.release();
@@ -332,8 +377,13 @@ fn Count(comptime which: enum { count, count_all }) type {
             state.total += other.total;
         }
 
-        fn finalize(_: *ExecContext, state: *const State) KernelError!Datum {
-            const n = if (which == .count) state.valid else state.total;
+        fn finalize(_: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            const mode: core.CountMode = if (which == .count_all) .all else if (options == .count) options.count.mode else .only_valid;
+            const n = switch (mode) {
+                .only_valid => state.valid,
+                .only_null => state.total - state.valid,
+                .all => state.total,
+            };
             return .{ .scalar = Scalar.init(out_type, .{ .i64 = std.math.cast(i64, n) orelse return error.Overflow }) };
         }
     };
@@ -341,7 +391,7 @@ fn Count(comptime which: enum { count, count_all }) type {
 
 fn AnyAll(comptime which: enum { any, all }) type {
     return struct {
-        const State = struct { any_true: bool = false, any_false: bool = false, count: u64 = 0 };
+        const State = struct { any_true: bool = false, any_false: bool = false, count: u64 = 0, nulls: u64 = 0 };
         const out_type = DataType{ .bool = {} };
 
         fn update(state: *State, data: *const ArrayData) KernelError!void {
@@ -362,10 +412,14 @@ fn AnyAll(comptime which: enum { any, all }) type {
             state.any_true = state.any_true or trues != 0;
             state.any_false = state.any_false or falses != 0;
             state.count += count;
+            state.nulls += data.length - count;
         }
 
         fn updateScalar(state: *State, s: Scalar) KernelError!void {
-            if (s.isNull()) return;
+            if (s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
             if (try dense.scalarAs(bool, s)) state.any_true = true else state.any_false = true;
             state.count += 1;
         }
@@ -374,11 +428,15 @@ fn AnyAll(comptime which: enum { any, all }) type {
             state.any_true = state.any_true or other.any_true;
             state.any_false = state.any_false or other.any_false;
             state.count += other.count;
+            state.nulls += other.nulls;
         }
 
-        fn finalize(_: *ExecContext, state: *const State) KernelError!Datum {
-            if (state.count == 0) return nullScalar(out_type);
+        fn finalize(_: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            const o = aggregateOptions(options);
             const result = if (which == .any) state.any_true else !state.any_false;
+            // Kleene: a null row decides unless a true (any) / false (all) row already did.
+            const decided = if (which == .any) state.any_true else state.any_false;
+            if ((!o.skip_nulls and !decided and state.nulls > 0) or state.count < o.min_count) return nullScalar(out_type);
             return .{ .scalar = Scalar.init(out_type, .{ .bool = result }) };
         }
     };

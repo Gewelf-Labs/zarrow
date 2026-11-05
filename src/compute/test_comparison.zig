@@ -7,6 +7,9 @@ const ExecContext = common.ExecContext;
 const Scalar = common.Scalar;
 const dense = common.dense;
 const none = common.none;
+const DataType = common.DataType;
+const Options = common.Options;
+const TypeTag = std.meta.Tag(DataType);
 
 const ops = [_][]const u8{ "equal", "not_equal", "less", "less_equal", "greater", "greater_equal" };
 
@@ -246,7 +249,8 @@ test "comparison errors: mismatched types, arity, options, lengths and malformed
     defer i.release();
     var l = try common.makeArray(i64, allocator, &.{ 1, 2 });
     defer l.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("less", &.{ .{ .array = i }, .{ .array = l } }, none));
+    // Numeric operands are cast to their common type; string layouts are not unified.
+    try common.expectInvoke(bool, &ctx, .scalar, "less", &.{ .{ .array = i }, .{ .array = l } }, &.{ false, false });
     var prng = std.Random.DefaultPrng.init(2);
     var s = try common.randomStrings(.string, allocator, prng.random(), 2, 0, 0);
     defer s.release();
@@ -270,4 +274,204 @@ test "comparison errors: mismatched types, arity, options, lengths and malformed
     var malformed = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .string = {} }, .length = 2, .null_count = 0, .buffers = &bufs });
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("less", &.{ .{ .array = malformed }, .{ .array = s } }, none));
+}
+
+/// Borrowed array of `dt` over `values` (all valid): temporal, decimal and fixed-size test inputs.
+fn typedArray(allocator: std.mem.Allocator, dt: DataType, values: []const u8, len: usize) !ArrayRef {
+    const bufs = [_]common.SharedBuffer{ .empty, .fromSlice(values) };
+    return ArrayRef.fromBorrowed(allocator, .{ .data_type = dt, .length = len, .null_count = 0, .buffers = &bufs });
+}
+
+test "comparison implicit casts and binary, fixed-size, temporal and decimal operands" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // int8 vs uint8 compares as int16 (pyarrow 26: less(-1, 255) is true).
+    var neg = try common.makeArray(i8, allocator, &.{ -1, 5, null });
+    defer neg.release();
+    var big = try common.makeArray(u8, allocator, &.{ 255, 5, 1 });
+    defer big.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "less", &.{ .{ .array = neg }, .{ .array = big } }, &.{ true, false, null });
+    try common.expectInvoke(bool, &ctx, .scalar, "equal", &.{ .{ .array = big }, .{ .scalar = common.scalarOf(f32, 5.0) } }, &.{ false, true, false });
+    var huge = try common.makeArray(u64, allocator, &.{1 << 63});
+    defer huge.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("equal", &.{ .{ .array = huge }, .{ .scalar = common.scalarOf(i64, 1) } }, none));
+
+    // Binary layouts compare by bytes like strings.
+    inline for (.{ TypeTag.binary, TypeTag.large_binary, TypeTag.binary_view }) |tag| {
+        var x = try common.makeStrings(tag, allocator, &.{ "\x00\xff", "abc", null, "a long binary value past twelve" });
+        defer x.release();
+        var y = try common.makeStrings(tag, allocator, &.{ "\x00", "abd", "q", "a long binary value past twelve" });
+        defer y.release();
+        const xy = [_]Datum{ .{ .array = x }, .{ .array = y } };
+        try common.expectInvoke(bool, &ctx, .scalar, "greater", &xy, &.{ true, false, null, false });
+        try common.expectInvoke(bool, &ctx, .scalar, "equal", &xy, &.{ false, false, null, true });
+    }
+
+    // fixed_size_binary(3), sliced, against an array and a scalar.
+    const fsb = DataType{ .fixed_size_binary = .{ .byte_width = 3 } };
+    var f_full = try typedArray(allocator, fsb, "zzzabcabdxyz", 4);
+    defer f_full.release();
+    var f = try f_full.slice(1, 3);
+    defer f.release();
+    var g = try typedArray(allocator, fsb, "abcabcxyz", 3);
+    defer g.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "less_equal", &.{ .{ .array = f }, .{ .array = g } }, &.{ true, false, true });
+    try common.expectInvoke(bool, &ctx, .scalar, "not_equal", &.{ .{ .array = f }, .{ .scalar = Scalar.init(fsb, .{ .binary = "abd" }) } }, &.{ true, false, true });
+    try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("equal", &.{ .{ .array = f }, .{ .scalar = Scalar.init(fsb, .{ .binary = "ab" }) } }, none));
+    var w4 = try typedArray(allocator, .{ .fixed_size_binary = .{ .byte_width = 4 } }, "abcdabcdabcd", 3);
+    defer w4.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("equal", &.{ .{ .array = g }, .{ .array = w4 } }, none));
+
+    // Temporal types compare their stored integers; units and timezones must match.
+    var d1 = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ -1, 0, null, 20000 });
+    defer d1.release();
+    var d2 = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 0, 0, 5, 19999 });
+    defer d2.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "less", &.{ .{ .array = d1 }, .{ .array = d2 } }, &.{ true, false, null, false });
+    try common.expectInvoke(bool, &ctx, .scalar, "greater_equal", &.{ .{ .array = d1 }, .{ .scalar = Scalar.init(.{ .date32 = {} }, .{ .date32 = 0 }) } }, &.{ false, true, null, true });
+    const ts_ms = DataType{ .timestamp = .{ .unit = .millisecond, .timezone = null } };
+    var t1 = try common.makeTyped(i64, ts_ms, allocator, &.{ 1000, -5, 7 });
+    defer t1.release();
+    var t2 = try common.makeTyped(i64, ts_ms, allocator, &.{ 1000, 5, null });
+    defer t2.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "equal", &.{ .{ .array = t1 }, .{ .array = t2 } }, &.{ true, false, null });
+    var t_s = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .second, .timezone = null } }, allocator, &.{ 1, 2, 3 });
+    defer t_s.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("equal", &.{ .{ .array = t1 }, .{ .array = t_s } }, none));
+    inline for (.{ DataType{ .time32 = .{ .unit = .millisecond } }, DataType{ .time64 = .{ .unit = .nanosecond } }, DataType{ .duration = .{ .unit = .second } }, DataType{ .date64 = {} } }) |dt| {
+        const V = if (dt == .time32) i32 else i64;
+        var x = try common.makeTyped(V, dt, allocator, &.{ 3, null, -2 });
+        defer x.release();
+        var y = try common.makeTyped(V, dt, allocator, &.{ 2, 2, -2 });
+        defer y.release();
+        try common.expectInvoke(bool, &ctx, .scalar, "greater", &.{ .{ .array = x }, .{ .array = y } }, &.{ true, null, false });
+    }
+
+    // Decimals with the same precision and scale compare their unscaled integers.
+    const dec = DataType{ .decimal128 = .{ .precision = 10, .scale = 2 } };
+    const dvals = [_]i128{ -150, 0, 99999 };
+    var dx = try typedArray(allocator, dec, std.mem.sliceAsBytes(&dvals), 3);
+    defer dx.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "less", &.{ .{ .array = dx }, .{ .scalar = Scalar.init(dec, .{ .decimal128 = 0 }) } }, &.{ true, false, false });
+    const dec256 = DataType{ .decimal256 = .{ .precision = 40, .scale = 0 } };
+    const wvals = [_]i256{ -(1 << 200), 7 };
+    var wx = try typedArray(allocator, dec256, std.mem.sliceAsBytes(&wvals), 2);
+    defer wx.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "less", &.{ .{ .array = wx }, .{ .scalar = Scalar.init(dec256, .{ .decimal256 = 0 }) } }, &.{ true, false });
+    const other_scale = DataType{ .decimal128 = .{ .precision = 10, .scale = 3 } };
+    var dy = try typedArray(allocator, other_scale, std.mem.sliceAsBytes(&dvals), 3);
+    defer dy.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("equal", &.{ .{ .array = dx }, .{ .array = dy } }, none));
+}
+
+fn withNulls(skip: bool) Options {
+    return .{ .element_wise_aggregate = .{ .skip_nulls = skip } };
+}
+
+test "min_element_wise and max_element_wise: nulls, NaN, signed zeros, strings, promotion (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var a = try common.makeArray(i64, allocator, &.{ 1, null, 3, null });
+    defer a.release();
+    var b = try common.makeArray(i64, allocator, &.{ 2, 2, null, null });
+    defer b.release();
+    const ab = [_]Datum{ .{ .array = a }, .{ .array = b } };
+    try common.expectInvokeWith(i64, &ctx, "min_element_wise", &ab, none, &.{ 1, 2, 3, null });
+    try common.expectInvokeWith(i64, &ctx, "max_element_wise", &ab, withNulls(true), &.{ 2, 2, 3, null });
+    try common.expectInvokeWith(i64, &ctx, "min_element_wise", &ab, withNulls(false), &.{ 1, null, null, null });
+    // One operand is the identity; a scalar broadcasts; a null scalar is skipped or poisons.
+    try common.expectInvokeWith(i64, &ctx, "max_element_wise", &.{.{ .array = a }}, none, &.{ 1, null, 3, null });
+    try common.expectInvokeWith(i64, &ctx, "min_element_wise", &.{ .{ .array = a }, .{ .scalar = common.scalarOf(i64, 2) } }, none, &.{ 1, 2, 2, 2 });
+    try common.expectInvokeWith(i64, &ctx, "min_element_wise", &.{ .{ .array = a }, .{ .scalar = common.scalarOf(i64, null) } }, none, &.{ 1, null, 3, null });
+    try common.expectInvokeWith(i64, &ctx, "min_element_wise", &.{ .{ .array = a }, .{ .scalar = common.scalarOf(i64, null) } }, withNulls(false), &.{ null, null, null, null });
+    // int32 with int64 gives int64 (pyarrow 26); three operands.
+    var c = try common.makeArray(i32, allocator, &.{ 0, 9, -4, 8 });
+    defer c.release();
+    var mixed = try ctx.invokeScalar("max_element_wise", &.{ .{ .array = c }, .{ .array = a }, .{ .array = b } }, none);
+    defer mixed.release();
+    try std.testing.expectEqual(TypeTag.int64, std.meta.activeTag(mixed.dataType()));
+    const got = try common.collect(i64, allocator, mixed);
+    defer allocator.free(got);
+    try common.expectRows(i64, &.{ 2, 9, 3, 8 }, got);
+
+    // NaN is left out unless every value is NaN; -0.0 < 0.0 (pyarrow 26).
+    const nan = std.math.nan(f64);
+    var x = try common.makeArray(f64, allocator, &.{ 1.0, nan, nan, null, -0.0, 0.0 });
+    defer x.release();
+    var y = try common.makeArray(f64, allocator, &.{ nan, 2.0, nan, nan, 0.0, -0.0 });
+    defer y.release();
+    const xy = [_]Datum{ .{ .array = x }, .{ .array = y } };
+    try common.expectInvokeWith(f64, &ctx, "max_element_wise", &xy, none, &.{ 1.0, 2.0, nan, nan, 0.0, 0.0 });
+    var mins = try ctx.invokeScalar("min_element_wise", &xy, none);
+    defer mins.release();
+    const min_rows = try common.collect(f64, allocator, mins);
+    defer allocator.free(min_rows);
+    try common.expectRows(f64, &.{ 1.0, 2.0, nan, nan, -0.0, -0.0 }, min_rows);
+    try std.testing.expect(std.math.signbit(min_rows[4].?) and std.math.signbit(min_rows[5].?));
+    var maxs = try ctx.invokeScalar("max_element_wise", &xy, none);
+    defer maxs.release();
+    const max_rows = try common.collect(f64, allocator, maxs);
+    defer allocator.free(max_rows);
+    try std.testing.expect(!std.math.signbit(max_rows[4].?) and !std.math.signbit(max_rows[5].?));
+
+    // Strings and binaries by bytes, every layout.
+    inline for (.{ TypeTag.string, TypeTag.large_string, TypeTag.string_view, TypeTag.binary }) |tag| {
+        var s = try common.makeStrings(tag, allocator, &.{ "b", null, "a", "a value longer than twelve" });
+        defer s.release();
+        var t = try common.makeStrings(tag, allocator, &.{ "a", "c", null, "a value longer than twelvf" });
+        defer t.release();
+        const st = [_]Datum{ .{ .array = s }, .{ .array = t } };
+        try common.expectInvokeStrings(&ctx, "min_element_wise", &st, none, &.{ "a", "c", "a", "a value longer than twelve" });
+        try common.expectInvokeStrings(&ctx, "max_element_wise", &st, none, &.{ "b", "c", "a", "a value longer than twelvf" });
+        try common.expectInvokeStrings(&ctx, "max_element_wise", &st, withNulls(false), &.{ "b", null, null, "a value longer than twelvf" });
+    }
+
+    // Temporal operands keep their type.
+    var d1 = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 5, null, -3 });
+    defer d1.release();
+    var d2 = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 4, 1, null });
+    defer d2.release();
+    var dmin = try ctx.invokeScalar("min_element_wise", &.{ .{ .array = d1 }, .{ .array = d2 } }, none);
+    defer dmin.release();
+    try std.testing.expect(dmin.dataType() == .date32);
+    const drows = try common.collect(i32, allocator, dmin);
+    defer allocator.free(drows);
+    try common.expectRows(i32, &.{ 4, 1, -3 }, drows);
+
+    // Chunked operands equal the array result.
+    var prng = std.Random.DefaultPrng.init(0xE1E);
+    var r1 = try common.randomArray(i16, allocator, prng.random(), 200, 3, 30, .{});
+    defer r1.release();
+    var r2 = try common.randomArray(i16, allocator, prng.random(), 200, 0, 30, .{});
+    defer r2.release();
+    const v1 = try common.collect(i16, allocator, .{ .array = r1 });
+    defer allocator.free(v1);
+    const v2 = try common.collect(i16, allocator, .{ .array = r2 });
+    defer allocator.free(v2);
+    const want = try allocator.alloc(?i16, 200);
+    defer allocator.free(want);
+    for (want, v1, v2) |*w, p, q| w.* = if (p == null) q else if (q == null) p else @max(p.?, q.?);
+    try common.expectInvokeWith(i16, &ctx, "max_element_wise", &.{ .{ .array = r1 }, .{ .array = r2 } }, none, want);
+    var ch = try common.chunkedAt(allocator, r1, &.{ 17, 99 });
+    defer ch.release();
+    var chunked = try ctx.invokeScalar("max_element_wise", &.{ .{ .chunked = ch }, .{ .array = r2 } }, none);
+    defer chunked.release();
+    try std.testing.expectEqual(@as(usize, 3), chunked.chunked.numChunks());
+    const chunked_rows = try common.collect(i16, allocator, chunked);
+    defer allocator.free(chunked_rows);
+    try common.expectRows(i16, want, chunked_rows);
+
+    // Errors: bool (no kernel, as in Arrow), mixed non-numeric types, options.
+    var flags = try common.makeArray(bool, allocator, &.{ true, false });
+    defer flags.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("min_element_wise", &.{ .{ .array = flags }, .{ .array = flags } }, none));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("min_element_wise", &.{ .{ .array = d1 }, .{ .array = c } }, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("min_element_wise", &ab, .{ .sort = .{} }));
+    try std.testing.expectError(error.InvalidArity, ctx.invokeScalar("max_element_wise", &.{}, none));
 }

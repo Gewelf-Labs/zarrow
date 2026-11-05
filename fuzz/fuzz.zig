@@ -295,9 +295,13 @@ fn kernelRegistry() *const zarrow.compute.FunctionRegistry {
     return &kernel_registry.?;
 }
 
-/// add / less / sum / min_max (numeric), and_kleene / any (bool), less and string kernels
-/// (strings), temporal extraction and rounding (dates, timestamps), cast (numbers, strings,
-/// binaries, dates, timestamps, dictionaries), is_null and count (any type), is_in and a group
+/// add / less / sum / min_max (numeric, also with operands of another numeric type: implicit
+/// casts), min / max_element_wise, is_nan / is_finite, aggregate options, and_kleene /
+/// and_not_kleene / any (bool), less and the string kernels (Unicode case mapping and predicates,
+/// trims, slices, replace_slice, zero_fill), temporal extraction, rounding and interval
+/// differences (dates, timestamps, times), comparisons of temporal, decimal and fixed-size
+/// binary arrays, binary_join of list<string-like>, cast (numbers, strings, binaries, dates,
+/// timestamps, times, durations, dictionaries), is_null and count (any type), is_in and a group
 /// by (Grouper, hash_count_distinct, hash_sum) on every key type, on a decoded array that passed
 /// validateFull and on a slice of it: the call must succeed (or fail with an expected error such as
 /// InvalidCast) and an array output must validate with the input length (one row per group for a
@@ -311,22 +315,47 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
         // is_null / count reject unions and run-end encoded arrays (NoMatchingKernel).
         expectKernel(&ctx, "is_null", .scalar, &.{d}, len, true);
         expectKernel(&ctx, "count", .aggregate, &.{d}, null, true);
+        expectCall(&ctx, "count", .aggregate, &.{d}, .{ .count = .{ .mode = .only_null } }, null, &.{error.NoMatchingKernel});
+        expectCall(&ctx, "is_null", .scalar, &.{d}, .{ .null_options = .{ .nan_is_null = true } }, len, &.{error.NoMatchingKernel});
+        const no_skip: zarrow.compute.Options = .{ .scalar_aggregate = .{ .skip_nulls = false, .min_count = 3 } };
         switch (a.data().data_type) {
             .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
                 expectKernel(&ctx, "add", .scalar, &binary, len, false);
                 expectKernel(&ctx, "less", .scalar, &binary, len, false);
                 expectKernel(&ctx, "sum", .aggregate, &.{d}, null, false);
                 expectKernel(&ctx, "min_max", .aggregate, &.{d}, null, false);
+                expectCall(&ctx, "mean", .aggregate, &.{d}, no_skip, null, &.{});
+                expectCall(&ctx, "min_max", .aggregate, &.{d}, no_skip, null, &.{});
+                expectKernel(&ctx, "is_nan", .scalar, &.{d}, len, false);
+                expectKernel(&ctx, "is_finite", .scalar, &.{d}, len, false);
+                expectCall(&ctx, "max_element_wise", .scalar, &binary, .none, len, &.{});
+                expectCall(&ctx, "min_element_wise", .scalar, &.{ d, d, d }, .{ .element_wise_aggregate = .{ .skip_nulls = false } }, len, &.{});
+                // Implicit casts to the common numeric type: a uint64 past int64 or an integer
+                // past 2^53 does not cast safely.
+                const wide: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .int64 = {} }, .{ .i64 = 3 }) };
+                const real: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .double = {} }, .{ .f64 = 0.5 }) };
+                expectCall(&ctx, "add", .scalar, &.{ d, wide }, .none, len, &.{error.InvalidCast});
+                expectCall(&ctx, "less", .scalar, &.{ real, d }, .none, len, &.{error.InvalidCast});
+                expectCall(&ctx, "max_element_wise", .scalar, &.{ d, wide }, .none, len, &.{error.InvalidCast});
             },
             .bool => {
                 expectKernel(&ctx, "and_kleene", .scalar, &binary, len, false);
+                expectKernel(&ctx, "and_not_kleene", .scalar, &binary, len, false);
                 expectKernel(&ctx, "less", .scalar, &binary, len, false);
                 expectKernel(&ctx, "any", .aggregate, &.{d}, null, false);
+                expectCall(&ctx, "all", .aggregate, &.{d}, no_skip, null, &.{});
             },
             .string, .large_string, .string_view => {
                 expectKernel(&ctx, "less", .scalar, &binary, len, false);
                 // validateFull passed, so the values are UTF-8: the utf8 kernels must succeed.
                 expectCall(&ctx, "utf8_upper", .scalar, &.{d}, .none, len, &.{});
+                inline for (.{ "utf8_lower", "utf8_swapcase", "utf8_title", "utf8_capitalize", "ascii_title", "utf8_is_lower", "utf8_is_title", "utf8_is_alnum", "utf8_is_printable", "ascii_is_upper", "utf8_is_numeric" }) |name| {
+                    expectCall(&ctx, name, .scalar, &.{d}, .none, len, &.{});
+                }
+                expectCall(&ctx, "utf8_trim", .scalar, &.{d}, .{ .trim = .{ .characters = "a\u{e9} " } }, len, &.{});
+                expectCall(&ctx, "utf8_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = -2, .stop = 7, .replacement = "\u{df}" } }, len, &.{});
+                expectCall(&ctx, "utf8_zero_fill", .scalar, &.{d}, .{ .zero_fill = .{ .width = 5 } }, len, &.{});
+                expectCall(&ctx, "min_element_wise", .scalar, &binary, .none, len, &.{});
                 expectCall(&ctx, "utf8_slice_codeunits", .scalar, &.{d}, .{ .slice = .{ .start = -3, .stop = 1, .step = -1 } }, len, &.{});
                 expectCall(&ctx, "binary_join_element_wise", .scalar, &binary, .none, len, &.{});
                 expectCall(&ctx, "utf8_split_whitespace", .scalar, &.{d}, .none, len, &.{});
@@ -336,18 +365,52 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int32 = {} }, true), len, &.{error.InvalidCast});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .double = {} }, true), len, &.{error.InvalidCast});
             },
-            .binary, .large_binary, .binary_view => expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{ error.InvalidCast, error.Overflow }),
+            .binary, .large_binary, .binary_view => {
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{ error.InvalidCast, error.Overflow });
+                expectCall(&ctx, "binary_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = 1, .stop = -1, .replacement = "\xff" } }, len, &.{});
+                expectKernel(&ctx, "greater", .scalar, &binary, len, false);
+            },
+            .fixed_size_binary, .decimal32, .decimal64, .decimal128, .decimal256, .duration => expectKernel(&ctx, "less_equal", .scalar, &binary, len, false),
+            .time32, .time64 => |t| if ((a.data().data_type == .time32) == (t.unit == .second or t.unit == .millisecond)) {
+                expectKernel(&ctx, "hour", .scalar, &.{d}, len, false);
+                expectKernel(&ctx, "subsecond", .scalar, &.{d}, len, false);
+                expectKernel(&ctx, "milliseconds_between", .scalar, &binary, len, false);
+                expectKernel(&ctx, "day_time_interval_between", .scalar, &binary, len, false);
+                expectCall(&ctx, "floor_temporal", .scalar, &.{d}, .{ .round_temporal = .{ .multiple = 7, .unit = .minute } }, len, &.{});
+                // A time is not bounded to a day by validateFull: a finer unit may overflow when safe.
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .time64 = .{ .unit = .nanosecond } }, true), len, &.{error.InvalidCast});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .time32 = .{ .unit = .second } }, false), len, &.{});
+            },
+            .list, .large_list => |l| switch (l.value_field.data_type.*) {
+                // binary_join: a null item gives a null row; every valid row joins.
+                inline .string, .large_string, .binary, .large_binary => |_, tag| {
+                    const sep = zarrow.compute.Scalar.init(@unionInit(DataType, @tagName(tag), {}), if (tag == .string or tag == .large_string) .{ .string = ", " } else .{ .binary = "\x00" });
+                    expectCall(&ctx, "binary_join", .scalar, &.{ d, .{ .scalar = sep } }, .none, len, &.{});
+                },
+                else => {},
+            },
             .date32, .date64, .timestamp => {
                 // A timestamp with a non-UTC timezone is NotImplemented; casts may overflow when safe.
                 const tz_ok = [_]anyerror{error.NotImplemented};
+                expectCall(&ctx, "us_year", .scalar, &.{d}, .none, len, &tz_ok);
+                expectCall(&ctx, "month_day_nano_interval_between", .scalar, &binary, .none, len, &tz_ok);
+                expectCall(&ctx, "day_time_interval_between", .scalar, &binary, .none, len, &tz_ok);
+                expectKernel(&ctx, "greater_equal", .scalar, &binary, len, false);
+                expectCall(&ctx, "max_element_wise", .scalar, &binary, .none, len, &.{});
                 expectCall(&ctx, "year", .scalar, &.{d}, .none, len, &tz_ok);
                 expectCall(&ctx, "iso_calendar", .scalar, &.{d}, .none, len, &tz_ok);
                 expectCall(&ctx, "floor_temporal", .scalar, &.{d}, .{ .round_temporal = .{ .multiple = 3, .unit = .week, .calendar_based_origin = true } }, len, &tz_ok);
                 expectCall(&ctx, "round_temporal", .scalar, &.{d}, .{ .round_temporal = .{ .multiple = 2, .unit = .month } }, len, &tz_ok);
-                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &.{});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &tz_ok);
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .timestamp = .{ .unit = .nanosecond, .timezone = null } }, true), len, &.{error.InvalidCast});
+                if (a.data().data_type == .timestamp) expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .time64 = .{ .unit = .microsecond } }, false), len, &tz_ok);
             },
-            .dictionary => |dict| expectCall(&ctx, "cast", .scalar, &.{d}, cast(dict.value_type.*, true), len, &.{error.UnsupportedType}),
+            .dictionary => |dict| {
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(dict.value_type.*, true), len, &.{error.UnsupportedType});
+                // Re-encoded with 16-bit indices: more distinct values than fit is InvalidCast.
+                const re: DataType = .{ .dictionary = .{ .index_type = .{ .bit_width = 16, .signed = true }, .value_type = dict.value_type } };
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(re, true), len, &.{ error.UnsupportedType, error.InvalidCast });
+            },
             else => {},
         }
         switch (a.data().data_type) {

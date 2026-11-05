@@ -70,11 +70,22 @@ pub const AggregateSession = struct {
 const function_kind_count = std.enums.values(FunctionKind).len;
 const FunctionIndexMap = std.StringHashMap(usize);
 
+/// Implicit casts a function applies when no kernel matches the argument types (Arrow's
+/// `Function::DispatchBest`).
+pub const ImplicitCast = enum {
+    /// Argument types must match a kernel exactly.
+    none,
+    /// Numeric arguments of different types are cast to their common numeric type first (see
+    /// `commonNumericType`).
+    numeric,
+};
+
 pub const Function = struct {
     allocator: std.mem.Allocator,
     name: []u8,
     kind: FunctionKind,
     kernels: std.ArrayList(Kernel),
+    implicit_cast: ImplicitCast = .none,
 
     pub fn kernelCount(self: *const Function) usize {
         return self.kernels.items.len;
@@ -155,6 +166,12 @@ pub const FunctionRegistry = struct {
 
     pub fn registerAggregateKernel(self: *FunctionRegistry, name: []const u8, kernel: Kernel) KernelError!void {
         return self.registerKernel(name, .aggregate, kernel);
+    }
+
+    /// Set the implicit casts of a registered function.
+    pub fn setImplicitCast(self: *FunctionRegistry, name: []const u8, kind: FunctionKind, mode: ImplicitCast) KernelError!void {
+        const idx = self.findFunctionIndex(name, kind) orelse return error.FunctionNotFound;
+        self.functions.items[idx].implicit_cast = mode;
     }
 
     pub fn containsFunction(self: *const FunctionRegistry, name: []const u8, kind: FunctionKind) bool {
@@ -273,8 +290,24 @@ pub const FunctionRegistry = struct {
         args: []const Datum,
         options: Options,
     ) KernelError!DataType {
-        const kernel = try self.resolveKernel(name, kind, args, options);
+        const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
+            const target = self.implicitTarget(err, name, kind, args) orelse return err;
+            // The result type of the call on arguments cast to the common type.
+            var stack: [4]Datum = undefined;
+            if (args.len > stack.len) return err;
+            for (stack[0..args.len]) |*a| a.* = .{ .scalar = core.Scalar.init(target, .null) };
+            return self.resolveResultType(name, kind, stack[0..args.len], options);
+        };
         return kernel.signature.inferResultType(args, options);
+    }
+
+    /// The common numeric type to cast `args` to when resolution failed with `NoMatchingKernel`
+    /// and the function casts numeric arguments implicitly; null otherwise.
+    fn implicitTarget(self: *const FunctionRegistry, err: KernelError, name: []const u8, kind: FunctionKind, args: []const Datum) ?DataType {
+        if (err != error.NoMatchingKernel) return null;
+        const function = self.findFunction(name, kind) orelse return null;
+        if (function.implicit_cast != .numeric) return null;
+        return commonNumericType(args);
     }
 
     /// Explain why result-type inference would fail for the given call site.
@@ -302,9 +335,34 @@ pub const FunctionRegistry = struct {
         args: []const Datum,
         options: Options,
     ) KernelError!Datum {
-        const kernel = try self.resolveKernel(name, kind, args, options);
+        const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
+            const target = self.implicitTarget(err, name, kind, args) orelse return err;
+            return self.invokeCast(ctx, name, kind, args, options, target);
+        };
         _ = try kernel.signature.inferResultType(args, options);
         return kernel.exec(ctx, args, options);
+    }
+
+    /// Cast every argument that is not of type `target` with the `cast` function (safe unless
+    /// `ExecConfig.safe_cast` is false, like Arrow's implicit casts), then invoke `name`.
+    fn invokeCast(self: *const FunctionRegistry, ctx: *ExecContext, name: []const u8, kind: FunctionKind, args: []const Datum, options: Options, target: DataType) KernelError!Datum {
+        const cast_args = ctx.allocator.alloc(Datum, args.len) catch return error.OutOfMemory;
+        defer ctx.allocator.free(cast_args);
+        const owned = ctx.allocator.alloc(bool, args.len) catch return error.OutOfMemory;
+        defer ctx.allocator.free(owned);
+        @memset(owned, false);
+        defer for (cast_args, owned) |*a, o| if (o) a.release();
+        for (args, cast_args, owned) |arg, *c, *o| {
+            if (arg.dataType().eql(target)) {
+                c.* = arg;
+                continue;
+            }
+            c.* = try self.invoke(ctx, "cast", .scalar, &.{arg}, .{ .cast = .{ .to_type = target } });
+            o.* = true;
+        }
+        const kernel = try self.resolveKernel(name, kind, cast_args, options);
+        _ = try kernel.signature.inferResultType(cast_args, options);
+        return kernel.exec(ctx, cast_args, options);
     }
 
     pub fn invokeScalar(
@@ -373,6 +431,51 @@ pub const FunctionRegistry = struct {
         return &self.function_index_by_kind[@intFromEnum(kind)];
     }
 };
+
+/// Arrow's `CommonNumeric` over the argument types: null unless every argument is int8..int64,
+/// uint8..uint64, float32 or float64 and two of them differ. Any float64 gives float64, else any
+/// float32 gives float32; integers of one signedness give the widest; mixed signedness gives the
+/// signed type wider than every unsigned one (uint64 with a signed type gives int64, as in Arrow).
+pub fn commonNumericType(args: []const Datum) ?DataType {
+    if (args.len < 2) return null;
+    var differ = false;
+    var float_bits: u8 = 0;
+    var signed_bits: u8 = 0;
+    var unsigned_bits: u8 = 0;
+    for (args) |arg| {
+        const dt = arg.dataType();
+        if (!dt.eql(args[0].dataType())) differ = true;
+        switch (dt) {
+            .float => float_bits = @max(float_bits, 32),
+            .double => float_bits = 64,
+            .int8 => signed_bits = @max(signed_bits, 8),
+            .int16 => signed_bits = @max(signed_bits, 16),
+            .int32 => signed_bits = @max(signed_bits, 32),
+            .int64 => signed_bits = 64,
+            .uint8 => unsigned_bits = @max(unsigned_bits, 8),
+            .uint16 => unsigned_bits = @max(unsigned_bits, 16),
+            .uint32 => unsigned_bits = @max(unsigned_bits, 32),
+            .uint64 => unsigned_bits = 64,
+            else => return null,
+        }
+    }
+    if (!differ) return null;
+    if (float_bits == 64) return .{ .double = {} };
+    if (float_bits == 32) return .{ .float = {} };
+    if (signed_bits == 0) return switch (unsigned_bits) {
+        8 => .{ .uint8 = {} },
+        16 => .{ .uint16 = {} },
+        32 => .{ .uint32 = {} },
+        else => .{ .uint64 = {} },
+    };
+    if (signed_bits <= unsigned_bits) signed_bits = if (unsigned_bits >= 32) 64 else unsigned_bits * 2;
+    return switch (signed_bits) {
+        8 => .{ .int8 = {} },
+        16 => .{ .int16 = {} },
+        32 => .{ .int32 = {} },
+        else => .{ .int64 = {} },
+    };
+}
 
 fn initFunctionIndexMaps(allocator: std.mem.Allocator) [function_kind_count]FunctionIndexMap {
     var maps: [function_kind_count]FunctionIndexMap = undefined;

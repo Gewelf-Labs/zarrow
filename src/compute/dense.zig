@@ -421,8 +421,8 @@ fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
             return s;
         },
         .struct_, .list => return Scalar.initNested(data.data_type, arr),
-        inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months => |_, tag| {
-            const T = if (tag == .date32 or tag == .time32 or tag == .interval_months) i32 else i64;
+        inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months, .interval_day_time, .interval_month_day_nano => |_, tag| {
+            const T = if (tag == .date32 or tag == .time32 or tag == .interval_months) i32 else if (tag == .interval_month_day_nano) i128 else i64;
             const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
             return Scalar.init(data.data_type, @unionInit(ScalarValue, @tagName(tag), values[0]));
         },
@@ -670,6 +670,21 @@ pub const VarBinaryOutput = struct {
             .views => unreachable,
         }
         self.pos = @intCast(offsets[self.len] - base);
+        self.row = self.len;
+    }
+
+    /// The `len + 1` offsets of an offsets layout (`O` = i32 or i64 by layout; entry 0 is 0), for
+    /// a caller that writes every row at once and then calls `closeRows`.
+    pub fn offsetSlots(self: *Self, comptime O: type) []O {
+        std.debug.assert(self.layout() == if (O == i32) Layout.offsets32 else Layout.offsets64);
+        return self.index.typedSlice(O)[0 .. self.len + 1];
+    }
+
+    /// Close every row after the caller wrote `bytes` bytes at the start of the data buffer
+    /// (through `reserve`) and filled `offsetSlots` (offsets layouts only).
+    pub fn closeRows(self: *Self, bytes: usize) void {
+        std.debug.assert(self.row == 0 and self.pos == 0 and self.layout() != .views and bytes <= self.data.data.len);
+        self.pos = bytes;
         self.row = self.len;
     }
 

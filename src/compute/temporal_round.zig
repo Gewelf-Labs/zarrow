@@ -2,10 +2,15 @@
 //! floor_temporal, ceil_temporal and round_temporal (`RoundTemporalOptions`) keep the input type;
 //! years_between, quarters_between, weeks_between (`DayOfWeekOptions.week_start`), days_between,
 //! hours_between, minutes_between, seconds_between, milliseconds_between, microseconds_between and
-//! nanoseconds_between return int64, month_interval_between returns month_interval. Inputs are
-//! date32, date64 and timestamp (both operands of a difference of the same type); timestamps
-//! without a timezone or in UTC only (another timezone is `NotImplemented`). Null handling is
-//! intersection.
+//! nanoseconds_between return int64, month_interval_between returns month_interval,
+//! day_time_interval_between returns day_time_interval (whole days apart, then the difference of
+//! the milliseconds of the day) and month_day_nano_interval_between month_day_nano_interval (months
+//! apart, then the difference of the days of the month and of the nanoseconds of the day), as in
+//! Arrow C++. Inputs are date32, date64 and timestamp (both operands of a difference of the same
+//! type), and time32 / time64 for the rounding functions, hours_between .. nanoseconds_between and
+//! the two interval differences (a time is a timestamp of its unit on 1970-01-01, as in Arrow);
+//! timestamps without a timezone or in UTC only (another timezone is `NotImplemented`). Null
+//! handling is intersection.
 //!
 //! The calendar math is temporal.zig's (proleptic Gregorian, days floored). Rounding follows
 //! Arrow C++ step by step: multiples count from 1970-01-01 (weeks from the Monday or Sunday
@@ -38,17 +43,38 @@ const Options = core.Options;
 const RoundTemporalOptions = core.RoundTemporalOptions;
 const TypeTag = std.meta.Tag(DataType);
 
-const temporal_tags = [_]TypeTag{ .date32, .date64, .timestamp };
+const temporal_tags = [_]TypeTag{ .date32, .date64, .timestamp, .time32, .time64 };
 const ns_per_day: i64 = 86_400_000_000_000;
 
 /// The rounding functions, by Arrow name.
 pub const RoundOp = enum { floor_temporal, ceil_temporal, round_temporal };
 
 /// The difference functions, by Arrow name.
-pub const Between = enum { years_between, quarters_between, month_interval_between, weeks_between, days_between, hours_between, minutes_between, seconds_between, milliseconds_between, microseconds_between, nanoseconds_between };
+pub const Between = enum { years_between, quarters_between, month_interval_between, weeks_between, days_between, hours_between, minutes_between, seconds_between, milliseconds_between, microseconds_between, nanoseconds_between, day_time_interval_between, month_day_nano_interval_between };
 
-/// Register the rounding and difference functions for date32, date64 and timestamp.
+/// Whether Arrow registers `b` for time32 / time64 (the differences of time-of-day units).
+fn forTimes(comptime b: Between) bool {
+    return switch (b) {
+        .years_between, .quarters_between, .month_interval_between, .weeks_between, .days_between => false,
+        else => true,
+    };
+}
+
+const day_time_type = DataType{ .interval_day_time = .{ .unit = .day_time } };
+const month_day_nano_type = DataType{ .interval_month_day_nano = .{ .unit = .month_day_nano } };
+
+fn betweenType(comptime b: Between) DataType {
+    return switch (b) {
+        .month_interval_between => month_interval_type,
+        .day_time_interval_between => day_time_type,
+        .month_day_nano_interval_between => month_day_nano_type,
+        else => .{ .int64 = {} },
+    };
+}
+
+/// Register the rounding and difference functions for date32, date64, timestamp, time32 and time64.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
+    @setEvalBranchQuota(10_000);
     inline for (temporal_tags) |tag| {
         inline for (comptime std.meta.tags(RoundOp)) |op| {
             try registry.registerScalarKernel(@tagName(op), .{
@@ -57,12 +83,12 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             });
         }
         inline for (comptime std.meta.tags(Between)) |b| {
-            try registry.registerScalarKernel(@tagName(b), .{
+            if (forTimes(b) or !(tag == .time32 or tag == .time64)) try registry.registerScalarKernel(@tagName(b), .{
                 .signature = .{
                     .arity = 2,
                     .type_check = sameTemporal(tag),
                     .options_check = if (b == .weeks_between) weekStartOptions else dense.noOptions,
-                    .result_type_fn = dense.resultTypeOf(if (b == .month_interval_between) month_interval_type else .{ .int64 = {} }),
+                    .result_type_fn = dense.resultTypeOf(betweenType(b)),
                 },
                 .exec = Diff(b).exec,
             });
@@ -112,28 +138,30 @@ fn checkTimezone(dt: DataType) KernelError!void {
     }
 }
 
-/// Nanoseconds per value of a date32 / date64 / timestamp type.
+/// Nanoseconds per value of a date32 / date64 / timestamp / time32 / time64 type.
 fn nsPerTick(dt: DataType) i64 {
-    return switch (dt) {
-        .date32 => ns_per_day,
-        .date64 => 1_000_000,
-        .timestamp => |ts| switch (ts.unit) {
-            .second => 1_000_000_000,
-            .millisecond => 1_000_000,
-            .microsecond => 1_000,
-            .nanosecond => 1,
-        },
+    const unit = switch (dt) {
+        .date32 => return ns_per_day,
+        .date64 => return 1_000_000,
+        .timestamp => |ts| ts.unit,
+        .time32, .time64 => |t| t.unit,
         else => unreachable,
+    };
+    return switch (unit) {
+        .second => 1_000_000_000,
+        .millisecond => 1_000_000,
+        .microsecond => 1_000,
+        .nanosecond => 1,
     };
 }
 
-/// Values of a temporal chunk operand as `V` (i32 for date32, i64 otherwise).
+/// Values of a temporal chunk operand as `V` (i32 for date32 and time32, i64 otherwise).
 fn operandOf(comptime V: type, v: ExecChunkValue) KernelError!dense.Operand(V) {
     return switch (v) {
         .array => |arr| .{ .slice = (PrimitiveArray(V){ .data = arr.data() }).values() catch return error.InvalidInput },
         .scalar => |s| .{ .scalar = switch (s.value) {
-            .date32 => |x| if (V == i32) x else return error.InvalidInput,
-            .date64, .timestamp => |x| if (V == i64) x else return error.InvalidInput,
+            .date32, .time32 => |x| if (V == i32) x else return error.InvalidInput,
+            .date64, .timestamp, .time64 => |x| if (V == i64) x else return error.InvalidInput,
             else => return error.InvalidInput,
         } },
     };
@@ -278,7 +306,7 @@ fn Round(comptime op: RoundOp) type {
             const o: RoundTemporalOptions = if (options == .round_temporal) options.round_temporal else .{};
             const p = try Plan.init(o, nsPerTick(data.data_type));
             return switch (data.data_type) {
-                .date32 => run(i32, ctx, data, len, p),
+                .date32, .time32 => run(i32, ctx, data, len, p),
                 else => run(i64, ctx, data, len, p),
             };
         }
@@ -352,14 +380,13 @@ fn Diff(comptime b: Between) type {
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 2) return error.InvalidArity;
             try checkTimezone(args[0].dataType());
-            const out_type: DataType = if (b == .month_interval_between) month_interval_type else .{ .int64 = {} };
-            return dense.execElementwiseWith(ctx, args, options, out_type, true, chunk);
+            return dense.execElementwiseWith(ctx, args, options, betweenType(b), true, chunk);
         }
 
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
             const week_start: i64 = if (options == .day_of_week) options.day_of_week.week_start else 1;
             return switch (values[0].dataType()) {
-                .date32 => run(i32, ctx, values, len, week_start),
+                .date32, .time32 => run(i32, ctx, values, len, week_start),
                 else => run(i64, ctx, values, len, week_start),
             };
         }
@@ -368,19 +395,49 @@ fn Diff(comptime b: Between) type {
             const tick_ns = nsPerTick(values[0].dataType());
             const lhs = try operandOf(V, values[0]);
             const rhs = try operandOf(V, values[1]);
-            const O = if (b == .month_interval_between) i32 else i64;
-            const out_type: DataType = if (b == .month_interval_between) month_interval_type else .{ .int64 = {} };
-            var out = try dense.DenseBinaryOutput(O).initValidity(ctx.allocator, len, dense.arrayData(values[0]), dense.arrayData(values[1]), out_type);
+            const O = switch (b) {
+                .month_interval_between => i32,
+                .month_day_nano_interval_between => i128,
+                else => i64,
+            };
+            var out = try dense.DenseBinaryOutput(O).initValidity(ctx.allocator, len, dense.arrayData(values[0]), dense.arrayData(values[1]), betweenType(b));
             errdefer out.deinit();
             const dst = out.values();
             switch (lhs) {
                 inline else => |l| switch (rhs) {
                     inline else => |r| for (dst, 0..) |*d, i| {
-                        d.* = @truncate(diff(dense.at(l, i), dense.at(r, i), tick_ns, week_start));
+                        d.* = switch (b) {
+                            .day_time_interval_between, .month_day_nano_interval_between => interval(dense.at(l, i), dense.at(r, i), tick_ns),
+                            else => @truncate(diff(dense.at(l, i), dense.at(r, i), tick_ns, week_start)),
+                        };
                     },
                 },
             }
             return out.finish() catch error.OutOfMemory;
+        }
+
+        /// day_time_interval_between: `{days, milliseconds}` as one i64 (days in the low 32 bits,
+        /// the Arrow memory layout); month_day_nano_interval_between: `{months, days, nanoseconds}`
+        /// as one i128 (months in the low 32 bits, days in the next 32, nanoseconds in the high 64).
+        /// Fields that do not fit wrap, like Arrow's 32-bit casts.
+        fn interval(a: i64, z: i64, tick_ns: i64) if (b == .day_time_interval_between) i64 else i128 {
+            const per_day = @divExact(ns_per_day, tick_ns);
+            const da = @divFloor(a, per_day);
+            const dz = @divFloor(z, per_day);
+            // Ticks into the day, in [0, per_day): at most one day of nanoseconds.
+            const ns_a = (a -% da *% per_day) *% tick_ns;
+            const ns_z = (z -% dz *% per_day) *% tick_ns;
+            if (b == .day_time_interval_between) {
+                const days: u32 = @truncate(@as(u64, @bitCast(dz -% da)));
+                const ms: u32 = @bitCast(@as(i32, @intCast(@divTrunc(ns_z, 1_000_000) - @divTrunc(ns_a, 1_000_000))));
+                return @bitCast(@as(u64, ms) << 32 | days);
+            }
+            const ca = temporal.civil(da);
+            const cz = temporal.civil(dz);
+            const months: u32 = @truncate(@as(u64, @bitCast((cz.year *% 12 +% cz.month) -% (ca.year *% 12 +% ca.month))));
+            const days: u32 = @bitCast(@as(i32, @intCast(cz.day - ca.day)));
+            const nanos: u64 = @bitCast(ns_z - ns_a);
+            return @bitCast(@as(u128, nanos) << 64 | @as(u128, days) << 32 | months);
         }
 
         fn diff(a: i64, z: i64, tick_ns: i64, week_start: i64) i64 {

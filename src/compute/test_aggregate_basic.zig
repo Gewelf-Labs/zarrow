@@ -322,3 +322,113 @@ test "aggregate errors and overflow modes: checked sum Overflow, wrapping, satur
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, checked.invokeAggregate("sum", &.{.{ .array = malformed }}, none));
 }
+
+fn aggOptions(skip_nulls: bool, min_count: u32) common.Options {
+    return .{ .scalar_aggregate = .{ .skip_nulls = skip_nulls, .min_count = min_count } };
+}
+
+/// Invoke an aggregate with options and return its scalar as `?T` (null for a null scalar).
+fn aggWith(comptime T: type, ctx: *ExecContext, name: []const u8, args: []const Datum, options: common.Options) !?T {
+    var out = try ctx.invokeAggregate(name, args, options);
+    defer out.release();
+    return if (out.scalar.isNull()) null else try dense.scalarAs(T, out.scalar);
+}
+
+test "aggregate ScalarAggregateOptions and CountOptions: skip_nulls, min_count, count modes, nullary count_all (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // Expected values from pyarrow 26.
+    var with_null = try common.makeArray(i64, allocator, &.{ 1, null, 3 });
+    defer with_null.release();
+    var three = try common.makeArray(i64, allocator, &.{ 1, 2, 3 });
+    defer three.release();
+    var empty = try common.makeArray(i32, allocator, &.{});
+    defer empty.release();
+    var one_null = try common.makeArray(i32, allocator, &.{ 1, null });
+    defer one_null.release();
+    const wn = [_]Datum{.{ .array = with_null }};
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &wn, aggOptions(false, 1)));
+    try std.testing.expectEqual(@as(?i64, 4), try aggWith(i64, &ctx, "sum", &wn, aggOptions(true, 1)));
+    try std.testing.expectEqual(@as(?i64, 4), try aggWith(i64, &ctx, "sum", &wn, aggOptions(true, 2)));
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &wn, aggOptions(true, 3)));
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{.{ .array = three }}, aggOptions(true, 4)));
+    try std.testing.expectEqual(@as(?i64, 0), try aggWith(i64, &ctx, "sum", &.{.{ .array = empty }}, aggOptions(true, 0)));
+    try std.testing.expect(std.math.isNan((try aggWith(f64, &ctx, "mean", &.{.{ .array = empty }}, aggOptions(true, 0))).?));
+    try std.testing.expectEqual(@as(?i32, null), try aggWith(i32, &ctx, "min", &.{.{ .array = empty }}, aggOptions(true, 0)));
+    try std.testing.expectEqual(@as(?i32, null), try aggWith(i32, &ctx, "min", &.{.{ .array = one_null }}, aggOptions(false, 0)));
+    try std.testing.expectEqual(@as(?f64, null), try aggWith(f64, &ctx, "mean", &.{.{ .array = one_null }}, aggOptions(false, 1)));
+    try std.testing.expectEqual(@as(?i32, 1), try aggWith(i32, &ctx, "max", &.{.{ .array = one_null }}, aggOptions(true, 1)));
+    inline for (.{ .{ &empty, aggOptions(true, 0) }, .{ &one_null, aggOptions(false, 1) } }) |c| {
+        var mm = try ctx.invokeAggregate("min_max", &.{.{ .array = c[0].* }}, c[1]);
+        defer mm.release();
+        try common.expectRows(i32, &.{ null, null }, &(try minMax(i32, mm.scalar)));
+    }
+
+    // any / all: Kleene logic without skip_nulls, min_count on valid rows.
+    var tn = try common.makeArray(bool, allocator, &.{ true, null });
+    defer tn.release();
+    var fn_ = try common.makeArray(bool, allocator, &.{ false, null });
+    defer fn_.release();
+    var tf = try common.makeArray(bool, allocator, &.{ true, false });
+    defer tf.release();
+    var nn = try common.makeArray(bool, allocator, &.{ null, null });
+    defer nn.release();
+    var no_bools = try common.makeArray(bool, allocator, &.{});
+    defer no_bools.release();
+    const B = struct { name: []const u8, arr: *ArrayRef, o: common.Options, want: ?bool };
+    for ([_]B{
+        .{ .name = "any", .arr = &tn, .o = aggOptions(false, 1), .want = true },
+        .{ .name = "any", .arr = &fn_, .o = aggOptions(false, 1), .want = null },
+        .{ .name = "all", .arr = &fn_, .o = aggOptions(false, 1), .want = false },
+        .{ .name = "all", .arr = &tn, .o = aggOptions(false, 1), .want = null },
+        .{ .name = "all", .arr = &no_bools, .o = aggOptions(true, 0), .want = true },
+        .{ .name = "any", .arr = &no_bools, .o = aggOptions(true, 0), .want = false },
+        .{ .name = "any", .arr = &tf, .o = aggOptions(true, 3), .want = null },
+        .{ .name = "any", .arr = &nn, .o = none, .want = null },
+        .{ .name = "all", .arr = &nn, .o = none, .want = null },
+        .{ .name = "all", .arr = &tn, .o = aggOptions(false, 0), .want = null },
+        .{ .name = "all", .arr = &tn, .o = aggOptions(true, 1), .want = true },
+    }) |c| {
+        const got = try aggWith(bool, &ctx, c.name, &.{.{ .array = c.arr.* }}, c.o);
+        std.testing.expectEqual(c.want, got) catch |err| {
+            std.debug.print("{s}\n", .{c.name});
+            return err;
+        };
+    }
+
+    // CountOptions modes; count_all with Arrow's nullary calling convention counts no rows.
+    try std.testing.expectEqual(@as(?i64, 2), try aggWith(i64, &ctx, "count", &wn, .{ .count = .{ .mode = .only_valid } }));
+    try std.testing.expectEqual(@as(?i64, 1), try aggWith(i64, &ctx, "count", &wn, .{ .count = .{ .mode = .only_null } }));
+    try std.testing.expectEqual(@as(?i64, 3), try aggWith(i64, &ctx, "count", &wn, .{ .count = .{ .mode = .all } }));
+    try std.testing.expectEqual(@as(?i64, 3), try aggWith(i64, &ctx, "count_all", &wn, none));
+    try std.testing.expectEqual(@as(?i64, 0), try aggWith(i64, &ctx, "count_all", &.{}, none));
+    var nullary = try ctx.beginAggregate("count_all", &.{}, none);
+    defer nullary.deinit();
+    try nullary.update(&.{});
+    var zero = try nullary.finalize();
+    defer zero.release();
+    try std.testing.expectEqual(@as(i64, 0), zero.scalar.value.i64);
+
+    // The lifecycle and chunked inputs see the nulls of every batch.
+    var parts = try common.chunkedAt(allocator, with_null, &.{1});
+    defer parts.release();
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{.{ .chunked = parts }}, aggOptions(false, 1)));
+    var session = try ctx.beginAggregate("max", &.{.{ .array = three }}, aggOptions(false, 1));
+    defer session.deinit();
+    try session.update(&.{.{ .array = three }});
+    var other = try ctx.beginAggregate("max", &.{.{ .array = three }}, aggOptions(false, 1));
+    defer other.deinit();
+    try other.update(&.{.{ .scalar = common.scalarOf(i64, null) }});
+    try session.merge(&other);
+    var merged = try session.finalize();
+    defer merged.release();
+    try std.testing.expect(merged.scalar.isNull());
+
+    // Options are checked per function.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("sum", &wn, .{ .count = .{} }));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("count", &wn, aggOptions(true, 1)));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("count_all", &wn, .{ .count = .{} }));
+}

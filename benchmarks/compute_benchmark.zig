@@ -183,6 +183,28 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var keys = try buildInt64Mod(allocator, cfg.rows, 14, 1000);
     defer keys.release();
     try timeGroupedSum(io, &ctx, "compute_hash_sum_int64", keys, i64arr, cfg, emit_csv, meta);
+
+    var words_unicode = try buildUnicode(allocator, cfg.rows, 15);
+    defer words_unicode.release();
+    try timeKernel(io, &ctx, .scalar, "compute_utf8_upper_unicode", "utf8_upper", &.{.{ .array = words_unicode }}, cfg, emit_csv, meta);
+    // int32 + int64: the int32 operand is cast to int64 first (Arrow's implicit cast).
+    try timeKernel(io, &ctx, .scalar, "compute_add_promoted", "add_checked", &.{ .{ .array = a }, .{ .array = i64arr } }, cfg, emit_csv, meta);
+}
+
+/// Utf8 rows of a lowercase word in a non-Latin or accented script and a number
+/// ("привет-417", "größe-3"): 2-byte code points, ASCII digits, a 2-to-3-byte mapping (ß).
+fn buildUnicode(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    const words = [_][]const u8{ "привет", "σωκράτης", "größe", "élan", "ǆungla", "ąžuolas", "ölçü", "ξένος" };
+    var b = try zarrow.StringBuilder.init(allocator, rows, rows * 20);
+    defer b.deinit();
+    var x: u32 = seed;
+    var buf: [32]u8 = undefined;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        const s = std.fmt.bufPrint(&buf, "{s}-{d}", .{ words[(x >> 24) % words.len], x % 1000 }) catch unreachable;
+        try b.append(s);
+    }
+    return b.finish();
 }
 
 /// Group `values` by `keys` (Grouper) and sum each group (hash_sum): the end-to-end group by.

@@ -498,7 +498,8 @@ pub fn collect(comptime T: type, allocator: std.mem.Allocator, datum: Datum) ![]
         .scalar => |s| {
             const out = try allocator.alloc(?T, 1);
             errdefer allocator.free(out);
-            out[0] = if (s.isNull()) null else try dense.scalarAs(T, s);
+            // i128 rows are month_day_nano intervals (no plain i128 scalar payload).
+            out[0] = if (s.isNull()) null else if (comptime T == i128) s.value.interval_month_day_nano else try dense.scalarAs(T, s);
             return out;
         },
     }

@@ -64,6 +64,8 @@ EXPECTED_BENCHES = {
     "compute_floor_temporal_day",
     "compute_is_in_int32",
     "compute_hash_sum_int64",
+    "compute_utf8_upper_unicode",
+    "compute_add_promoted",
 }
 
 
