@@ -3,6 +3,7 @@ const core = @import("core.zig");
 const signature_mod = @import("signature.zig");
 
 const TimeUnit = @import("../datatype.zig").TimeUnit;
+const Field = @import("../datatype.zig").Field;
 const FunctionKind = core.FunctionKind;
 const DataType = core.DataType;
 const Datum = core.Datum;
@@ -12,6 +13,7 @@ const Options = core.Options;
 pub const TypeCheckFn = signature_mod.TypeCheckFn;
 pub const OptionsCheckFn = signature_mod.OptionsCheckFn;
 pub const ResultTypeFn = signature_mod.ResultTypeFn;
+pub const ResultTypeAllocFn = signature_mod.ResultTypeAllocFn;
 pub const KernelSignature = signature_mod.KernelSignature;
 pub const KernelExecFn = *const fn (ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum;
 pub const AggregateInitFn = *const fn (ctx: *ExecContext, options: Options) KernelError!*anyopaque;
@@ -98,6 +100,15 @@ pub const ImplicitCast = enum {
     comparison,
     /// `commonNumericType`, then `commonTemporalType` (Arrow's min / max_element_wise).
     element_wise,
+    /// Integers and decimals to float64, floats to their common float type (Arrow's
+    /// `ArithmeticFloatingPointFunction`: sqrt, ln, sin, atan2, logb, ...).
+    floating,
+    /// Decimals with any number to float64, otherwise `commonNumericType` (Arrow's
+    /// `ArithmeticDecimalToFloatingPointFunction`: power).
+    decimal_to_float,
+    /// Integers to float64; decimals and floats keep a kernel of their own (Arrow's
+    /// `ArithmeticIntegerToFloatingPointFunction`: ceil, floor, trunc).
+    integer_to_float,
 };
 
 pub const Function = struct {
@@ -321,6 +332,42 @@ pub const FunctionRegistry = struct {
         return kernel.signature.inferResultType(args, options);
     }
 
+    /// `resolveResultType` for every kernel, also one whose result type needs storage (a struct
+    /// over the input type, such as decimal min_max or value_counts): it is allocated in
+    /// `allocator`, an arena the caller frees (the type may also borrow from `args`).
+    pub fn resolveResultTypeAlloc(
+        self: *const FunctionRegistry,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        kind: FunctionKind,
+        args: []const Datum,
+        options: Options,
+    ) KernelError!DataType {
+        const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
+            const targets = self.implicitTargets(err, name, kind, args) orelse return err;
+            var stack: [4]Datum = undefined;
+            if (args.len > stack.len) return err;
+            for (stack[0..args.len], 0..) |*a, i| a.* = .{ .scalar = core.Scalar.init(targets.of(i), .null) };
+            const inner = try self.resolveResultTypeAlloc(allocator, name, kind, stack[0..args.len], options);
+            // A struct field type borrowing from the stack arguments must not escape.
+            return dupFields(allocator, inner);
+        };
+        return kernel.signature.inferResultTypeAlloc(allocator, args, options);
+    }
+
+    /// `dt` with its struct field types copied into `allocator` (one level: what a result type
+    /// callback builds).
+    fn dupFields(allocator: std.mem.Allocator, dt: DataType) KernelError!DataType {
+        if (dt != .struct_) return dt;
+        const fields = allocator.dupe(Field, dt.struct_.fields) catch return error.OutOfMemory;
+        for (fields) |*f| {
+            const t = allocator.create(DataType) catch return error.OutOfMemory;
+            t.* = f.data_type.*;
+            f.data_type = t;
+        }
+        return .{ .struct_ = .{ .fields = fields } };
+    }
+
     /// The types to cast `args` to when resolution failed with `NoMatchingKernel` and the
     /// function casts arguments implicitly (see `ImplicitCast`); null otherwise.
     fn implicitTargets(self: *const FunctionRegistry, err: KernelError, name: []const u8, kind: FunctionKind, args: []const Datum) ?Targets {
@@ -364,6 +411,37 @@ pub const FunctionRegistry = struct {
             .numeric => commonNumericType(args) orelse commonDecimalFloatType(args),
             .comparison => commonNumericType(args) orelse commonDecimalFloatType(args) orelse commonTemporalType(args),
             .element_wise => commonNumericType(args) orelse commonTemporalType(args),
+            .floating => floatingType(args, true),
+            .decimal_to_float => commonNumericType(args) orelse floatingType(args, false),
+            .integer_to_float => if (args.len == 1 and isIntegerType(args[0].dataType())) .{ .double = {} } else null,
+        };
+    }
+
+    fn isIntegerType(dt: DataType) bool {
+        return switch (dt) {
+            .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => true,
+            else => false,
+        };
+    }
+
+    /// The widest float after decimals (and, with `integers`, integers) count as float64
+    /// (Arrow converts them before taking the common type: atan2(float32, int32) is float64);
+    /// null when no argument is a float or a converted type, or one is not a number.
+    fn floatingType(args: []const Datum, comptime integers: bool) ?DataType {
+        var float_bits: u8 = 0;
+        for (args) |arg| switch (arg.dataType()) {
+            .decimal32, .decimal64, .decimal128, .decimal256 => float_bits = 64,
+            .float => float_bits = @max(float_bits, 32),
+            .double => float_bits = 64,
+            .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => if (integers) {
+                float_bits = 64;
+            },
+            else => return null,
+        };
+        return switch (float_bits) {
+            64 => .{ .double = {} },
+            32 => .{ .float = {} },
+            else => null,
         };
     }
 
@@ -396,7 +474,7 @@ pub const FunctionRegistry = struct {
             const targets = self.implicitTargets(err, name, kind, args) orelse return err;
             return self.invokeCast(ctx, name, kind, args, options, targets);
         };
-        _ = try kernel.signature.inferResultType(args, options);
+        try kernel.signature.checkResultType(args, options);
         return kernel.exec(ctx, args, options);
     }
 
@@ -419,7 +497,7 @@ pub const FunctionRegistry = struct {
             o.* = true;
         }
         const kernel = try self.resolveKernel(name, kind, cast_args, options);
-        _ = try kernel.signature.inferResultType(cast_args, options);
+        try kernel.signature.checkResultType(cast_args, options);
         return kernel.exec(ctx, cast_args, options);
     }
 

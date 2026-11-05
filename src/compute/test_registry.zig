@@ -509,6 +509,14 @@ test "registerAll registers every kernel family function name with its kind" {
         "hours_between",        "minutes_between",        "seconds_between",           "milliseconds_between",
         "microseconds_between", "nanoseconds_between",    "day_time_interval_between", "month_day_nano_interval_between",
     };
+    const math_names = [_][]const u8{
+        "sqrt",       "sqrt_checked",       "exp",         "expm1",               "ln",            "ln_checked",   "log10",         "log10_checked",
+        "log2",       "log2_checked",       "log1p",       "log1p_checked",       "sin",           "sin_checked",  "cos",           "cos_checked",
+        "tan",        "tan_checked",        "asin",        "asin_checked",        "acos",          "acos_checked", "atan",          "sinh",
+        "cosh",       "tanh",               "asinh",       "acosh",               "acosh_checked", "atanh",        "atanh_checked", "atan2",
+        "logb",       "logb_checked",       "power",       "power_checked",       "bit_wise_and",  "bit_wise_or",  "bit_wise_xor",  "bit_wise_not",
+        "shift_left", "shift_left_checked", "shift_right", "shift_right_checked",
+    };
     const scalar_names = [_][]const u8{
         "add",            "add_checked",    "subtract",  "subtract_checked", "multiply",         "multiply_checked",
         "divide",         "divide_checked", "negate",    "negate_checked",   "abs",              "abs_checked",
@@ -517,9 +525,22 @@ test "registerAll registers every kernel family function name with its kind" {
         "or_kleene",      "is_null",        "is_valid",  "true_unless_null", "cast",             "is_in",
         "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
         "and_not_kleene", "sign",
-    } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names;
-    const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
-    const hash_names = [_][]const u8{ "hash_sum", "hash_mean", "hash_min", "hash_max", "hash_min_max", "hash_count", "hash_count_all", "hash_any", "hash_all", "hash_count_distinct", "hash_distinct" };
+    } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
+        "round", "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
+    };
+    const vector_names = [_][]const u8{
+        "unique",   "value_counts", "dictionary_encode",  "drop_null",             "fill_null_forward", "fill_null_backward", "mode",
+        "quantile", "sort_indices", "array_sort_indices", "partition_nth_indices", "select_k_unstable", "rank",
+    };
+    const aggregate_names = [_][]const u8{
+        "sum",      "mean",   "min",  "max",      "min_max", "count", "count_all",  "any",            "all",   "product",
+        "variance", "stddev", "skew", "kurtosis", "first",   "last",  "first_last", "count_distinct", "index",
+    };
+    const hash_names = [_][]const u8{
+        "hash_sum",   "hash_mean",           "hash_min",        "hash_max",     "hash_min_max",  "hash_count",  "hash_count_all", "hash_any",
+        "hash_all",   "hash_count_distinct", "hash_distinct",   "hash_product", "hash_variance", "hash_stddev", "hash_skew",      "hash_kurtosis",
+        "hash_first", "hash_last",           "hash_first_last", "hash_one",     "hash_list",
+    };
     for (scalar_names) |name| try std.testing.expect(registry.containsFunction(name, .scalar));
     for (aggregate_names) |name| {
         try std.testing.expect(registry.containsFunction(name, .aggregate));
@@ -530,15 +551,17 @@ test "registerAll registers every kernel family function name with its kind" {
         try std.testing.expect(registry.containsFunction(name, .hash_aggregate));
         for (registry.findFunction(name, .hash_aggregate).?.kernelsSlice()) |kernel| try std.testing.expect(kernel.supportsAggregateLifecycle());
     }
-    try std.testing.expectEqual(scalar_names.len + aggregate_names.len + hash_names.len, registry.functionCount());
+    for (vector_names) |name| try std.testing.expect(registry.containsFunction(name, .vector));
+    try std.testing.expectEqual(scalar_names.len + aggregate_names.len + hash_names.len + vector_names.len, registry.functionCount());
 
     // One kernel per input type: 10 numeric types and one for every decimal / integer pair;
     // negate_checked has no unsigned kernels and adds decimal128 / decimal256; comparisons add
     // bool, the string and binary layouts, six temporal types, four decimal types,
     // fixed_size_binary, mixed byte layouts and mixed decimals; min / max_element_wise numbers,
     // temporal, strings, binaries, decimals and fixed_size_binary.
-    try std.testing.expectEqual(@as(usize, 11), registry.kernelCount("add", .scalar));
-    try std.testing.expectEqual(@as(usize, 8), registry.kernelCount("negate_checked", .scalar));
+    // add also has the six temporal patterns (timestamp + duration, ...), negate_checked duration.
+    try std.testing.expectEqual(@as(usize, 17), registry.kernelCount("add", .scalar));
+    try std.testing.expectEqual(@as(usize, 9), registry.kernelCount("negate_checked", .scalar));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sign", .scalar));
     try std.testing.expectEqual(@as(usize, 30), registry.kernelCount("less", .scalar));
     try std.testing.expectEqual(@as(usize, 27), registry.kernelCount("min_element_wise", .scalar));
@@ -550,7 +573,8 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(common.core.ImplicitCast.element_wise, registry.findFunction("max_element_wise", .scalar).?.implicit_cast);
     try std.testing.expectEqual(common.core.ImplicitCast.none, registry.findFunction("negate", .scalar).?.implicit_cast);
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
-    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("min_max", .aggregate));
+    // min_max: ten numeric types plus decimal128 / decimal256.
+    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("min_max", .aggregate));
     // One cast kernel for every pair; string kernels per string layout (binary_length also for the
     // binary layouts); temporal date parts for date32 / date64 / timestamp, time parts without date32.
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("cast", .scalar));
@@ -595,7 +619,7 @@ test "ExecContext.invoke add works end to end after registerAll" {
     try std.testing.expect((try registry.resolveResultType("less", .scalar, &args, Options.noneValue())) == .bool);
     try std.testing.expect((try registry.resolveResultType("sum", .aggregate, args[0..1], Options.noneValue())) == .int64);
     try std.testing.expect((try registry.resolveResultType("mean", .aggregate, args[0..1], Options.noneValue())) == .double);
-    try std.testing.expectError(error.FunctionNotFound, ctx.invoke("power", .scalar, &args, Options.noneValue()));
+    try std.testing.expectError(error.FunctionNotFound, ctx.invoke("random", .scalar, &args, Options.noneValue()));
 
     var total = try ctx.invokeAggregate("sum", &.{.{ .array = out.array }}, Options.noneValue());
     defer total.release();

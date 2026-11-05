@@ -375,6 +375,83 @@ pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) K
     }
 }
 
+/// Storage of the type of a struct array built by `structArray`: the field list and a copy of
+/// every child type, shared by the array and its slices through the owner hooks (refcounted).
+const StructTypeOwner = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(u32),
+    types: []DataType,
+    fields: []datatype.Field,
+
+    fn retain(ctx: ?*anyopaque) void {
+        const self: *StructTypeOwner = @ptrCast(@alignCast(ctx.?));
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(ctx: ?*anyopaque) void {
+        const self: *StructTypeOwner = @ptrCast(@alignCast(ctx.?));
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.allocator.free(self.types);
+        self.allocator.free(self.fields);
+        self.allocator.destroy(self);
+    }
+};
+
+/// A struct type with fields `names` over `types`, allocated in `allocator` (an arena), for a
+/// `ResultTypeAllocFn`.
+pub fn structTypeAlloc(allocator: std.mem.Allocator, names: []const []const u8, types: []const DataType) KernelError!DataType {
+    const ts = allocator.dupe(DataType, types) catch return error.OutOfMemory;
+    const fields = allocator.alloc(datatype.Field, names.len) catch return error.OutOfMemory;
+    for (fields, names, ts) |*f, n, *t| f.* = .{ .name = n, .data_type = t };
+    return .{ .struct_ = .{ .fields = fields } };
+}
+
+/// A struct array of `len` rows over `children` (taken over, also on error) whose type is
+/// stored with the array (field `i` is named `names[i]`, static strings, and has the type of
+/// `children[i]`): the array and its slices keep the type alive, so a kernel can return a
+/// struct over a type known only at run time (decimal min_max, value_counts). `validity`
+/// (taken over) may be null.
+pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    std.debug.assert(names.len == children.len);
+    var v = validity;
+    var kids_owned = true;
+    defer if (kids_owned) for (children) |c| {
+        var k = c;
+        k.release();
+    };
+    errdefer if (v) |*b| b.deinit();
+    const owner = allocator.create(StructTypeOwner) catch return error.OutOfMemory;
+    owner.* = .{ .allocator = allocator, .refs = .init(1), .types = &.{}, .fields = &.{} };
+    defer StructTypeOwner.release(owner);
+    owner.types = allocator.alloc(DataType, children.len) catch return error.OutOfMemory;
+    owner.fields = allocator.alloc(datatype.Field, children.len) catch return error.OutOfMemory;
+    for (owner.types, owner.fields, children, names) |*t, *f, c, n| {
+        t.* = c.data().data_type;
+        f.* = .{ .name = n, .data_type = t };
+    }
+    const kids = allocator.dupe(ArrayRef, children) catch return error.OutOfMemory;
+    errdefer allocator.free(kids);
+    const buffers = allocator.alloc(SharedBuffer, 1) catch return error.OutOfMemory;
+    errdefer allocator.free(buffers);
+    buffers[0] = .empty;
+    var null_count: usize = 0;
+    if (v) |*b| {
+        null_count = bitmap.countUnsetBit(b.data, len);
+        buffers[0] = b.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
+        v = null;
+    }
+    errdefer buffers[0].release();
+    const arr = ArrayRef.fromOwnedWithOwner(allocator, .{
+        .data_type = .{ .struct_ = .{ .fields = owner.fields } },
+        .length = len,
+        .null_count = null_count,
+        .buffers = buffers,
+        .children = kids,
+    }, owner, StructTypeOwner.retain, StructTypeOwner.release) catch return error.OutOfMemory;
+    kids_owned = false;
+    return arr;
+}
+
 /// Return a zeroed packed-bit buffer for `len` rows (an all-null validity bitmap).
 fn zeroBits(allocator: std.mem.Allocator, len: usize) KernelError!OwnedBuffer {
     return OwnedBuffer.init(allocator, bitmap.byteLength(len)) catch error.OutOfMemory;
@@ -402,7 +479,7 @@ pub fn finishFixed(allocator: std.mem.Allocator, out_type: DataType, len: usize,
 
 /// Return row 0 of a kernel output as a scalar. A string / binary scalar borrows its bytes from
 /// `payload`, which it retains; a struct or list scalar is a nested scalar over the row.
-fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
+pub fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
     const data = arr.data();
     if (data.length != 1) return error.InvalidInput;
     if (data.isNull(0)) return Scalar.init(data.data_type, .null);

@@ -39,15 +39,22 @@ defer sum.release();
 | Decimals | `decimal.zig` | the decimal kernels of `add`, `subtract`, `multiply`, `divide` (+ `_checked`; decimal32..decimal256, also with an integer), `negate`, `abs` (+ `_checked`) and `sign` (decimal128 / decimal256); the decimal casts behind `cast`; the decimal helpers of the comparison and aggregate families |
 | Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string and binary layouts, fixed_size_binary, temporal, decimal; mixed byte layouts and mixed decimals compared in place); `min_element_wise`, `max_element_wise` (numeric, temporal, decimal, fixed_size_binary, string and binary layouts; `ElementWiseAggregateOptions`) |
 | Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene`, `and_not_kleene` |
-| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`; sum, mean, min, max also on decimal128 / decimal256), `count` (`CountOptions`), `count_all` (one argument or none) |
+| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`; sum, mean, min, max, min_max also on decimal128 / decimal256), `count` (`CountOptions`), `count_all` (one argument or none) |
+| More aggregations | `aggregate_stats.zig` | `product`, `first`, `last`, `first_last` (`ScalarAggregateOptions`), `variance`, `stddev` (`VarianceOptions`), `skew`, `kurtosis` (`SkewOptions`), `count_distinct` (`CountOptions`), `index` (`IndexOptions`); vector `mode` (`ModeOptions`) and `quantile` (`QuantileOptions`) |
+| Math | `math.zig` | `sqrt`, `exp`, `expm1`, `ln`, `log10`, `log2`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` (+ `_checked` where Arrow has one), `atan2`, `logb` (+ `_checked`), `power` (+ `_checked`), `bit_wise_and`, `bit_wise_or`, `bit_wise_xor`, `bit_wise_not`, `shift_left`, `shift_right` (+ `_checked`) |
+| Rounding | `round.zig` | `round` (`RoundOptions`), `round_to_multiple` (`RoundToMultipleOptions`), `round_binary` (`RoundBinaryOptions`), `ceil`, `floor`, `trunc` (floats, integers, decimal128 / decimal256) |
+| Temporal arithmetic | `temporal_arith.zig` | the timestamp, date, time and duration kernels of `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` (+ `_checked`) |
+| Associative transforms | `associative.zig` | `unique`, `value_counts`, `dictionary_encode` (`DictionaryEncodeOptions`) |
+| Selecting and null replacement | `selection.zig` | `coalesce`, `if_else`, `case_when`, `choose` (scalar); `drop_null`, `fill_null_forward`, `fill_null_backward` (vector) |
+| Sorts and partitions | `sort.zig` | `sort_indices`, `array_sort_indices` (`SortOptions`), `partition_nth_indices` (`PartitionNthOptions`), `select_k_unstable` (`SelectKOptions`), `rank` (`RankOptions`); `sortIndicesRecordBatch`, `sortIndicesTable` |
 | Categorizations | `is_null.zig` | `is_null` (`NullOptions`), `is_valid`, `true_unless_null`, `is_nan`, `is_finite`, `is_inf` |
 | Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp / time32 / time64 / duration units, timestamp to time of day, same-width integers and temporal types, dictionary decode and encode (every index width), the null type; decimals to and from decimals, integers, floats and text (`decimal.zig`) |
 | Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `ascii_swapcase`, `ascii_capitalize`, `ascii_title`, `ascii_reverse` (ASCII letters), `utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title` (Unicode simple case mappings), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `utf8_trim`, `utf8_ltrim`, `utf8_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alnum`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_lower`, `ascii_is_printable`, `ascii_is_space`, `ascii_is_title`, `ascii_is_upper`, `utf8_is_alnum`, `utf8_is_alpha`, `utf8_is_decimal`, `utf8_is_digit`, `utf8_is_lower`, `utf8_is_numeric`, `utf8_is_printable`, `utf8_is_space`, `utf8_is_title`, `utf8_is_upper` (string, large_string, string_view) |
 | String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `utf8_zero_fill`, `utf8_replace_slice`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding, zero fill, replace_slice and whitespace splits on the string layouts), `binary_slice`, `binary_reverse`, `binary_replace_slice` (binary layouts), `binary_join` (`list<T>` / `large_list<T>` with a `T` separator) |
 | Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `us_year`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp, time32, time64); `subsecond` (timestamp, time32, time64) |
 | Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between` (date32, date64, timestamp); `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between`, `day_time_interval_between`, `month_day_nano_interval_between` and the rounding functions (also time32, time64) |
-| Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, string and binary layouts) |
-| Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy` (per-aggregate options); kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_any`, `hash_all` (`ScalarAggregateOptions`; the first four also on decimal128 / decimal256), `hash_count`, `hash_count_distinct`, `hash_distinct` (`CountOptions`), `hash_count_all` (values plus uint32 group ids, one row per group) |
+| Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, intervals, decimals, fixed_size_binary, string and binary layouts; a value set of another type is cast) |
+| Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy` (per-aggregate options); kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_any`, `hash_all`, `hash_product`, `hash_first`, `hash_last`, `hash_first_last` (`ScalarAggregateOptions`; sum, mean, min, max, min_max also on decimal128 / decimal256), `hash_variance`, `hash_stddev` (`VarianceOptions`), `hash_skew`, `hash_kurtosis` (`SkewOptions`), `hash_count`, `hash_count_distinct`, `hash_distinct` (`CountOptions`), `hash_one`, `hash_list`, `hash_count_all` (values plus uint32 group ids, one row per group) |
 
 Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
 scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar; grouped
@@ -84,8 +91,19 @@ When only dictionaries were decoded or null types replaced, each argument keeps 
 dictionary of strings compares with a string_view through the mixed-layout kernel). The cast is safe
 unless `ExecConfig.safe_cast` is false, so a value the common type cannot hold (2^60 to float64, 2^63 as
 int64, a timestamp past the finer unit) is `InvalidCast`, as in Arrow. `add`, `subtract`, `multiply`,
-`divide` (and `_checked`) use `.numeric`, the six comparisons `.comparison`, `min_element_wise` /
-`max_element_wise` `.element_wise`; `resolveResultType` reports the type of the cast call.
+`divide` (and `_checked`), the bit-wise functions and the shifts use `.numeric`, the six comparisons
+`.comparison`, `min_element_wise` / `max_element_wise` `.element_wise`. Three more modes follow Arrow's
+floating-point dispatch: `.floating` (integers and decimals count as float64, then the widest float:
+`sqrt`, `ln`, `sin`, ..., `atan2`, `logb`; atan2(float32, int32) is float64, as Arrow),
+`.decimal_to_float` (`commonNumericType`, else a decimal makes float64: `power`) and
+`.integer_to_float` (an integer goes to float64: `ceil`, `floor`, `trunc`; decimals keep their own
+kernels). `resolveResultType` reports the type of the cast call.
+
+The multiplexers (`coalesce`, `if_else`, `case_when`, `choose`) cast their value arguments themselves
+(`selection.commonValueType`): numbers to `commonNumericType`, temporal types to `commonTemporalType`,
+string / binary layouts to binary or the large layout when one argument is, decimals to the precision and
+scale that hold every value. `is_in` / `index_in` cast a value set of another type to the input type,
+and the input to the value set's type when that fails (pyarrow 26).
 
 Some mixed types need no cast because a kernel takes them directly: decimals of different widths,
 precisions and scales and a decimal with an integer (arithmetic with Arrow's result types; comparisons by
@@ -195,6 +213,10 @@ Compute options are type-safe and tag-based.
 - `element_wise_aggregate`
 - `replace_slice`
 - `zero_fill`
+- `round`, `round_to_multiple`, `round_binary`
+- `mode`, `variance`, `skew`, `quantile`, `index`
+- `partition_nth`, `select_k`, `rank`
+- `dictionary_encode`
 - `custom`
 
 ### Payload types
@@ -224,6 +246,17 @@ Compute options are type-safe and tag-based.
 - `ReplaceSliceOptions` (`start`, `stop`, `replacement`) for `utf8_replace_slice`, `binary_replace_slice`
 - `ZeroFillOptions` (`width`, `padding` = `"0"`) for `utf8_zero_fill`
 - `TrimOptions` also serves `utf8_trim` / `utf8_ltrim` / `utf8_rtrim` (`characters` as UTF-8 code points)
+- `RoundOptions` (`ndigits` = 0, `round_mode` = `half_to_even`; `RoundMode`: `down`, `up`, `towards_zero`,
+  `towards_infinity`, `half_down`, `half_up`, `half_towards_zero`, `half_towards_infinity`,
+  `half_to_even`, `half_to_odd`), `RoundToMultipleOptions` (`multiple`: a `Scalar` cast to the input
+  type, `round_mode`), `RoundBinaryOptions` (`round_mode`)
+- `ModeOptions` (`n` = 1, `skip_nulls`, `min_count` = 0), `VarianceOptions` (`ddof` = 0, `skip_nulls`,
+  `min_count`), `SkewOptions` (`skip_nulls`, `biased` = true, `min_count`), `QuantileOptions` (`q` =
+  `{0.5}`, `interpolation`: `linear | lower | higher | nearest | midpoint`, `skip_nulls`, `min_count`),
+  `IndexOptions` (`value`: a `Scalar`)
+- `PartitionNthOptions` (`pivot`, `null_placement`), `SelectKOptions` (`k`, `sort_keys`), `RankOptions`
+  (`order`, `null_placement`, `tiebreaker`: `min | max | first | dense`)
+- `DictionaryEncodeOptions` (`null_encoding`: `mask | encode`)
 - `CustomOptions`
 
 Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`, `week`,
@@ -234,12 +267,14 @@ Use `KernelSignature.options_check` to validate allowed option families for each
 
 ### SortOptions
 
-`SortOptions` currently includes:
+`SortOptions` (sort_indices, array_sort_indices):
 
-- `order`: `ascending | descending`
+- `order`: `ascending | descending` (array_sort_indices, and every column when `sort_keys` is empty)
+- `sort_keys`: one `SortKey` (`name`, `order`) per column of sort_indices; the name picks the column in
+  `sortIndicesRecordBatch` / `sortIndicesTable`
 - `null_placement`: `at_start | at_end`
-- `nan_placement`: `?at_start | ?at_end`
-- `stable`: `bool`
+- `nan_placement`, `stable`: kept for compatibility; the sorts always place NaN next to the nulls and
+  are always stable
 
 ---
 
@@ -252,12 +287,23 @@ Use `KernelSignature.options_check` to validate allowed option families for each
 - bounded arity range (`range`);
 - optional `type_check` callback;
 - optional `options_check` callback;
-- optional `result_type_fn` callback.
+- optional `result_type_fn` callback;
+- optional `result_type_alloc_fn` callback, for a result type that needs storage (a struct over the input
+  type: decimal `min_max`, `value_counts`, `first_last`, `mode`; a dictionary over it: `dictionary_encode`).
 
 Result type APIs:
 
-- `KernelSignature.inferResultType(args, options)`
+- `KernelSignature.inferResultType(args, options)` (`NotImplemented` for a kernel with only
+  `result_type_alloc_fn`)
+- `KernelSignature.inferResultTypeAlloc(allocator, args, options)`
 - `FunctionRegistry.resolveResultType(...)`
+- `FunctionRegistry.resolveResultTypeAlloc(allocator, ...)`: the type is allocated in `allocator` (an
+  arena the caller frees) and may borrow from the arguments.
+
+A kernel returning a struct over a run-time type builds it with `dense.structArray`: the field list and
+child types live in a refcounted block owned by the array and its slices (owner hooks), so the result
+(and a scalar over it) keeps its type valid as long as it lives; `dense.structTypeAlloc` builds the same
+type in an arena for `result_type_alloc_fn`.
 
 When signature or options checks fail, errors are reported through `KernelError`.
 

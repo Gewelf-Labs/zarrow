@@ -9,6 +9,10 @@ const Options = core.Options;
 pub const TypeCheckFn = *const fn (args: []const Datum) bool;
 pub const OptionsCheckFn = *const fn (options: Options) bool;
 pub const ResultTypeFn = *const fn (args: []const Datum, options: Options) KernelError!DataType;
+/// Result type callback whose type needs storage (a struct over the input's type, such as
+/// min_max of a decimal or value_counts): nested types are allocated in `allocator` (an arena;
+/// they may also borrow from `args`).
+pub const ResultTypeAllocFn = *const fn (allocator: std.mem.Allocator, args: []const Datum, options: Options) KernelError!DataType;
 
 /// Kernel signature metadata used for dispatch and type inference.
 pub const KernelSignature = struct {
@@ -24,6 +28,9 @@ pub const KernelSignature = struct {
     options_check: ?OptionsCheckFn = null,
     /// Optional result type inference callback.
     result_type_fn: ?ResultTypeFn = null,
+    /// Result type callback of a kernel whose result type needs storage; `inferResultType`
+    /// then answers `NotImplemented` and `inferResultTypeAlloc` calls it.
+    result_type_alloc_fn: ?ResultTypeAllocFn = null,
 
     pub fn any(arity: usize) KernelSignature {
         return .{
@@ -198,8 +205,30 @@ pub const KernelSignature = struct {
         if (self.result_type_fn) |infer| {
             return infer(args, options);
         }
+        if (self.result_type_alloc_fn != null) return error.NotImplemented;
         if (args.len == 0) return error.InvalidInput;
         return args[0].dataType();
+    }
+
+    /// `inferResultType`, with `allocator` (an arena) for a result type that needs storage.
+    pub fn inferResultTypeAlloc(self: KernelSignature, allocator: std.mem.Allocator, args: []const Datum, options: Options) KernelError!DataType {
+        const infer = self.result_type_alloc_fn orelse return self.inferResultType(args, options);
+        if (!self.matchesArity(args.len)) return error.InvalidArity;
+        if (self.type_check) |check| {
+            if (!check(args)) return error.NoMatchingKernel;
+        }
+        if (self.options_check) |check| {
+            if (!check(options)) return error.InvalidOptions;
+        }
+        return infer(allocator, args, options);
+    }
+
+    /// Check that the call has a result type (the type itself is dropped): a type that needs
+    /// storage is built in a stack buffer.
+    pub fn checkResultType(self: KernelSignature, args: []const Datum, options: Options) KernelError!void {
+        var buf: [2048]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        _ = try self.inferResultTypeAlloc(fba.allocator(), args, options);
     }
 
     /// Human-readable reason for result-type inference failure.
@@ -211,6 +240,7 @@ pub const KernelSignature = struct {
         if (self.options_check) |check| {
             if (!check(options)) return "cannot infer result type: options_check failed";
         }
+        if (self.result_type_fn == null and self.result_type_alloc_fn != null) return "cannot infer result type without an allocator: use inferResultTypeAlloc";
         if (self.result_type_fn == null and args.len == 0) return "cannot infer result type: no arguments and no result_type_fn";
         return "result type inference should succeed";
     }

@@ -16,6 +16,13 @@ pub const temporal_round = @import("temporal_round.zig");
 pub const set_lookup = @import("set_lookup.zig");
 pub const hash_aggregate = @import("hash_aggregate.zig");
 pub const decimal = @import("decimal.zig");
+pub const math = @import("math.zig");
+pub const round = @import("round.zig");
+pub const temporal_arith = @import("temporal_arith.zig");
+pub const associative = @import("associative.zig");
+pub const selection = @import("selection.zig");
+pub const aggregate_stats = @import("aggregate_stats.zig");
+pub const sort = @import("sort.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -32,4 +39,11 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try set_lookup.register(registry);
     try hash_aggregate.register(registry);
     try decimal.register(registry);
+    try math.register(registry);
+    try round.register(registry);
+    try temporal_arith.register(registry);
+    try associative.register(registry);
+    try selection.register(registry);
+    try aggregate_stats.register(registry);
+    try sort.register(registry);
 }

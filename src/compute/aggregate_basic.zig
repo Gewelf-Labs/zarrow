@@ -28,8 +28,9 @@
 //!   bits until finalize, which applies `overflow_mode` (`checked`: `Overflow` past the precision,
 //!   `wrapping`: the low 128 / 256 bits as Arrow C++, `saturating`: clamp to the precision); mean
 //!   gives the input type, rounded half away from zero (null with no valid row whatever
-//!   `min_count`, as Arrow); min / max give the input type. Decimal min_max is not registered (its
-//!   struct type would have to borrow the input's precision and scale).
+//!   `min_count`, as Arrow); min / max give the input type; min_max a `struct<min, max>` of the
+//!   input type, stored with its payload array (`dense.structArray`; the result type comes from
+//!   `resolveResultTypeAlloc`).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const buffer = @import("../buffer.zig");
@@ -73,6 +74,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         try add(registry, "mean", 1, check, scalarAggregateOptions, DecimalSum(T, .mean));
         try add(registry, "min", 1, check, scalarAggregateOptions, DecimalMinMax(T, .min));
         try add(registry, "max", 1, check, scalarAggregateOptions, DecimalMinMax(T, .max));
+        try add(registry, "min_max", 1, check, scalarAggregateOptions, DecimalMinMax(T, .min_max));
     }
 }
 
@@ -81,82 +83,115 @@ fn noArgs(args: []const Datum) bool {
 }
 
 /// `none` (Arrow defaults) or `ScalarAggregateOptions`.
-fn scalarAggregateOptions(options: Options) bool {
+pub fn scalarAggregateOptions(options: Options) bool {
     return options == .none or options == .scalar_aggregate;
 }
 
 /// `none` (only_valid) or `CountOptions`.
-fn countOptions(options: Options) bool {
+pub fn countOptions(options: Options) bool {
     return options == .none or options == .count;
 }
 
-fn aggregateOptions(options: Options) core.ScalarAggregateOptions {
+pub fn aggregateOptions(options: Options) core.ScalarAggregateOptions {
     return if (options == .scalar_aggregate) options.scalar_aggregate else .{};
 }
 
 /// Whether the options make the result null: a null row with `skip_nulls` false, or fewer valid
 /// rows than `min_count` (Arrow C++).
-fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
+pub fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
     return (!o.skip_nulls and nulls > 0) or count < o.min_count;
 }
 
-fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime arity: usize, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime Impl: type) KernelError!void {
+/// Whether `Impl` declares a function `name` (a `void` declaration stands for none).
+pub fn hasFn(comptime Impl: type, comptime name: []const u8) bool {
+    if (!@hasDecl(Impl, name)) return false;
+    return @TypeOf(@field(Impl, name)) != void;
+}
+
+/// Register `Impl` (see `Aggregate`) as an aggregate kernel of `name`. A result type that needs
+/// storage comes from `Impl.resultTypeAlloc`, a plain one from `Impl.resultType` or `out_type`.
+pub fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime arity: usize, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime Impl: type) KernelError!void {
     const A = Aggregate(Impl);
+    const alloc = comptime hasFn(Impl, "resultTypeAlloc");
+    const plain = comptime hasFn(Impl, "resultType");
     try registry.registerAggregateKernel(name, .{
-        .signature = .{ .arity = arity, .type_check = check, .options_check = options_check, .result_type_fn = if (@hasDecl(Impl, "resultType")) Impl.resultType else dense.resultTypeOf(Impl.out_type) },
+        .signature = .{
+            .arity = arity,
+            .type_check = check,
+            .options_check = options_check,
+            .result_type_fn = if (alloc) null else if (plain) Impl.resultType else dense.resultTypeOf(Impl.out_type),
+            .result_type_alloc_fn = if (alloc) Impl.resultTypeAlloc else null,
+        },
         .exec = A.exec,
         .aggregate_lifecycle = .{ .init = A.init, .update = A.update, .merge = A.merge, .finalize = A.finalize, .deinit = A.deinit },
     });
 }
 
-/// Exec and lifecycle callbacks around an `Impl` with `State`, `update` (one validated array),
-/// `updateScalar`, `merge` and `finalize`.
-fn Aggregate(comptime Impl: type) type {
+/// Exec and lifecycle callbacks around an `Impl` with `State`, `update` (one validated array:
+/// its `ArrayData`, or its `ArrayRef` when `Impl` declares `update_takes_ref`), `updateScalar`, `merge` (may
+/// fail) and `finalize`. A state that owns memory is built by `Impl.initState(ctx, options)` and
+/// freed by `Impl.deinitState`.
+pub fn Aggregate(comptime Impl: type) type {
     const State = Impl.State;
+    const takes_ref = @hasDecl(Impl, "update_takes_ref");
     return struct {
         fn consume(state: *State, datum: Datum) KernelError!void {
             switch (datum) {
-                .array => |arr| try consumeArray(state, arr.data()),
-                .chunked => |chunked| for (chunked.chunks()) |chunk| try consumeArray(state, chunk.data()),
+                .array => |arr| try consumeArray(state, arr),
+                .chunked => |chunked| for (chunked.chunks()) |chunk| try consumeArray(state, chunk),
                 .scalar => |s| try Impl.updateScalar(state, s),
             }
         }
 
-        fn consumeArray(state: *State, data: *const ArrayData) KernelError!void {
-            data.validateLayout() catch return error.InvalidInput;
-            try Impl.update(state, data);
+        fn consumeArray(state: *State, arr: ArrayRef) KernelError!void {
+            arr.data().validateLayout() catch return error.InvalidInput;
+            try Impl.update(state, if (takes_ref) arr else arr.data());
+        }
+
+        fn newState(ctx: *ExecContext, options: Options) KernelError!State {
+            return if (@hasDecl(Impl, "initState")) Impl.initState(ctx, options) else .{};
+        }
+
+        fn freeState(state: *State) void {
+            if (@hasDecl(Impl, "deinitState")) Impl.deinitState(state);
         }
 
         /// Aggregate one array, chunked array or scalar into a scalar (count_all: also none).
-        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+        pub fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len > 1) return error.InvalidArity;
-            var state: State = .{};
+            var state = try newState(ctx, options);
+            defer freeState(&state);
             // Decimal states keep their input type (the result type depends on it).
             if (@hasField(State, "dt") and args.len == 1) state.dt = args[0].dataType();
             if (args.len == 1) try consume(&state, args[0]);
             return Impl.finalize(ctx, &state, options);
         }
 
-        fn init(ctx: *ExecContext, _: Options) KernelError!*anyopaque {
+        pub fn init(ctx: *ExecContext, options: Options) KernelError!*anyopaque {
             const state = ctx.allocator.create(State) catch return error.OutOfMemory;
-            state.* = .{};
+            state.* = newState(ctx, options) catch |err| {
+                ctx.allocator.destroy(state);
+                return err;
+            };
             return state;
         }
 
-        fn update(_: *ExecContext, state: *anyopaque, args: []const Datum, _: Options) KernelError!void {
+        pub fn update(_: *ExecContext, state: *anyopaque, args: []const Datum, _: Options) KernelError!void {
             if (args.len > 1) return error.InvalidArity;
             if (args.len == 1) try consume(cast(state), args[0]);
         }
 
-        fn merge(_: *ExecContext, state: *anyopaque, other: *anyopaque, _: Options) KernelError!void {
-            Impl.merge(cast(state), cast(other));
+        pub fn merge(_: *ExecContext, state: *anyopaque, other: *anyopaque, _: Options) KernelError!void {
+            const r = Impl.merge(cast(state), cast(other));
+            if (@TypeOf(r) != void) try r;
         }
 
-        fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
+        pub fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
             return Impl.finalize(ctx, cast(state), options);
         }
 
-        fn deinit(ctx: *ExecContext, state: *anyopaque) void {
+        pub fn deinit(ctx: *ExecContext, state: *anyopaque) void {
+            freeState(cast(state));
             ctx.allocator.destroy(cast(state));
         }
 
@@ -170,19 +205,19 @@ fn nullScalar(dt: DataType) Datum {
     return .{ .scalar = Scalar.init(dt, .null) };
 }
 
-fn values(comptime T: type, data: *const ArrayData) KernelError![]const T {
+pub fn values(comptime T: type, data: *const ArrayData) KernelError![]const T {
     return (primitive_array.PrimitiveArray(T){ .data = data }).values() catch error.InvalidInput;
 }
 
 /// Load 8 values starting at `i` (zero past the end).
-inline fn lanes(comptime T: type, vals: []const T, i: usize) @Vector(8, T) {
+pub inline fn lanes(comptime T: type, vals: []const T, i: usize) @Vector(8, T) {
     if (i + 8 <= vals.len) return vals[i..][0..8].*;
     var tmp: [8]T = @splat(0);
     @memcpy(tmp[0 .. vals.len - i], vals[i..]);
     return tmp;
 }
 
-inline fn popCount(mask: @Vector(8, bool)) u64 {
+pub inline fn popCount(mask: @Vector(8, bool)) u64 {
     return @popCount(@as(u8, @bitCast(mask)));
 }
 
@@ -561,37 +596,53 @@ fn DecimalSum(comptime T: type, comptime which: enum { sum, mean }) type {
     };
 }
 
-fn DecimalMinMax(comptime T: type, comptime which: enum { min, max }) type {
-    const start: T = if (which == .min) std.math.maxInt(T) else std.math.minInt(T);
+/// Names of the fields of a min_max result.
+pub const min_max_names = [_][]const u8{ "min", "max" };
+
+fn DecimalMinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
     return struct {
-        const State = struct { v: T = start, count: u64 = 0, nulls: u64 = 0, dt: DataType = .{ .null = {} } };
+        const State = struct { min: T = std.math.maxInt(T), max: T = std.math.minInt(T), count: u64 = 0, nulls: u64 = 0, dt: DataType = .{ .null = {} } };
 
-        pub fn resultType(args: []const Datum, _: Options) KernelError!DataType {
-            if (args.len != 1) return error.InvalidArity;
-            _ = try decimal.checkedParams(args[0].dataType());
-            return args[0].dataType();
-        }
+        pub const resultType = if (which == .min_max) {} else struct {
+            fn f(args: []const Datum, _: Options) KernelError!DataType {
+                if (args.len != 1) return error.InvalidArity;
+                _ = try decimal.checkedParams(args[0].dataType());
+                return args[0].dataType();
+            }
+        }.f;
 
-        inline fn pick(a: T, b: T) T {
-            return if (which == .min) @min(a, b) else @max(a, b);
-        }
+        /// min_max: `struct<min: T, max: T>` over the input's decimal type.
+        pub const resultTypeAlloc = if (which != .min_max) {} else struct {
+            fn f(allocator: std.mem.Allocator, args: []const Datum, _: Options) KernelError!DataType {
+                if (args.len != 1) return error.InvalidArity;
+                const dt = args[0].dataType();
+                _ = try decimal.checkedParams(dt);
+                return dense.structTypeAlloc(allocator, &min_max_names, &.{ dt, dt });
+            }
+        }.f;
 
         fn update(state: *State, data: *const ArrayData) KernelError!void {
             _ = try decimal.checkedParams(data.data_type);
             state.dt = data.data_type;
             const vals = try values(T, data);
-            var best = state.v;
+            var lo = state.min;
+            var hi = state.max;
             var count: u64 = 0;
             if (dense.validityBits(data)) |bits| {
                 for (vals, 0..) |v, i| if (bitmap.bitIsSet(bits, data.offset + i)) {
-                    best = pick(best, v);
+                    lo = @min(lo, v);
+                    hi = @max(hi, v);
                     count += 1;
                 };
             } else {
-                for (vals) |v| best = pick(best, v);
+                for (vals) |v| {
+                    lo = @min(lo, v);
+                    hi = @max(hi, v);
+                }
                 count = vals.len;
             }
-            state.v = best;
+            state.min = lo;
+            state.max = hi;
             state.count += count;
             state.nulls += data.length - count;
         }
@@ -603,21 +654,52 @@ fn DecimalMinMax(comptime T: type, comptime which: enum { min, max }) type {
                 state.nulls += 1;
                 return;
             }
-            state.v = pick(state.v, try decimal.scalarInt(T, s));
+            const v = try decimal.scalarInt(T, s);
+            state.min = @min(state.min, v);
+            state.max = @max(state.max, v);
             state.count += 1;
         }
 
         fn merge(state: *State, other: *const State) void {
-            state.v = pick(state.v, other.v);
+            state.min = @min(state.min, other.min);
+            state.max = @max(state.max, other.max);
             state.count += other.count;
             state.nulls += other.nulls;
             if (state.dt == .null) state.dt = other.dt;
         }
 
-        fn finalize(_: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+        fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
             if (state.dt == .null) return nullScalar(.{ .null = {} });
-            if (state.count == 0 or nullByOptions(aggregateOptions(options), state.count, state.nulls)) return nullScalar(state.dt);
-            return .{ .scalar = decimalScalar(T, state.dt, state.v) };
+            const valid = state.count != 0 and !nullByOptions(aggregateOptions(options), state.count, state.nulls);
+            if (which != .min_max) {
+                if (!valid) return nullScalar(state.dt);
+                return .{ .scalar = decimalScalar(T, state.dt, if (which == .min) state.min else state.max) };
+            }
+            var lo = try oneDecimal(T, ctx.allocator, state.dt, if (valid) state.min else null);
+            var hi = oneDecimal(T, ctx.allocator, state.dt, if (valid) state.max else null) catch |err| {
+                lo.release();
+                return err;
+            };
+            _ = &hi;
+            var payload = try dense.structArray(ctx.allocator, &min_max_names, &.{ lo, hi }, 1, null);
+            defer payload.release();
+            return .{ .scalar = try Scalar.initNested(payload.data().data_type, payload) };
         }
     };
+}
+
+/// A one-row decimal array of type `dt` holding `v` (null when `v` is null).
+pub fn oneDecimal(comptime T: type, allocator: std.mem.Allocator, dt: DataType, v: ?T) KernelError!ArrayRef {
+    var buf = buffer.OwnedBuffer.init(allocator, @sizeOf(T)) catch return error.OutOfMemory;
+    var validity: ?buffer.OwnedBuffer = null;
+    if (v) |x| {
+        buf.typedSlice(T)[0] = x;
+    } else {
+        validity = dense.bitsBuffer(allocator, 1) catch |err| {
+            buf.deinit();
+            return err;
+        };
+        validity.?.data[0] = 0;
+    }
+    return dense.finishFixed(allocator, dt, 1, &buf, validity);
 }

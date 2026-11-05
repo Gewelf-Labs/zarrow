@@ -1117,6 +1117,8 @@ pub fn datumTake(datum: Datum, indices: []const usize) KernelError!Datum {
     if (indices.len == 0) {
         return switch (datum) {
             .chunked => |chunks| Datum.fromChunked(chunks.slice(allocator, 0, 0) catch |err| return common.mapChunkedError(err)),
+            // An empty slice keeps every type and layout (the builders know only a few types).
+            .array => |arr| Datum.fromArray(arr.slice(0, 0) catch return error.OutOfMemory),
             else => builders.datumBuildEmptyLikeWithAllocator(allocator, out_type),
         };
     }

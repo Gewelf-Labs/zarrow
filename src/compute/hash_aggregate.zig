@@ -134,19 +134,22 @@ const FixedTable = struct {
     }
 };
 
-/// How the rows of a key type are read.
-const KeyKind = enum { b8, b16, b32, b64, f32, f64, boolean, bytes };
+/// How the rows of a key type are read (`fixed_bytes`: the value bytes of a wider fixed-width
+/// type, hashed as a byte string).
+const KeyKind = enum { b8, b16, b32, b64, f32, f64, boolean, bytes, fixed_bytes };
 
 fn keyKind(dt: DataType) ?KeyKind {
     return switch (dt) {
         .int8, .uint8 => .b8,
         .int16, .uint16 => .b16,
-        .int32, .uint32, .date32, .time32 => .b32,
-        .int64, .uint64, .date64, .timestamp, .time64, .duration => .b64,
+        .int32, .uint32, .date32, .time32, .decimal32, .interval_months => .b32,
+        .int64, .uint64, .date64, .timestamp, .time64, .duration, .decimal64, .interval_day_time => .b64,
         .float => .f32,
         .double => .f64,
         .bool => .boolean,
         .string, .large_string, .string_view, .binary, .large_binary, .binary_view => .bytes,
+        .decimal128, .decimal256, .interval_month_day_nano => .fixed_bytes,
+        .fixed_size_binary => |f| if (f.byte_width > 0) .fixed_bytes else null,
         else => null,
     };
 }
@@ -220,6 +223,19 @@ pub const KeyMap = struct {
                     else => u64,
                 };
                 const vals = (PrimitiveArray(U){ .data = data }).values() catch return error.InvalidInput;
+                // Lookups in a frozen narrow key range read the direct table: no hashing, and the
+                // table lives in locals rather than behind `self`.
+                if (mode == .lookup and k != .f32 and k != .f64) if (self.dense) |d| {
+                    const null_id = self.null_id orelse missing;
+                    for (vals, ids, 0..) |v, *id, i| {
+                        const off = @as(u64, v) -% d.min;
+                        id.* = if (off < d.ids.len) d.ids[@intCast(off)] else missing;
+                        if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + i)) {
+                            id.* = null_id;
+                        };
+                    }
+                    return;
+                };
                 for (vals, ids, 0..) |v, *id, i| {
                     if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + i)) {
                         id.* = try self.nullId(mode);
@@ -238,6 +254,20 @@ pub const KeyMap = struct {
                 };
                 const key: u64 = @intFromBool(bitmap.bitIsSet(data.buffers[1].data, data.offset + i));
                 id.* = if (mode == .insert) try self.put(allocator, &self.fixed, key) else self.lookupFixed(key);
+            },
+            .fixed_bytes => {
+                // validateLayout bounds the values buffer by (offset + length) * width.
+                const w = (data.data_type.bitWidth() orelse return error.UnsupportedType) / 8;
+                const vals = data.buffers[1].data;
+                if (vals.len / w < data.offset + data.length) return error.InvalidInput;
+                for (ids, 0..) |*id, i| {
+                    if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + i)) {
+                        id.* = try self.nullId(mode);
+                        continue;
+                    };
+                    const s = vals[(data.offset + i) * w ..][0..w];
+                    id.* = if (mode == .insert) try self.put(allocator, &self.bytes, s) else self.bytes.get(s) orelse missing;
+                }
             },
             .bytes => switch (try dense.StringOperand.init(.{ .array = arr })) {
                 inline else => |r| for (ids, 0..) |*id, i| {
@@ -433,6 +463,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     try add(registry, "hash_all", withIds(.bool), aggregateOptions, Grouped(AnyAll(.all)));
     try add(registry, "hash_count_distinct", distinctArgs, countOptions, Distinct(.count));
     try add(registry, "hash_distinct", distinctArgs, countOptions, Distinct(.list));
+    try registerMore(registry);
 }
 
 /// `none` (Arrow defaults) or `ScalarAggregateOptions`.
@@ -460,8 +491,15 @@ fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
 }
 
 fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime A: type) KernelError!void {
+    const alloc = comptime aggregate_basic.hasFn(A, "resultTypeAlloc");
     try registry.registerKernel(name, .hash_aggregate, .{
-        .signature = .{ .arity = if (A.ids_only) 1 else 2, .type_check = check, .options_check = options_check, .result_type_fn = A.resultType },
+        .signature = .{
+            .arity = if (A.ids_only) 1 else 2,
+            .type_check = check,
+            .options_check = options_check,
+            .result_type_fn = if (alloc) null else A.resultType,
+            .result_type_alloc_fn = if (alloc) A.resultTypeAlloc else null,
+        },
         .exec = A.exec,
         .aggregate_lifecycle = .{ .init = A.init, .update = A.update, .merge = A.merge, .finalize = A.finalize, .deinit = A.deinit },
     });
@@ -548,8 +586,15 @@ fn Grouped(comptime Impl: type) type {
 
         fn resultType(args: []const Datum, _: Options) KernelError!DataType {
             if (@hasDecl(Impl, "resultType")) return Impl.resultType(args);
+            if (comptime aggregate_basic.hasFn(Impl, "resultTypeAlloc")) return error.NotImplemented;
             return Impl.out_type;
         }
+
+        pub const resultTypeAlloc = if (!aggregate_basic.hasFn(Impl, "resultTypeAlloc")) {} else struct {
+            fn f(allocator: std.mem.Allocator, args: []const Datum, _: Options) KernelError!DataType {
+                return Impl.resultTypeAlloc(allocator, args);
+            }
+        }.f;
 
         /// Aggregate the values of every group: one row per group id.
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
@@ -1201,4 +1246,439 @@ pub fn groupBy(ctx: *ExecContext, keys: []const Key, aggregates: []const Aggrega
     };
     owned = false;
     return batch;
+}
+
+// ------------------------------------------------------------------------------ round 16 kernels
+
+const stats = @import("aggregate_stats.zig");
+
+/// Register hash_product, hash_variance, hash_stddev, hash_skew, hash_kurtosis, hash_first,
+/// hash_last, hash_first_last, hash_one, hash_list and the decimal hash_min_max.
+fn registerMore(registry: *FunctionRegistry) KernelError!void {
+    inline for (dense.numeric_types) |T| {
+        const tag = comptime std.meta.activeTag(dense.dataTypeOf(T));
+        try add(registry, "hash_product", withIds(tag), aggregateOptions, Grouped(Product(T)));
+    }
+    inline for (dense.numeric_types ++ [_]type{ i128, i256 }) |T| {
+        const tag = comptime if (T == i128) .decimal128 else if (T == i256) .decimal256 else std.meta.activeTag(dense.dataTypeOf(T));
+        try add(registry, "hash_variance", withIds(tag), varianceOptions, Grouped(GroupMoments(T, .variance)));
+        try add(registry, "hash_stddev", withIds(tag), varianceOptions, Grouped(GroupMoments(T, .stddev)));
+        try add(registry, "hash_skew", withIds(tag), skewOptions, Grouped(GroupMoments(T, .skew)));
+        try add(registry, "hash_kurtosis", withIds(tag), skewOptions, Grouped(GroupMoments(T, .kurtosis)));
+    }
+    inline for (.{ i128, i256 }) |T| {
+        const check = comptime withIds(if (T == i128) .decimal128 else .decimal256);
+        try add(registry, "hash_min_max", check, aggregateOptions, Grouped(DecimalMinMaxPair(T)));
+    }
+    try add(registry, "hash_first", anyWithIds, aggregateOptions, Pick(.first));
+    try add(registry, "hash_last", anyWithIds, aggregateOptions, Pick(.last));
+    try add(registry, "hash_first_last", anyWithIds, aggregateOptions, Pick(.first_last));
+    try add(registry, "hash_one", anyWithIds, dense.noOptions, Pick(.one));
+    try add(registry, "hash_list", anyWithIds, dense.noOptions, Pick(.list));
+}
+
+fn varianceOptions(options: Options) bool {
+    return options == .none or options == .variance;
+}
+
+fn skewOptions(options: Options) bool {
+    return options == .none or options == .skew;
+}
+
+/// Values of any type the take kernels handle, then the group ids.
+fn anyWithIds(args: []const Datum) bool {
+    return args.len == 2 and args[1].dataType() == .uint32 and args[0].dataType() != .null;
+}
+
+fn Product(comptime T: type) type {
+    const is_float = @typeInfo(T) == .float;
+    const signed = !is_float and @typeInfo(T).int.signedness == .signed;
+    const Out = if (is_float) f64 else if (signed) i64 else u64;
+    return struct {
+        const ids_only = false;
+        const Group = struct { prod: Out = 1, count: u64 = 0, nulls: u64 = 0, zero: bool = false, neg: bool = false, overflow: bool = false };
+        const out_type = dense.dataTypeOf(Out);
+
+        inline fn mul(g: *Group, v: Out) void {
+            if (is_float) {
+                g.prod *= v;
+                return;
+            }
+            if (v == 0) g.zero = true;
+            if (signed and v < 0) g.neg = !g.neg;
+            const r = @mulWithOverflow(g.prod, v);
+            g.prod = r[0];
+            g.overflow = g.overflow or r[1] != 0;
+        }
+
+        fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
+            try eachValid(T, data.?, ids, groups, struct {
+                inline fn f(g: *Group, v: T) void {
+                    mul(g, if (is_float) @floatCast(v) else v);
+                    g.count += 1;
+                }
+            }.f);
+        }
+
+        fn mergeGroup(a: *Group, b: Group) void {
+            a.count += b.count;
+            a.nulls += b.nulls;
+            if (is_float) {
+                a.prod *= b.prod;
+                return;
+            }
+            a.zero = a.zero or b.zero;
+            if (b.neg) a.neg = !a.neg;
+            const r = @mulWithOverflow(a.prod, b.prod);
+            a.prod = r[0];
+            a.overflow = a.overflow or b.overflow or r[1] != 0;
+        }
+
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            return fixedOutput(Out, ctx.allocator, out_type, groups.len, .{ ctx, groups, scalarOptions(options) }, struct {
+                fn fill(c: anytype, out: []Out, valid: []u8) KernelError!void {
+                    for (c[1], out, 0..) |g, *o, i| {
+                        o.* = 0;
+                        if (nullByOptions(c[2], g.count, g.nulls)) {
+                            bitmap.clearBit(valid, i);
+                            continue;
+                        }
+                        o.* = g.prod;
+                        if (!is_float and g.zero) o.* = 0;
+                        if (!is_float and !g.zero and g.overflow) switch (c[0].overflowMode()) {
+                            .checked => return error.Overflow,
+                            .wrapping => {},
+                            .saturating => o.* = if (g.neg) std.math.minInt(Out) else std.math.maxInt(Out),
+                        };
+                    }
+                }
+            }.fill);
+        }
+    };
+}
+
+fn GroupMoments(comptime T: type, comptime kind: stats.MomentKind) type {
+    const is_dec = T == i128 or T == i256;
+    return struct {
+        const ids_only = false;
+        const Group = struct { m: stats.MomentSums = .{}, nulls: u64 = 0 };
+        const out_type = DataType{ .double = {} };
+
+        fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
+            const d = data.?;
+            const scale: i32 = if (is_dec) (try decimal.checkedParams(d.data_type)).scale else 0;
+            const vals = try typedValues(T, d);
+            const bits = dense.validityBits(d);
+            for (vals, ids, 0..) |v, id, i| {
+                if (bits) |b| if (!bitmap.bitIsSet(b, d.offset + i)) {
+                    groups[id].nulls += 1;
+                    continue;
+                };
+                const x: f64 = if (is_dec) decimal.toFloatValue(f64, v, scale) else if (@typeInfo(T) == .float) @floatCast(v) else @floatFromInt(v);
+                groups[id].m = stats.MomentSums.merge(groups[id].m, stats.MomentSums.of(x));
+            }
+        }
+
+        fn mergeGroup(a: *Group, b: Group) void {
+            a.m = stats.MomentSums.merge(a.m, b.m);
+            a.nulls += b.nulls;
+        }
+
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            if (options == .variance and options.variance.ddof < 0) return error.InvalidOptions;
+            return fixedOutput(f64, ctx.allocator, out_type, groups.len, .{ groups, options }, struct {
+                fn fill(c: anytype, out: []f64, valid: []u8) KernelError!void {
+                    for (c[0], out, 0..) |g, *o, i| {
+                        o.* = stats.momentResult(kind, g.m, g.nulls, c[1]) orelse {
+                            bitmap.clearBit(valid, i);
+                            o.* = 0;
+                            continue;
+                        };
+                    }
+                }
+            }.fill);
+        }
+    };
+}
+
+/// hash_min_max of decimal128 / decimal256: `struct<min, max>` of the input type, stored with
+/// the array (`dense.structArray`).
+fn DecimalMinMaxPair(comptime T: type) type {
+    return struct {
+        const ids_only = false;
+        const Group = struct { min: T = std.math.maxInt(T), max: T = std.math.minInt(T), count: u64 = 0, nulls: u64 = 0 };
+
+        pub fn resultTypeAlloc(allocator: std.mem.Allocator, args: []const Datum) KernelError!DataType {
+            if (args.len != 2) return error.InvalidArity;
+            const dt = args[0].dataType();
+            _ = try decimal.checkedParams(dt);
+            return dense.structTypeAlloc(allocator, &aggregate_basic.min_max_names, &.{ dt, dt });
+        }
+
+        fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
+            _ = try decimal.checkedParams(data.?.data_type);
+            try eachValid(T, data.?, ids, groups, struct {
+                inline fn f(g: *Group, v: T) void {
+                    g.min = @min(g.min, v);
+                    g.max = @max(g.max, v);
+                    g.count += 1;
+                }
+            }.f);
+        }
+
+        fn mergeGroup(a: *Group, b: Group) void {
+            a.min = @min(a.min, b.min);
+            a.max = @max(a.max, b.max);
+            a.count += b.count;
+            a.nulls += b.nulls;
+        }
+
+        fn side(ctx: *ExecContext, dt: DataType, groups: []const Group, opts: core.ScalarAggregateOptions, comptime is_min: bool) KernelError!ArrayRef {
+            return fixedOutput(T, ctx.allocator, dt, groups.len, .{ groups, opts }, struct {
+                fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
+                    for (c[0], out, 0..) |g, *o, i| {
+                        o.* = if (is_min) g.min else g.max;
+                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
+                            bitmap.clearBit(valid, i);
+                            o.* = 0;
+                        }
+                    }
+                }
+            }.fill);
+        }
+
+        fn finalize(ctx: *ExecContext, groups: []const Group, value_type: ?DataType, options: Options) KernelError!ArrayRef {
+            const dt = value_type orelse return error.InvalidInput;
+            const o = scalarOptions(options);
+            const mins = try side(ctx, dt, groups, o, true);
+            const maxs = side(ctx, dt, groups, o, false) catch |err| {
+                var m = mins;
+                m.release();
+                return err;
+            };
+            return dense.structArray(ctx.allocator, &aggregate_basic.min_max_names, &.{ mins, maxs }, groups.len, null);
+        }
+    };
+}
+
+const first_last_names = [_][]const u8{ "first", "last" };
+
+/// hash_first, hash_last, hash_first_last, hash_one (the first non-null value of the group;
+/// Arrow returns an arbitrary one) and hash_list (every value of the group, nulls included, in
+/// row order: `list<T>`). The value batches are retained; each group keeps the global row of its
+/// first / last (valid) value, then one take builds the output.
+fn Pick(comptime which: enum { first, last, first_last, one, list }) type {
+    return struct {
+        const ids_only = false;
+
+        const Rows = struct {
+            first_valid: ?u64 = null,
+            last_valid: ?u64 = null,
+            first_any: ?u64 = null,
+            last_any: ?u64 = null,
+            count: u64 = 0,
+        };
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            batches: std.ArrayList(ArrayRef) = .empty,
+            total: u64 = 0,
+            groups: std.ArrayList(Rows) = .empty,
+            /// hash_list: (group, global row) of every row in order.
+            pairs: std.ArrayList(struct { group: u32, row: u64 }) = .empty,
+            seen: Seen = .{},
+            value_type: ?DataType = null,
+
+            fn deinit(self: *State) void {
+                for (self.batches.items) |*b| b.release();
+                self.batches.deinit(self.allocator);
+                self.groups.deinit(self.allocator);
+                self.pairs.deinit(self.allocator);
+            }
+
+            pub fn piece(self: *State, vals: ?ArrayRef, ids: []const u32, groups: usize) KernelError!void {
+                const v = vals.?;
+                if (self.value_type == null) self.value_type = v.data().data_type;
+                if (groups > self.groups.items.len) self.groups.appendNTimes(self.allocator, .{}, groups - self.groups.items.len) catch return error.OutOfMemory;
+                self.batches.append(self.allocator, v.retain()) catch return error.OutOfMemory;
+                const d = v.data();
+                const base = self.total;
+                self.total += d.length;
+                if (which == .list) {
+                    self.pairs.ensureUnusedCapacity(self.allocator, ids.len) catch return error.OutOfMemory;
+                    for (ids, 0..) |id, i| self.pairs.appendAssumeCapacity(.{ .group = id, .row = base + i });
+                    return;
+                }
+                for (ids, 0..) |id, i| {
+                    const g = &self.groups.items[id];
+                    const row = base + i;
+                    if (g.first_any == null) g.first_any = row;
+                    g.last_any = row;
+                    if (!d.isNull(i)) {
+                        if (g.first_valid == null) g.first_valid = row;
+                        g.last_valid = row;
+                        g.count += 1;
+                    }
+                }
+            }
+        };
+
+        fn resultType(args: []const Datum, _: Options) KernelError!DataType {
+            if (args.len != 2) return error.InvalidArity;
+            if (which == .first_last) return error.NotImplemented;
+            if (which == .list) return listOver(switch (args[0]) {
+                .array => |*a| &a.data().data_type,
+                .chunked => |*c| &c.node.data_type,
+                .scalar => |*s| &s.data_type,
+            });
+            return args[0].dataType();
+        }
+
+        pub const resultTypeAlloc = if (which != .first_last) {} else struct {
+            fn f(allocator: std.mem.Allocator, args: []const Datum, _: Options) KernelError!DataType {
+                if (args.len != 2) return error.InvalidArity;
+                return dense.structTypeAlloc(allocator, &first_last_names, &.{ args[0].dataType(), args[0].dataType() });
+            }
+        }.f;
+
+        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+            var state: State = .{ .allocator = ctx.allocator };
+            defer state.deinit();
+            if (args.len > 0) state.value_type = args[0].dataType();
+            try forEachPiece(ctx.allocator, args, false, true, &state.seen, &state);
+            return .{ .array = try finish(ctx, &state, options) };
+        }
+
+        fn init(ctx: *ExecContext, _: Options) KernelError!*anyopaque {
+            const state = ctx.allocator.create(State) catch return error.OutOfMemory;
+            state.* = .{ .allocator = ctx.allocator };
+            return state;
+        }
+
+        fn update(_: *ExecContext, state: *anyopaque, args: []const Datum, _: Options) KernelError!void {
+            const s = cast(state);
+            try forEachPiece(s.allocator, args, false, false, &s.seen, s);
+        }
+
+        /// Append the batches of `other` (same group ids) after this state's rows.
+        fn merge(_: *ExecContext, state: *anyopaque, other: *anyopaque, _: Options) KernelError!void {
+            const s = cast(state);
+            const o = cast(other);
+            const base = s.total;
+            for (o.batches.items) |b| s.batches.append(s.allocator, b.retain()) catch return error.OutOfMemory;
+            s.total += o.total;
+            if (o.groups.items.len > s.groups.items.len) s.groups.appendNTimes(s.allocator, .{}, o.groups.items.len - s.groups.items.len) catch return error.OutOfMemory;
+            for (s.groups.items[0..o.groups.items.len], o.groups.items) |*a, b| {
+                if (a.first_any == null) a.first_any = if (b.first_any) |r| base + r else null;
+                if (a.first_valid == null) a.first_valid = if (b.first_valid) |r| base + r else null;
+                if (b.last_any) |r| a.last_any = base + r;
+                if (b.last_valid) |r| a.last_valid = base + r;
+                a.count += b.count;
+            }
+            s.pairs.ensureUnusedCapacity(s.allocator, o.pairs.items.len) catch return error.OutOfMemory;
+            for (o.pairs.items) |p| s.pairs.appendAssumeCapacity(.{ .group = p.group, .row = base + p.row });
+            s.seen.rows += o.seen.rows;
+            s.seen.groups = @max(s.seen.groups, o.seen.groups);
+            if (s.value_type == null) s.value_type = o.value_type;
+        }
+
+        fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
+            return .{ .array = try finish(ctx, cast(state), options) };
+        }
+
+        fn deinit(ctx: *ExecContext, state: *anyopaque) void {
+            const s = cast(state);
+            s.deinit();
+            ctx.allocator.destroy(s);
+        }
+
+        fn cast(state: *anyopaque) *State {
+            return @ptrCast(@alignCast(state));
+        }
+
+        /// The batches as one array (none: an empty array of the value type).
+        fn combined(allocator: std.mem.Allocator, s: *const State) KernelError!ArrayRef {
+            const dt = s.value_type orelse return error.InvalidInput;
+            if (s.batches.items.len == 1) return s.batches.items[0].retain();
+            if (s.batches.items.len == 0) return dense.nullArray(allocator, dt, 0);
+            return concat.concatArrayRefs(allocator, dt, s.batches.items) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidInput,
+            };
+        }
+
+        fn takeNullable(arr: ArrayRef, indices: []const ?usize) KernelError!ArrayRef {
+            var taken = try core.datumTakeNullable(.{ .array = arr }, indices);
+            return switch (taken) {
+                .array => |a| a,
+                else => {
+                    taken.release();
+                    return error.InvalidInput;
+                },
+            };
+        }
+
+        /// The row of group `g` for `first` (or `last`), null when none qualifies. `min_count`
+        /// is not applied: pyarrow 26 group_by ignores it for hash_first / hash_last.
+        fn rowOf(g: Rows, comptime is_first: bool, o: core.ScalarAggregateOptions) ?usize {
+            const r = if (o.skip_nulls) (if (is_first) g.first_valid else g.last_valid) else (if (is_first) g.first_any else g.last_any);
+            return if (r) |x| @intCast(x) else null;
+        }
+
+        fn finish(ctx: *ExecContext, s: *State, options: Options) KernelError!ArrayRef {
+            const allocator = ctx.allocator;
+            const n = s.seen.groups;
+            if (s.groups.items.len < n) s.groups.appendNTimes(allocator, .{}, n - s.groups.items.len) catch return error.OutOfMemory;
+            var all = try combined(allocator, s);
+            defer all.release();
+            if (which == .list) return listOf(allocator, s, all, n);
+            const o: core.ScalarAggregateOptions = if (which == .one) .{} else scalarOptions(options);
+            const indices = allocator.alloc(?usize, n) catch return error.OutOfMemory;
+            defer allocator.free(indices);
+            for (indices, s.groups.items[0..n]) |*ix, g| ix.* = rowOf(g, which != .last, o);
+            if (n == 0) return all.slice(0, 0) catch error.OutOfMemory;
+            const firsts = try takeNullable(all, indices);
+            if (which != .first_last) return firsts;
+            for (indices, s.groups.items[0..n]) |*ix, g| ix.* = rowOf(g, false, o);
+            const lasts = takeNullable(all, indices) catch |err| {
+                var f = firsts;
+                f.release();
+                return err;
+            };
+            return dense.structArray(allocator, &first_last_names, &.{ firsts, lasts }, n, null);
+        }
+
+        /// hash_list: the rows of every group in row order (a stable counting sort).
+        fn listOf(allocator: std.mem.Allocator, s: *const State, all: ArrayRef, n: usize) KernelError!ArrayRef {
+            const counts = allocator.alloc(usize, n + 1) catch return error.OutOfMemory;
+            defer allocator.free(counts);
+            @memset(counts, 0);
+            for (s.pairs.items) |p| counts[p.group + 1] += 1;
+            for (1..n + 1) |g| counts[g] += counts[g - 1];
+            var offsets = OwnedBuffer.initUninit(allocator, (n + 1) * 4) catch return error.OutOfMemory;
+            defer offsets.deinit();
+            for (offsets.typedSlice(i32)[0 .. n + 1], counts) |*o, c| o.* = std.math.cast(i32, c) orelse return error.Overflow;
+            const order = allocator.alloc(usize, counts[n]) catch return error.OutOfMemory;
+            defer allocator.free(order);
+            const fill = allocator.dupe(usize, counts[0..n]) catch return error.OutOfMemory;
+            defer allocator.free(fill);
+            for (s.pairs.items) |p| {
+                order[fill[p.group]] = @intCast(p.row);
+                fill[p.group] += 1;
+            }
+            var child = try takeArray(allocator, all, order);
+            errdefer child.release();
+            var buffers = [2]SharedBuffer{ .empty, .empty };
+            buffers[1] = offsets.toShared((n + 1) * 4) catch return error.OutOfMemory;
+            errdefer buffers[1].release();
+            var children = [1]ArrayRef{child};
+            return ArrayRef.fromOwnedInline(allocator, .{
+                .data_type = listOver(&child.data().data_type),
+                .length = n,
+                .null_count = 0,
+                .buffers = &buffers,
+                .children = &children,
+            }) catch error.OutOfMemory;
+        }
+    };
 }

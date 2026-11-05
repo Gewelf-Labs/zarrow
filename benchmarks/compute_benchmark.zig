@@ -207,6 +207,17 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     defer group_ids.release();
     const skip_nulls = Options{ .scalar_aggregate = .{ .skip_nulls = true, .min_count = 1 } };
     try timeKernelWith(io, &ctx, .hash_aggregate, "compute_hash_sum_skip_nulls", "hash_sum", &.{ .{ .array = i64arr }, .{ .array = group_ids } }, skip_nulls, cfg, emit_csv, meta);
+
+    // float64 with 10% nulls: square root, rounding to two digits (half to even) and stddev.
+    try timeKernel(io, &ctx, .scalar, "compute_sqrt_float64", "sqrt", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
+    const two_digits = Options{ .round = .{ .ndigits = 2 } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_round_float64", "round", &.{.{ .array = f64arr }}, two_digits, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .aggregate, "compute_stddev_float64", "stddev", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
+    // unique over int32 rows drawn from 1000 values; sort_indices over random int32 rows.
+    var a_k = try buildInt32Mod(allocator, cfg.rows, 18, 1000);
+    defer a_k.release();
+    try timeKernel(io, &ctx, .vector, "compute_unique_int32", "unique", &.{.{ .array = a_k }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .vector, "compute_sort_indices_int32", "sort_indices", &.{.{ .array = a }}, cfg, emit_csv, meta);
 }
 
 /// decimal128(18, 2) values below 10^16 in magnitude, every tenth row null.

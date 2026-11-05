@@ -18,4 +18,11 @@ test {
     _ = @import("test_temporal_round.zig");
     _ = @import("test_set_lookup.zig");
     _ = @import("test_hash_aggregate.zig");
+    _ = @import("test_math.zig");
+    _ = @import("test_round.zig");
+    _ = @import("test_temporal_arith.zig");
+    _ = @import("test_associative.zig");
+    _ = @import("test_selection.zig");
+    _ = @import("test_aggregate_stats.zig");
+    _ = @import("test_sort.zig");
 }
