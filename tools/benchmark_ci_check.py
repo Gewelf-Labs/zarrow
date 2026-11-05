@@ -69,6 +69,11 @@ EXPECTED_BENCHES = {
     "compute_decimal128_add",
     "compute_cmp_mixed_string",
     "compute_hash_sum_skip_nulls",
+    "compute_sqrt_float64",
+    "compute_round_float64",
+    "compute_unique_int32",
+    "compute_sort_indices_int32",
+    "compute_stddev_float64",
 }
 
 

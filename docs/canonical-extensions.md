@@ -27,7 +27,7 @@ type; **no** = nothing.
 | C data interface export and import of both keys; duplicates and metadata without a name rejected | `src/ffi/c_data.zig` | yes | `src/ffi/c_data.zig:1264`, `src/ffi/c_data.zig:1343` | `src/ffi/c_data.zig:"c data schema export/import roundtrip preserves extension metadata"`, `src/ffi/c_data.zig:"c data array export/import handles extension layout via storage type"` |
 | Compute kernels (take, filter, concat) on extension arrays operate on the storage layout | `storageDataType` dispatch in the kernels | yes | `src/concat_array_refs.zig:44`, `src/compute/datum_permutation.zig:1113` | `src/compute/test_datum.zig:"compute datumTake nested kernels match the per-row oracle on sliced inputs with null indices"`, `src/compute/test_datum.zig:"concatArrayRefs N-ary path matches the source rows for every layout, sliced parts and child windows"` (both use a `test.ext` over int32 source) |
 | `validateFull` on an extension array (validates the storage) | `validateFull` via `layoutDataType` | partial (no extension-specific test) | `src/array/array_data.zig:811` | `src/array/array_data.zig:"array data validateLayout accepts extension by delegating to storage layout"` |
-| Fuzzing of extension metadata on the IPC path | fuzz target `ipc-stream` | yes | `fuzz/fuzz.zig:901` | `fuzz/fuzz.zig:"fuzz ipc-stream"` |
+| Fuzzing of extension metadata on the IPC path | fuzz target `ipc-stream` | yes | `fuzz/fuzz.zig:1000` | `fuzz/fuzz.zig:"fuzz ipc-stream"` |
 | Registry of known extension names, equality by name plus metadata, typed accessors | none | no | | |
 
 ## Canonical types

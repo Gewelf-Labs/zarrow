@@ -210,8 +210,13 @@ test "set lookup errors: options, value set type, unsupported types and malforme
     const args = [_]Datum{.{ .array = x }};
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_in", &args, common.none));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_in", &args, lookup(.{ .scalar = common.scalarOf(i32, 1) }, .match)));
-    // Arrow casts the value set; here it must have the input's type.
-    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("index_in", &args, lookup(.{ .array = y }, .match)));
+    // A value set of another type is cast (see the value set cast test); one no cast reaches is
+    // InvalidOptions.
+    try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(.{ .array = y }, .match), &.{0});
+    const item = DataType{ .int32 = {} };
+    var fsb = try common.datumBuildNullLike(.{ .list = .{ .value_field = .{ .name = "item", .data_type = &item } } }, 1);
+    defer fsb.release();
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("index_in", &args, lookup(fsb, .match)));
     var n = try common.datumBuildNullLike(.{ .null = {} }, 2);
     defer n.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("is_in", &.{n}, lookup(n, .match)));
@@ -222,4 +227,79 @@ test "set lookup errors: options, value set type, unsupported types and malforme
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("is_in", &.{.{ .array = malformed }}, lookup(args[0], .match)));
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("is_in", &args, lookup(.{ .array = malformed }, .match)));
+}
+
+test "set lookup casts a value set of another type and takes decimal, fixed_size_binary and interval keys (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var i64s = try common.makeArray(i64, allocator, &.{ 1, 2, 3 });
+    defer i64s.release();
+    var i32s = try common.makeArray(i32, allocator, &.{ 1, 2, 3 });
+    defer i32s.release();
+    var set13 = try common.makeArray(i32, allocator, &.{ 1, 3 });
+    defer set13.release();
+    var set13_64 = try common.makeArray(i64, allocator, &.{ 1, 3 });
+    defer set13_64.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = i64s }}, lookup(.{ .array = set13 }, .match), &.{ true, false, true });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = i32s }}, lookup(.{ .array = set13_64 }, .match), &.{ true, false, true });
+    // The value set does not cast to int8 (300): the input is cast to int64 instead.
+    var i8s = try common.makeArray(i8, allocator, &.{ 1, 2, 3 });
+    defer i8s.release();
+    var wide = try common.makeArray(i64, allocator, &.{ 1, 300 });
+    defer wide.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = i8s }}, lookup(.{ .array = wide }, .match), &.{ true, false, false });
+    var f = try common.makeArray(f64, allocator, &.{ 1.0, 2.5, 3.0 });
+    defer f.release();
+    var set31 = try common.makeArray(i32, allocator, &.{ 3, 1 });
+    defer set31.release();
+    try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = f }}, lookup(.{ .array = set31 }, .match), &.{ 1, null, 0 });
+    var fs = try common.makeArray(f64, allocator, &.{ 1.5, 2.0 });
+    defer fs.release();
+    var ints12 = try common.makeArray(i32, allocator, &.{ 1, 2 });
+    defer ints12.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = ints12 }}, lookup(.{ .array = fs }, .match), &.{ false, true });
+    var text = try common.makeStrings(.string, allocator, &.{"1"});
+    defer text.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = ints12 }}, lookup(.{ .array = text }, .match), &.{ true, false });
+    var ab = try common.makeStrings(.string, allocator, &.{ "a", "b" });
+    defer ab.release();
+    var lb = try common.makeStrings(.large_string, allocator, &.{"b"});
+    defer lb.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = ab }}, lookup(.{ .array = lb }, .match), &.{ false, true });
+    var d = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 1, 2 });
+    defer d.release();
+    var one = try common.makeArray(i32, allocator, &.{1});
+    defer one.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = d }}, lookup(.{ .array = one }, .match), &.{ true, false });
+    var ts = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .second, .timezone = null } }, allocator, &.{ 1, 2 });
+    defer ts.release();
+    var tms = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .millisecond, .timezone = null } }, allocator, &.{1000});
+    defer tms.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = ts }}, lookup(.{ .array = tms }, .match), &.{ true, false });
+
+    // Decimal, fixed_size_binary and month_day_nano keys hash their value bytes.
+    const d52 = DataType{ .decimal128 = .{ .precision = 5, .scale = 2 } };
+    var dec = try common.makeTyped(i128, d52, allocator, &.{ 100, 200, null });
+    defer dec.release();
+    var dset = try common.makeTyped(i128, d52, allocator, &.{200});
+    defer dset.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = dec }}, lookup(.{ .array = dset }, .match), &.{ false, true, false });
+    var fb = try common.array_mod.FixedSizeBinaryBuilder.init(allocator, 2, 3);
+    defer fb.deinit();
+    try fb.append("ab");
+    try fb.append("cd");
+    try fb.appendNull();
+    var fsb = try fb.finish();
+    defer fsb.release();
+    var fsb_slice = try fsb.slice(1, 2);
+    defer fsb_slice.release();
+    try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = fsb }}, lookup(.{ .array = fsb_slice }, .match), &.{ null, 0, 1 });
+    const mdn = DataType{ .interval_month_day_nano = .{ .unit = .month_day_nano } };
+    var iv = try common.makeTyped(i128, mdn, allocator, &.{ 5, 7 });
+    defer iv.release();
+    var ivs = try common.makeTyped(i128, mdn, allocator, &.{7});
+    defer ivs.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = iv }}, lookup(.{ .array = ivs }, .match), &.{ false, true });
 }

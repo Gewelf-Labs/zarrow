@@ -51,6 +51,30 @@ pub const OptionsTag = enum {
     replace_slice,
     /// Width and padding of utf8_zero_fill.
     zero_fill,
+    /// Digits and mode of round (also ceil / floor / trunc take none).
+    round,
+    /// Multiple and mode of round_to_multiple.
+    round_to_multiple,
+    /// Mode of round_binary.
+    round_binary,
+    /// Number of modes of mode.
+    mode,
+    /// Delta degrees of freedom of variance / stddev (and their hash_ forms).
+    variance,
+    /// Bias correction of skew / kurtosis.
+    skew,
+    /// Quantiles and interpolation of quantile.
+    quantile,
+    /// Value searched by index.
+    index,
+    /// Pivot of partition_nth_indices.
+    partition_nth,
+    /// k and sort keys of select_k_unstable.
+    select_k,
+    /// Order, null placement and tie breaking of rank.
+    rank,
+    /// Null encoding of dictionary_encode.
+    dictionary_encode,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -95,10 +119,21 @@ pub const SortNaNPlacement = enum {
     at_end,
 };
 
-/// Common options for sort-like kernels.
-pub const SortOptions = struct {
-    /// Ordering direction.
+/// One sort key of sort_indices / select_k_unstable (Arrow `SortKey`): a column by position
+/// (the arguments of sort_indices) or by name (`sortIndicesRecordBatch` / `sortIndicesTable`).
+pub const SortKey = struct {
+    /// Column name (record batch / table helpers); unused for positional arguments.
+    name: []const u8 = "",
     order: SortOrder = .ascending,
+};
+
+/// Common options for sort-like kernels (Arrow `SortOptions` and `ArraySortOptions`).
+pub const SortOptions = struct {
+    /// Ordering direction (array_sort_indices, and every column when `sort_keys` is empty).
+    order: SortOrder = .ascending,
+    /// One key per sort column, in priority order (sort_indices); empty: every argument with
+    /// `order`.
+    sort_keys: []const SortKey = &.{},
     /// Null placement behavior.
     null_placement: SortNullPlacement = .at_end,
     /// Optional NaN placement policy for floating-point inputs.
@@ -277,6 +312,110 @@ pub const ZeroFillOptions = struct {
     padding: []const u8 = "0",
 };
 
+/// Rounding mode (Arrow `RoundMode`): `down` toward -inf, `up` toward +inf, `towards_zero`,
+/// `towards_infinity` (away from zero); the `half_*` modes round to the nearest and break ties
+/// that way (`half_to_even` / `half_to_odd`: to the even / odd neighbour).
+pub const RoundMode = enum { down, up, towards_zero, towards_infinity, half_down, half_up, half_towards_zero, half_towards_infinity, half_to_even, half_to_odd };
+
+/// Options of round (Arrow `RoundOptions`).
+pub const RoundOptions = struct {
+    /// Digits after the decimal point (negative: to tens, hundreds, ...).
+    ndigits: i64 = 0,
+    round_mode: RoundMode = .half_to_even,
+};
+
+/// Options of round_to_multiple (Arrow `RoundToMultipleOptions`). `multiple` must be positive;
+/// it is cast to the input type (safe cast).
+pub const RoundToMultipleOptions = struct {
+    multiple: core.Scalar = core.Scalar.init(.{ .double = {} }, .{ .f64 = 1.0 }),
+    round_mode: RoundMode = .half_to_even,
+};
+
+/// Options of round_binary (Arrow `RoundBinaryOptions`); the digits are the second argument.
+pub const RoundBinaryOptions = struct {
+    round_mode: RoundMode = .half_to_even,
+};
+
+/// Options of mode (Arrow `ModeOptions`).
+pub const ModeOptions = struct {
+    /// Number of most common values to return (at least 1).
+    n: i64 = 1,
+    skip_nulls: bool = true,
+    min_count: u32 = 0,
+};
+
+/// Options of variance / stddev (Arrow `VarianceOptions`).
+pub const VarianceOptions = struct {
+    /// Delta degrees of freedom: the divisor is `count - ddof` (at least 0).
+    ddof: i32 = 0,
+    skip_nulls: bool = true,
+    min_count: u32 = 0,
+};
+
+/// Options of skew / kurtosis (Arrow `SkewOptions`).
+pub const SkewOptions = struct {
+    skip_nulls: bool = true,
+    /// false: the sample (bias-corrected) estimator.
+    biased: bool = true,
+    min_count: u32 = 0,
+};
+
+/// Interpolation of quantile between two data points (Arrow `QuantileOptions::Interpolation`).
+pub const QuantileInterpolation = enum { linear, lower, higher, nearest, midpoint };
+
+/// Options of quantile (Arrow `QuantileOptions`).
+pub const QuantileOptions = struct {
+    /// Quantiles in [0, 1].
+    q: []const f64 = &.{0.5},
+    interpolation: QuantileInterpolation = .linear,
+    skip_nulls: bool = true,
+    min_count: u32 = 0,
+};
+
+/// Options of index (Arrow `IndexOptions`): the value to find, of the input's type.
+pub const IndexOptions = struct {
+    value: core.Scalar,
+};
+
+/// Options of partition_nth_indices (Arrow `PartitionNthOptions`).
+pub const PartitionNthOptions = struct {
+    /// The row at this sorted position is in place; at most the input length.
+    pivot: usize,
+    null_placement: SortNullPlacement = .at_end,
+};
+
+/// Options of select_k_unstable (Arrow `SelectKOptions`).
+pub const SelectKOptions = struct {
+    k: usize,
+    /// One key per argument (empty: one ascending key).
+    sort_keys: []const SortKey = &.{},
+};
+
+/// Tie breaking of rank (Arrow `RankOptions::Tiebreaker`).
+pub const RankTiebreaker = enum {
+    /// Equal values get the lowest rank of the run.
+    min,
+    /// Equal values get the highest rank of the run.
+    max,
+    /// Equal values get ranks in input order.
+    first,
+    /// Like min, but the ranks of the runs are consecutive.
+    dense,
+};
+
+/// Options of rank (Arrow `RankOptions`).
+pub const RankOptions = struct {
+    order: SortOrder = .ascending,
+    null_placement: SortNullPlacement = .at_end,
+    tiebreaker: RankTiebreaker = .first,
+};
+
+/// Options of dictionary_encode (Arrow `DictionaryEncodeOptions`).
+pub const DictionaryEncodeOptions = struct {
+    /// `mask`: a null row stays null; `encode`: nulls become one dictionary entry.
+    null_encoding: enum { mask, encode } = .mask,
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -310,6 +449,18 @@ pub const Options = union(OptionsTag) {
     element_wise_aggregate: ElementWiseAggregateOptions,
     replace_slice: ReplaceSliceOptions,
     zero_fill: ZeroFillOptions,
+    round: RoundOptions,
+    round_to_multiple: RoundToMultipleOptions,
+    round_binary: RoundBinaryOptions,
+    mode: ModeOptions,
+    variance: VarianceOptions,
+    skew: SkewOptions,
+    quantile: QuantileOptions,
+    index: IndexOptions,
+    partition_nth: PartitionNthOptions,
+    select_k: SelectKOptions,
+    rank: RankOptions,
+    dictionary_encode: DictionaryEncodeOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {

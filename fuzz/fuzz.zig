@@ -444,6 +444,99 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
             expectCall(&ctx, "is_in", .scalar, &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = sliced } } }, len, &.{});
             exerciseGroupBy(&ctx, a);
         }
+        exerciseRound16(&ctx, a);
+    }
+}
+
+/// Round 16 kernels on any decoded array: math and rounding (numbers, decimals), temporal
+/// arithmetic, unique / value_counts, the multiplexers and null replacement, the new aggregates
+/// and the sorts. A sort result must be a permutation of the rows and rank values in [1, len].
+fn exerciseRound16(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    const dt = a.data().data_type;
+    const sort = zarrow.compute.kernels.sort;
+    const hash = zarrow.compute.kernels.hash_aggregate;
+    switch (dt) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+            // Integers go to float64 by a safe cast: past 2^53 it is InvalidCast (as Arrow).
+            expectCall(ctx, "sqrt", .scalar, &.{d}, .none, len, &.{error.InvalidCast});
+            expectCall(ctx, "power", .scalar, &.{ d, d }, .none, len, &.{error.InvalidInput});
+            expectCall(ctx, "round", .scalar, &.{d}, .{ .round = .{ .ndigits = -1, .round_mode = .half_to_odd } }, len, &.{error.Overflow});
+            expectCall(ctx, "round_to_multiple", .scalar, &.{d}, .{ .round_to_multiple = .{ .multiple = zarrow.compute.Scalar.init(.{ .int8 = {} }, .{ .i8 = 3 }), .round_mode = .up } }, len, &.{ error.Overflow, error.InvalidCast });
+            expectCall(ctx, "variance", .aggregate, &.{d}, .{ .variance = .{ .ddof = 1 } }, null, &.{});
+            expectCall(ctx, "kurtosis", .aggregate, &.{d}, .{ .skew = .{ .biased = false } }, null, &.{});
+            expectCall(ctx, "product", .aggregate, &.{d}, .none, null, &.{});
+            expectAnyLen(ctx, "mode", &.{d}, .{ .mode = .{ .n = 3 } }, &.{});
+            const q = [_]f64{ 0, 0.3, 1 };
+            expectCall(ctx, "quantile", .vector, &.{d}, .{ .quantile = .{ .q = &q, .interpolation = .nearest } }, q.len, &.{});
+        },
+        .decimal128, .decimal256 => {
+            expectCall(ctx, "round", .scalar, &.{d}, .{ .round = .{ .ndigits = 1 } }, len, &.{ error.Overflow, error.InvalidOptions });
+            expectCall(ctx, "floor", .scalar, &.{d}, .none, len, &.{ error.Overflow, error.InvalidOptions });
+            expectCall(ctx, "min_max", .aggregate, &.{d}, .none, null, &.{});
+            expectCall(ctx, "stddev", .aggregate, &.{d}, .none, null, &.{});
+        },
+        .timestamp => {
+            expectCall(ctx, "subtract_checked", .scalar, &.{ d, d }, .none, len, &.{ error.Overflow, error.InvalidInput });
+            const dur = zarrow.compute.Scalar.init(.{ .duration = .{ .unit = .second } }, .{ .duration = 3 });
+            expectCall(ctx, "add", .scalar, &.{ d, .{ .scalar = dur } }, .none, len, &.{error.InvalidCast});
+        },
+        else => {},
+    }
+    if (hash.isKeyType(dt)) {
+        expectAnyLen(ctx, "unique", &.{d}, .none, &.{});
+        expectAnyLen(ctx, "value_counts", &.{d}, .none, &.{});
+        expectCall(ctx, "count_distinct", .aggregate, &.{d}, .{ .count = .{ .mode = .all } }, null, &.{});
+        // dictionary_encode decodes back to the same rows.
+        var enc = ctx.invoke("dictionary_encode", .vector, &.{d}, .none) catch |e| std.debug.panic("fuzz-invariant: dictionary_encode of a valid {s} array failed: {s}", .{ @tagName(dt.id()), @errorName(e) });
+        defer enc.release();
+        expectValid("dictionary_encode", enc.array, len);
+    }
+    // Multiplexers and null replacement take every layout the take kernels handle.
+    expectCall(ctx, "coalesce", .scalar, &.{ d, d }, .none, len, &.{ error.UnsupportedType, error.NoMatchingKernel });
+    expectAnyLen(ctx, "drop_null", &.{d}, .none, &.{});
+    expectCall(ctx, "fill_null_backward", .vector, &.{d}, .none, len, &.{});
+    if (sort.isSortable(dt)) {
+        for ([_]zarrow.compute.Options{ .none, .{ .sort = .{ .order = .descending, .null_placement = .at_start } } }) |o| {
+            var out = ctx.invoke("sort_indices", .vector, &.{ d, d }, o) catch |e| std.debug.panic("fuzz-invariant: sort_indices of a valid {s} array failed: {s}", .{ @tagName(dt.id()), @errorName(e) });
+            defer out.release();
+            expectPermutation("sort_indices", out.array, len, false);
+        }
+        var r = ctx.invoke("rank", .vector, &.{d}, .{ .rank = .{ .tiebreaker = .dense } }) catch |e| std.debug.panic("fuzz-invariant: rank of a valid {s} array failed: {s}", .{ @tagName(dt.id()), @errorName(e) });
+        defer r.release();
+        expectPermutation("rank", r.array, len, true);
+        expectCall(ctx, "select_k_unstable", .vector, &.{d}, .{ .select_k = .{ .k = 5 } }, @min(len, 5), &.{});
+    }
+}
+
+/// Invoke vector function `name`: an error outside `allowed` is a finding, the output array
+/// must validate (any length).
+fn expectAnyLen(ctx: *zarrow.compute.ExecContext, name: []const u8, args: []const zarrow.compute.Datum, options: zarrow.compute.Options, allowed: []const anyerror) void {
+    var out = ctx.invoke(name, .vector, args, options) catch |e| {
+        for (allowed) |ok| if (e == ok) return;
+        std.debug.panic("fuzz-invariant: kernel {s} failed on a valid {s} array: {s}", .{ name, @tagName(args[0].dataType().id()), @errorName(e) });
+    };
+    defer out.release();
+    const a = out.asArray() orelse std.debug.panic("fuzz-invariant: {s} did not return an array", .{name});
+    expectValid(name, a, a.data().length);
+}
+
+/// A uint64 index array of `len` rows: a permutation of `[0, len)` (or, for `ranks`, values in
+/// `[1, len]`).
+fn expectPermutation(op: []const u8, arr: ArrayRef, len: usize, ranks: bool) void {
+    expectValid(op, arr, len);
+    const vals = (zarrow.PrimitiveArray(u64){ .data = arr.data() }).values() catch std.debug.panic("fuzz-invariant: {s} output is not uint64", .{op});
+    var seen = std.heap.page_allocator.alloc(bool, len) catch return;
+    defer std.heap.page_allocator.free(seen);
+    @memset(seen, false);
+    for (vals) |v| {
+        if (ranks) {
+            if (v < 1 or v > len) std.debug.panic("fuzz-invariant: {s} gave rank {d} of {d} rows", .{ op, v, len });
+            continue;
+        }
+        if (v >= len or seen[v]) std.debug.panic("fuzz-invariant: {s} is not a permutation (row {d} of {d})", .{ op, v, len });
+        seen[v] = true;
     }
 }
 
@@ -465,8 +558,14 @@ fn exerciseGroupBy(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
     expectValid("Grouper.uniques", keys[0], groups);
     const args = [_]zarrow.compute.Datum{ .{ .array = a }, .{ .array = ids } };
     expectCall(ctx, "hash_count_distinct", .hash_aggregate, &args, .none, groups, &.{});
+    expectCall(ctx, "hash_first_last", .hash_aggregate, &args, .{ .scalar_aggregate = .{ .skip_nulls = false } }, groups, &.{});
+    expectCall(ctx, "hash_list", .hash_aggregate, &args, .none, groups, &.{});
     switch (a.data().data_type) {
-        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => expectCall(ctx, "hash_sum", .hash_aggregate, &args, .none, groups, &.{}),
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+            expectCall(ctx, "hash_sum", .hash_aggregate, &args, .none, groups, &.{});
+            expectCall(ctx, "hash_variance", .hash_aggregate, &args, .none, groups, &.{});
+            expectCall(ctx, "hash_product", .hash_aggregate, &args, .none, groups, &.{});
+        },
         else => {},
     }
 }

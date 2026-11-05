@@ -1,7 +1,9 @@
 //! Set lookup (Arrow C++ "Containment tests"): is_in (bool) and index_in (int32) with
-//! `SetLookupOptions`. The value set (an array or chunked array of the input's type; Arrow would
-//! cast it, here another type is `InvalidOptions`) is hashed once per call into a `KeyMap`
-//! (hash_aggregate.zig), then every input row is looked up. index_in returns the position of the
+//! `SetLookupOptions`. The value set (an array or chunked array) is hashed once per call into a
+//! `KeyMap` (hash_aggregate.zig), then every input row is looked up. A value set of another type
+//! is cast to the input's type (safe cast); when that cast fails, the input is cast to the value
+//! set's type instead (as pyarrow 26: an int64 value set [1, 300] against int8 rows, or a float
+//! value set [1.5] against int32 rows); when neither cast exists the call is `InvalidOptions`. index_in returns the position of the
 //! first occurrence in the value set. Inputs: every key type of hash_aggregate.zig (numbers, bool,
 //! dates, timestamps, times, durations, string and binary layouts); floats match by bits after
 //! folding every NaN into one (NaN matches NaN, -0.0 does not match 0.0, as in Arrow).
@@ -99,13 +101,37 @@ fn Lookup(comptime op: Op) type {
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 1) return error.InvalidArity;
             const o = options.set_lookup;
-            if (!o.value_set.dataType().eql(args[0].dataType())) return error.InvalidOptions;
-            var set: Set = .{ .behavior = o.null_matching_behavior };
+            const in_type = args[0].dataType();
+            const set_type = o.value_set.dataType();
+            if (set_type.eql(in_type)) return run(ctx, args[0], o.value_set, o.null_matching_behavior);
+            if (ctx.invoke("cast", .scalar, &.{o.value_set}, .{ .cast = .{ .to_type = in_type } })) |cast_set| {
+                var vs = cast_set;
+                defer vs.release();
+                return run(ctx, args[0], vs, o.null_matching_behavior);
+            } else |err| if (!castFailed(err)) return err;
+            if (!hash.isKeyType(set_type)) return error.InvalidOptions;
+            var input = ctx.invoke("cast", .scalar, &.{args[0]}, .{ .cast = .{ .to_type = set_type } }) catch |err| {
+                return if (castFailed(err)) error.InvalidOptions else err;
+            };
+            defer input.release();
+            return run(ctx, input, o.value_set, o.null_matching_behavior);
+        }
+
+        fn castFailed(err: KernelError) bool {
+            return switch (err) {
+                error.InvalidCast, error.UnsupportedType, error.NoMatchingKernel, error.NotImplemented => true,
+                else => false,
+            };
+        }
+
+        fn run(ctx: *ExecContext, input: Datum, value_set: Datum, behavior: core.NullMatchingBehavior) KernelError!Datum {
+            if (value_set == .scalar) return error.InvalidOptions;
+            var set: Set = .{ .behavior = behavior };
             defer set.deinit(ctx.allocator);
-            try set.build(ctx.allocator, o.value_set);
+            try set.build(ctx.allocator, value_set);
             // The chunks read the prebuilt set through the custom options payload.
             const inner: Options = .{ .custom = .{ .tag = "set_lookup", .payload = &set } };
-            return dense.execElementwiseWith(ctx, args, inner, if (op == .is_in) bool_type else int32_type, false, chunk);
+            return dense.execElementwiseWith(ctx, &.{input}, inner, if (op == .is_in) bool_type else int32_type, false, chunk);
         }
 
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {

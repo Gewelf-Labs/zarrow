@@ -210,5 +210,25 @@
   "compute_hash_sum_skip_nulls": {
     "min_rows_per_sec": 5000.0,
     "max_ns_per_row": 2000000.0
+  },
+  "compute_sqrt_float64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_round_float64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_unique_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_sort_indices_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_stddev_float64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
   }
 }
