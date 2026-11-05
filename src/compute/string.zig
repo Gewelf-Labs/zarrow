@@ -5,10 +5,11 @@
 //! binary_join_element_wise, which follows `JoinOptions`.
 //!
 //! Scope against Arrow C++ (no Unicode tables in the Zig standard library):
-//! - utf8_upper / utf8_lower map ASCII letters only and leave other code points unchanged
-//!   (Arrow maps every cased code point through utf8proc).
+//! - utf8_upper / utf8_lower / utf8_swapcase / utf8_capitalize map ASCII letters only and leave
+//!   other code points unchanged (Arrow maps every cased code point through utf8proc).
 //! - utf8_is_alpha / utf8_is_digit treat non-ASCII code points as neither letters nor digits;
-//!   utf8_is_space and utf8_*trim_whitespace use the Unicode White_Space property.
+//!   utf8_is_space, utf8_*trim_whitespace and utf8_split_whitespace use the Unicode White_Space
+//!   property plus U+001C..U+001F (the set Arrow gets from utf8proc).
 //! - match_substring / starts_with / ends_with take a literal pattern; `ignore_case` folds ASCII
 //!   letters only.
 //! The utf8_* kernels that decode code points (upper / lower, trim_whitespace, slice_codeunits,
@@ -53,6 +54,10 @@ const Transform = enum {
     utf8_rtrim_whitespace,
     utf8_slice_codeunits,
     utf8_reverse,
+    ascii_swapcase,
+    utf8_swapcase,
+    ascii_capitalize,
+    utf8_capitalize,
 };
 
 /// String to bool functions.
@@ -163,7 +168,7 @@ fn joinOptions(options: Options) bool {
 // ------------------------------------------------------------------------------ code points
 
 /// Return whether `s` is valid UTF-8 (all-ASCII strings take a vector fast path).
-fn validUtf8(s: []const u8) bool {
+pub fn validUtf8(s: []const u8) bool {
     return isAscii(s) or std.unicode.utf8ValidateSlice(s);
 }
 
@@ -178,20 +183,21 @@ fn isAscii(s: []const u8) bool {
 }
 
 /// Byte length of the code point starting with `first` (valid UTF-8 only).
-inline fn cpLen(first: u8) usize {
+pub inline fn cpLen(first: u8) usize {
     return if (first < 0x80) 1 else if (first < 0xE0) 2 else if (first < 0xF0) 3 else 4;
 }
 
-/// Unicode White_Space (the property utf8proc reports as space for Arrow's utf8 kernels).
-fn isUnicodeSpace(cp: u21) bool {
+/// Unicode White_Space plus U+001C..U+001F: the code points Arrow's utf8 kernels treat as space
+/// (checked against pyarrow 26).
+pub fn isUnicodeSpace(cp: u21) bool {
     return switch (cp) {
-        0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+        0x09...0x0D, 0x1C...0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
         else => false,
     };
 }
 
 /// Code point starting at `s[i]` (valid UTF-8 only).
-fn decodeAt(s: []const u8, i: usize) u21 {
+pub fn decodeAt(s: []const u8, i: usize) u21 {
     return std.unicode.utf8Decode(s[i..][0..cpLen(s[i])]) catch unreachable;
 }
 
@@ -204,15 +210,19 @@ fn prevStart(s: []const u8, end: usize) usize {
 
 // ------------------------------------------------------------------------------ transforms
 
-fn upper(c: u8) u8 {
+pub fn upper(c: u8) u8 {
     return if (c -% 'a' < 26) c - 32 else c;
 }
 
-fn lower(c: u8) u8 {
+pub fn lower(c: u8) u8 {
     return if (c -% 'A' < 26) c + 32 else c;
 }
 
-/// `dst[i] = f(src[i])` for an ASCII case map `f` (upper or lower), 32 bytes per step.
+fn swap(c: u8) u8 {
+    return if ((c | 32) -% 'a' < 26) c ^ 32 else c;
+}
+
+/// `dst[i] = f(src[i])` for an ASCII case map `f` (upper, lower or swap), 32 bytes per step.
 fn mapBytes(comptime f: fn (u8) u8, dst: []u8, src: []const u8) void {
     const L = 32;
     const V = @Vector(L, u8);
@@ -222,7 +232,8 @@ fn mapBytes(comptime f: fn (u8) u8, dst: []u8, src: []const u8) void {
     var i: usize = 0;
     while (i + L <= src.len) : (i += L) {
         const v: V = src[i..][0..L].*;
-        dst[i..][0..L].* = @select(u8, (v -% first) < n26, v ^ flip, v);
+        const hit = if (f == swap) ((v | flip) -% @as(V, @splat('a'))) < n26 else (v -% first) < n26;
+        dst[i..][0..L].* = @select(u8, hit, v ^ flip, v);
     }
     for (dst[i..src.len], src[i..]) |*d, c| d.* = f(c);
 }
@@ -231,6 +242,7 @@ fn Transformer(comptime t: Transform) type {
     const case_map: ?fn (u8) u8 = switch (t) {
         .ascii_upper, .utf8_upper => upper,
         .ascii_lower, .utf8_lower => lower,
+        .ascii_swapcase, .utf8_swapcase => swap,
         else => null,
     };
     const validates = std.mem.startsWith(u8, @tagName(t), "utf8_");
@@ -325,7 +337,13 @@ fn Transformer(comptime t: Transform) type {
                     }
                     return src.len;
                 },
-                .utf8_slice_codeunits => return slice(allocator, dst, src, options.slice, scratch),
+                .utf8_slice_codeunits => return slice(false, allocator, dst, src, options.slice, scratch),
+                .ascii_capitalize, .utf8_capitalize => {
+                    if (src.len == 0) return 0;
+                    dst[0] = upper(src[0]);
+                    mapBytes(lower, dst[1..src.len], src[1..]);
+                    return src.len;
+                },
                 else => unreachable,
             }
             @memcpy(dst[0 .. hi - lo], src[lo..hi]);
@@ -334,13 +352,17 @@ fn Transformer(comptime t: Transform) type {
     };
 }
 
-/// Python `s[start:stop:step]` over the code points of valid UTF-8 `src` (Arrow C++ semantics).
-fn slice(allocator: std.mem.Allocator, dst: []u8, src: []const u8, o: core.SliceOptions, starts: *std.ArrayList(usize)) KernelError!usize {
-    starts.clearRetainingCapacity();
-    var i: usize = 0;
-    while (i < src.len) : (i += cpLen(src[i])) starts.append(allocator, i) catch return error.OutOfMemory;
-    starts.append(allocator, src.len) catch return error.OutOfMemory;
-    const n: i64 = @intCast(starts.items.len - 1);
+/// Python `s[start:stop:step]` over the code points of valid UTF-8 `src` (Arrow C++ semantics),
+/// or over its bytes when `bytes` (binary_slice; `starts` is then unused).
+pub fn slice(comptime bytes: bool, allocator: std.mem.Allocator, dst: []u8, src: []const u8, o: core.SliceOptions, starts: *std.ArrayList(usize)) KernelError!usize {
+    var n: i64 = @intCast(src.len);
+    if (!bytes) {
+        starts.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < src.len) : (i += cpLen(src[i])) starts.append(allocator, i) catch return error.OutOfMemory;
+        starts.append(allocator, src.len) catch return error.OutOfMemory;
+        n = @intCast(starts.items.len - 1);
+    }
     const lower_bound: i64 = if (o.step > 0) 0 else -1;
     const upper_bound: i64 = if (o.step > 0) n else n - 1;
     const clamp = struct {
@@ -354,7 +376,7 @@ fn slice(allocator: std.mem.Allocator, dst: []u8, src: []const u8, o: core.Slice
     var w: usize = 0;
     while (if (o.step > 0) cur < stop else cur > stop) {
         const k: usize = @intCast(cur);
-        const cp = src[starts.items[k]..starts.items[k + 1]];
+        const cp = if (bytes) src[k..][0..1] else src[starts.items[k]..starts.items[k + 1]];
         @memcpy(dst[w..][0..cp.len], cp);
         w += cp.len;
         cur = std.math.add(i64, cur, o.step) catch break;

@@ -25,6 +25,20 @@ pub const OptionsTag = enum {
     join,
     /// Characters removed by ascii_trim / ascii_ltrim / ascii_rtrim.
     trim,
+    /// Pattern and replacement of replace_substring.
+    replace_substring,
+    /// Separator and limits of split_pattern.
+    split_pattern,
+    /// Limits of ascii_split_whitespace / utf8_split_whitespace.
+    split,
+    /// Width and padding of the ascii_* / utf8_* pad functions.
+    pad,
+    /// Multiple and unit of floor_temporal / ceil_temporal / round_temporal.
+    round_temporal,
+    /// Week numbering of week.
+    week,
+    /// Value set of is_in / index_in.
+    set_lookup,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -128,6 +142,85 @@ pub const TrimOptions = struct {
     characters: []const u8,
 };
 
+/// Options of replace_substring (Arrow `ReplaceSubstringOptions`).
+pub const ReplaceSubstringOptions = struct {
+    /// Literal bytes to replace (no regex). Empty only with a `max_replacements` bound.
+    pattern: []const u8,
+    replacement: []const u8,
+    /// Replace at most this many matches per row from the left; null replaces all.
+    max_replacements: ?usize = null,
+};
+
+/// Options of split_pattern (Arrow `SplitPatternOptions`).
+pub const SplitPatternOptions = struct {
+    /// Literal separator; must not be empty.
+    pattern: []const u8,
+    /// Split at most this many times per row; null splits at every separator.
+    max_splits: ?usize = null,
+    /// Count `max_splits` from the end of the row.
+    reverse: bool = false,
+};
+
+/// Options of ascii_split_whitespace and utf8_split_whitespace (Arrow `SplitOptions`).
+pub const SplitOptions = struct {
+    max_splits: ?usize = null,
+    reverse: bool = false,
+};
+
+/// Options of ascii_lpad / rpad / center and utf8_lpad / rpad / center (Arrow `PadOptions`).
+pub const PadOptions = struct {
+    /// Output length in bytes (ascii_*) or code points (utf8_*); longer rows are kept as is.
+    width: usize,
+    /// One ASCII byte (ascii_*) or one code point (utf8_*).
+    padding: []const u8 = " ",
+    /// center with an odd amount of padding puts the extra character on the right.
+    lean_left_on_odd_padding: bool = true,
+};
+
+/// Rounding unit of the *_temporal functions (Arrow `CalendarUnit`).
+pub const CalendarUnit = enum { nanosecond, microsecond, millisecond, second, minute, hour, day, week, month, quarter, year };
+
+/// Options of floor_temporal, ceil_temporal and round_temporal (Arrow `RoundTemporalOptions`).
+pub const RoundTemporalOptions = struct {
+    /// Number of units to round to; must be > 0.
+    multiple: i64 = 1,
+    unit: CalendarUnit = .day,
+    /// Weeks start on Monday (true) or Sunday (false).
+    week_starts_monday: bool = true,
+    /// ceil_temporal of a value already on a boundary moves to the next boundary.
+    ceil_is_strictly_greater: bool = false,
+    /// Count multiples from the start of the next larger unit instead of from 1970-01-01.
+    calendar_based_origin: bool = false,
+};
+
+/// Options of week (Arrow `WeekOptions`; iso_week and us_week are fixed instances).
+pub const WeekOptions = struct {
+    week_starts_monday: bool = true,
+    /// Days before week 1 of their year are week 0 (instead of the last week of the previous year).
+    count_from_zero: bool = false,
+    /// Week 1 starts on the first week start day of the year (instead of holding its 4th day).
+    first_week_is_fully_in_year: bool = false,
+};
+
+/// How is_in / index_in treat nulls (Arrow `SetLookupOptions::NullMatchingBehavior`).
+pub const NullMatchingBehavior = enum {
+    /// A null input matches a null in the value set.
+    match,
+    /// A null input never matches (Arrow's `skip_nulls = true`).
+    skip,
+    /// A null input gives a null output.
+    emit_null,
+    /// Like emit_null; a value not found is also null when the value set holds a null.
+    inconclusive,
+};
+
+/// Options of is_in and index_in (Arrow `SetLookupOptions`). `value_set` is borrowed: an array or
+/// chunked array of the input's type, kept alive by the caller for the call.
+pub const SetLookupOptions = struct {
+    value_set: core.Datum,
+    null_matching_behavior: NullMatchingBehavior = .match,
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -148,6 +241,13 @@ pub const Options = union(OptionsTag) {
     slice: SliceOptions,
     join: JoinOptions,
     trim: TrimOptions,
+    replace_substring: ReplaceSubstringOptions,
+    split_pattern: SplitPatternOptions,
+    split: SplitOptions,
+    pad: PadOptions,
+    round_temporal: RoundTemporalOptions,
+    week: WeekOptions,
+    set_lookup: SetLookupOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {

@@ -296,10 +296,12 @@ fn kernelRegistry() *const zarrow.compute.FunctionRegistry {
 }
 
 /// add / less / sum / min_max (numeric), and_kleene / any (bool), less and string kernels
-/// (strings), temporal extraction (dates, timestamps), cast (numbers, strings, binaries, dates,
-/// timestamps, dictionaries), is_null and count (any type) on a decoded array that passed
+/// (strings), temporal extraction and rounding (dates, timestamps), cast (numbers, strings,
+/// binaries, dates, timestamps, dictionaries), is_null and count (any type), is_in and a group
+/// by (Grouper, hash_count_distinct, hash_sum) on every key type, on a decoded array that passed
 /// validateFull and on a slice of it: the call must succeed (or fail with an expected error such as
-/// InvalidCast) and an array output must validate with the input length.
+/// InvalidCast) and an array output must validate with the input length (one row per group for a
+/// grouped aggregate).
 fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
     var ctx = zarrow.compute.ExecContext.initWithConfig(gpa, kernelRegistry(), .{ .overflow_mode = .wrapping });
     for ([_]ArrayRef{ arr, sliced }) |a| {
@@ -327,6 +329,8 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "utf8_upper", .scalar, &.{d}, .none, len, &.{});
                 expectCall(&ctx, "utf8_slice_codeunits", .scalar, &.{d}, .{ .slice = .{ .start = -3, .stop = 1, .step = -1 } }, len, &.{});
                 expectCall(&ctx, "binary_join_element_wise", .scalar, &binary, .none, len, &.{});
+                expectCall(&ctx, "utf8_split_whitespace", .scalar, &.{d}, .none, len, &.{});
+                expectCall(&ctx, "replace_substring", .scalar, &.{d}, .{ .replace_substring = .{ .pattern = "a", .replacement = "\u{e9}\u{e9}" } }, len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .large_string = {} }, true), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .binary_view = {} }, true), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int32 = {} }, true), len, &.{error.InvalidCast});
@@ -338,6 +342,8 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 const tz_ok = [_]anyerror{error.NotImplemented};
                 expectCall(&ctx, "year", .scalar, &.{d}, .none, len, &tz_ok);
                 expectCall(&ctx, "iso_calendar", .scalar, &.{d}, .none, len, &tz_ok);
+                expectCall(&ctx, "floor_temporal", .scalar, &.{d}, .{ .round_temporal = .{ .multiple = 3, .unit = .week, .calendar_based_origin = true } }, len, &tz_ok);
+                expectCall(&ctx, "round_temporal", .scalar, &.{d}, .{ .round_temporal = .{ .multiple = 2, .unit = .month } }, len, &tz_ok);
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .timestamp = .{ .unit = .nanosecond, .timezone = null } }, true), len, &.{error.InvalidCast});
             },
@@ -352,6 +358,34 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
             },
             else => {},
         }
+        if (zarrow.compute.kernels.hash_aggregate.isKeyType(a.data().data_type)) {
+            expectCall(&ctx, "is_in", .scalar, &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = sliced } } }, len, &.{});
+            exerciseGroupBy(&ctx, a);
+        }
+    }
+}
+
+/// Group the rows of `a` by their own values: the group ids must validate with one row per input
+/// row, and the grouped aggregates must give one row per group.
+fn exerciseGroupBy(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const hash = zarrow.compute.kernels.hash_aggregate;
+    var grouper = hash.Grouper.init(ctx.allocator, &.{a.data().data_type}) catch |e| std.debug.panic("fuzz-invariant: Grouper.init failed: {s}", .{@errorName(e)});
+    defer grouper.deinit();
+    var ids = grouper.consume(&.{a}) catch |e| std.debug.panic("fuzz-invariant: Grouper.consume failed on a valid {s} array: {s}", .{ @tagName(a.data().data_type.id()), @errorName(e) });
+    defer ids.release();
+    expectValid("Grouper.consume", ids, a.data().length);
+    const groups = grouper.numGroups();
+    const keys = grouper.uniques() catch |e| std.debug.panic("fuzz-invariant: Grouper.uniques failed: {s}", .{@errorName(e)});
+    defer {
+        for (keys) |*k| k.release();
+        ctx.allocator.free(keys);
+    }
+    expectValid("Grouper.uniques", keys[0], groups);
+    const args = [_]zarrow.compute.Datum{ .{ .array = a }, .{ .array = ids } };
+    expectCall(ctx, "hash_count_distinct", .hash_aggregate, &args, .none, groups, &.{});
+    switch (a.data().data_type) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => expectCall(ctx, "hash_sum", .hash_aggregate, &args, .none, groups, &.{}),
+        else => {},
     }
 }
 

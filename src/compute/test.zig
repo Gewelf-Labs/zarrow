@@ -12,4 +12,8 @@ test {
     _ = @import("test_cast.zig");
     _ = @import("test_string.zig");
     _ = @import("test_temporal.zig");
+    _ = @import("test_string_transform.zig");
+    _ = @import("test_temporal_round.zig");
+    _ = @import("test_set_lookup.zig");
+    _ = @import("test_hash_aggregate.zig");
 }

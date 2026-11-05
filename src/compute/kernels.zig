@@ -11,6 +11,10 @@ pub const is_null = @import("is_null.zig");
 pub const cast = @import("cast.zig");
 pub const string = @import("string.zig");
 pub const temporal = @import("temporal.zig");
+pub const string_transform = @import("string_transform.zig");
+pub const temporal_round = @import("temporal_round.zig");
+pub const set_lookup = @import("set_lookup.zig");
+pub const hash_aggregate = @import("hash_aggregate.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -22,4 +26,8 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try cast.register(registry);
     try string.register(registry);
     try temporal.register(registry);
+    try string_transform.register(registry);
+    try temporal_round.register(registry);
+    try set_lookup.register(registry);
+    try hash_aggregate.register(registry);
 }
