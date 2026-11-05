@@ -189,6 +189,36 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     try timeKernel(io, &ctx, .scalar, "compute_utf8_upper_unicode", "utf8_upper", &.{.{ .array = words_unicode }}, cfg, emit_csv, meta);
     // int32 + int64: the int32 operand is cast to int64 first (Arrow's implicit cast).
     try timeKernel(io, &ctx, .scalar, "compute_add_promoted", "add_checked", &.{ .{ .array = a }, .{ .array = i64arr } }, cfg, emit_csv, meta);
+
+    // decimal128(18, 2) + decimal128(18, 2) -> decimal128(19, 2).
+    var dec_a = try buildDecimal(allocator, cfg.rows, 16);
+    defer dec_a.release();
+    var dec_b = try buildDecimal(allocator, cfg.rows, 17);
+    defer dec_b.release();
+    try timeKernel(io, &ctx, .scalar, "compute_decimal128_add", "add", &.{ .{ .array = dec_a }, .{ .array = dec_b } }, cfg, emit_csv, meta);
+    // string vs string_view: bytes compared in place, no cast.
+    var str_view = try ctx.invoke("cast", .scalar, &.{.{ .array = str_b }}, .{ .cast = .{ .to_type = .{ .string_view = {} } } });
+    defer str_view.release();
+    try timeKernel(io, &ctx, .scalar, "compute_cmp_mixed_string", "less", &.{ .{ .array = str_a }, str_view }, cfg, emit_csv, meta);
+    // hash_sum with explicit ScalarAggregateOptions over int64 values with 10% nulls (1000 groups).
+    var grouper = try compute.kernels.hash_aggregate.Grouper.init(allocator, &.{keys.data().data_type});
+    defer grouper.deinit();
+    var group_ids = try grouper.consume(&.{keys});
+    defer group_ids.release();
+    const skip_nulls = Options{ .scalar_aggregate = .{ .skip_nulls = true, .min_count = 1 } };
+    try timeKernelWith(io, &ctx, .hash_aggregate, "compute_hash_sum_skip_nulls", "hash_sum", &.{ .{ .array = i64arr }, .{ .array = group_ids } }, skip_nulls, cfg, emit_csv, meta);
+}
+
+/// decimal128(18, 2) values below 10^16 in magnitude, every tenth row null.
+fn buildDecimal(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    var b = try zarrow.Decimal128Builder(.{ .precision = 18, .scale = 2 }).init(allocator, rows);
+    defer b.deinit();
+    var x: u64 = seed;
+    for (0..rows) |i| {
+        x = x *% 6364136223846793005 +% 1442695040888963407;
+        if (i % 10 == 0) try b.appendNull() else try b.append(@as(i128, @as(i64, @bitCast(x >> 10))) >> 1);
+    }
+    return b.finish();
 }
 
 /// Utf8 rows of a lowercase word in a non-Latin or accented script and a number

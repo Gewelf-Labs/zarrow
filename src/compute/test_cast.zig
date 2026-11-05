@@ -365,7 +365,9 @@ test "cast errors: unsupported pairs, options, unparsable text, mismatched scala
     // int32 casts to date32 / time32 only (Arrow's zero-copy casts), not to date64.
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .date64 = {} })));
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .binary = {} })));
-    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .decimal128 = .{ .precision = 10, .scale = 2 } })));
+    // int32 to decimal needs `10 + scale` digits of precision (Arrow: "should be at least 12").
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &args, to(.{ .decimal128 = .{ .precision = 11, .scale = 2 } })));
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .scalar = Scalar.init(.{ .bool = {} }, .{ .bool = true }) }}, to(.{ .decimal128 = .{ .precision = 10, .scale = 2 } })));
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(dict_string)));
     const ordered = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 8, .signed = true }, .value_type = &int32_type, .ordered = true } };
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(ordered)));

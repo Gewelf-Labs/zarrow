@@ -66,6 +66,9 @@ EXPECTED_BENCHES = {
     "compute_hash_sum_int64",
     "compute_utf8_upper_unicode",
     "compute_add_promoted",
+    "compute_decimal128_add",
+    "compute_cmp_mixed_string",
+    "compute_hash_sum_skip_nulls",
 }
 
 
