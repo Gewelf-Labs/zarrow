@@ -20,12 +20,18 @@
 //!   target is checked for UTF-8 in both modes (Arrow C++ skips the check when unsafe). Offsets
 //!   past the 32-bit range are `Overflow`.
 //! - date32 <-> date64, timestamp unit changes, timestamp -> date32 / date64 (floored to the day),
-//!   date32 / date64 -> timestamp. Safe: losing a fraction (date64 to date32, a finer to a coarser
-//!   timestamp unit) or overflowing is `InvalidCast`; unsafe truncates toward zero and wraps.
-//!   A timezone change keeps the instants (values unchanged).
+//!   date32 / date64 -> timestamp, time32 / time64 unit changes, timestamp -> time32 / time64 (the
+//!   time of day), duration unit changes. Safe: losing a fraction (date64 to date32, a finer to a
+//!   coarser unit) or overflowing is `InvalidCast`; unsafe truncates toward zero and wraps. A
+//!   timezone change keeps the instants (values unchanged); a timestamp in a timezone other than
+//!   UTC to a date or time is `NotImplemented` (Arrow uses the local time, no timezone database).
+//! - int32 <-> date32 / time32 and int64 <-> date64 / timestamp / time64 / duration keep the
+//!   stored values (Arrow's zero-copy casts; other integer widths are not cast, as in Arrow).
 //! - dictionary to its value type (decoded with take), then on to any target above; a value
-//!   array to `dictionary<int32, value type>` through `dictionaryEncode` (the target's
-//!   `value_type` must outlive the result).
+//!   array to `dictionary<I, value type>` for every integer index type `I` through
+//!   `dictionaryEncode` (more distinct values than `I` holds is `InvalidCast`); a dictionary to a
+//!   dictionary of another index or value type (the values are cast first). The target's
+//!   `value_type` must outlive the result.
 //! - the null type to any type above (all rows null).
 //! Other pairs are `UnsupportedType`.
 const std = @import("std");
@@ -89,7 +95,7 @@ fn kindOf(dt: DataType) Kind {
         .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => .number,
         .string, .large_string, .string_view => .string,
         .binary, .large_binary, .binary_view => .binary,
-        .date32, .date64, .timestamp => .temporal,
+        .date32, .date64, .timestamp, .time32, .time64, .duration => .temporal,
         .dictionary => .dictionary,
         else => .other,
     };
@@ -106,15 +112,71 @@ fn castArray(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelE
     if (fk == .dictionary) {
         var decoded = try decode(ctx.allocator, arr);
         defer decoded.release();
+        if (tk == .dictionary) return encode(ctx, decoded, to, safe, true);
         return castArray(ctx, decoded, to, safe);
     }
-    if (tk == .dictionary) return encode(ctx, arr, to);
+    if (tk == .dictionary) return encode(ctx, arr, to, safe, false);
+    if (sameStorage(from, to)) return reinterpret(ctx, data, to);
     if ((fk == .number or fk == .boolean) and (tk == .number or tk == .boolean)) return numeric(ctx, data, to, safe);
     if ((fk == .number or fk == .boolean) and tk == .string) return toText(ctx, data, to);
     if (fk == .string and (tk == .number or tk == .boolean)) return fromText(ctx, arr, to);
     if ((fk == .string or fk == .binary) and (tk == .string or tk == .binary)) return bytesCast(ctx, arr, to);
-    if (fk == .temporal and tk == .temporal) return temporal(ctx, data, to, safe);
+    if (fk == .temporal and tk == .temporal) {
+        if (!temporalPair(from, to)) return error.UnsupportedType;
+        if (from == .timestamp and (to == .date32 or to == .date64 or to == .time32 or to == .time64)) {
+            if (from.timestamp.timezone) |tz| if (!@import("temporal.zig").isUtc(tz)) return error.NotImplemented;
+        }
+        return temporal(ctx, data, to, safe);
+    }
     return error.UnsupportedType;
+}
+
+/// int32 with date32 / time32, int64 with date64 / timestamp / time64 / duration (either way):
+/// the stored values are kept (Arrow's zero-copy casts).
+fn sameStorage(from: DataType, to: DataType) bool {
+    const S = struct {
+        fn width(dt: DataType) ?u8 {
+            return switch (dt) {
+                .date32, .time32 => 32,
+                .date64, .timestamp, .time64, .duration => 64,
+                else => null,
+            };
+        }
+    };
+    if (from == .int32 or from == .int64) {
+        const w = S.width(to) orelse return false;
+        return w == @as(u8, if (from == .int32) 32 else 64);
+    }
+    if (to == .int32 or to == .int64) {
+        const w = S.width(from) orelse return false;
+        return w == @as(u8, if (to == .int32) 32 else 64);
+    }
+    return false;
+}
+
+/// The array over the same buffers with type `to` (no copy).
+fn reinterpret(ctx: *ExecContext, data: *const ArrayData, to: DataType) KernelError!ArrayRef {
+    var layout = data.*;
+    layout.data_type = to;
+    return ArrayRef.fromBorrowed(ctx.allocator, layout) catch error.OutOfMemory;
+}
+
+/// The temporal pairs Arrow casts: dates and timestamps among themselves, times among
+/// themselves, a timestamp to a time, durations among themselves.
+fn temporalPair(from: DataType, to: DataType) bool {
+    const Group = enum { calendar, time, duration };
+    const S = struct {
+        fn group(dt: DataType) Group {
+            return switch (dt) {
+                .time32, .time64 => .time,
+                .duration => .duration,
+                else => .calendar,
+            };
+        }
+    };
+    const f = S.group(from);
+    const t = S.group(to);
+    return f == t or (from == .timestamp and t == .time);
 }
 
 // ------------------------------------------------------------------------------ dictionary
@@ -150,16 +212,60 @@ fn readIndices(comptime I: type, data: *const ArrayData, out: []?usize) KernelEr
     for (out, raw, 0..) |*o, x, i| o.* = if (data.isNull(i)) null else @intCast(x);
 }
 
-/// Dictionary-encode `arr` when the target is `dictionary<int32, type of arr>`.
-fn encode(ctx: *ExecContext, arr: ArrayRef, to: DataType) KernelError!ArrayRef {
+/// Dictionary-encode `arr` when the target is `dictionary<I, type of arr>` (or, with
+/// `cast_values`, of a type `arr` casts to first: the values of a dictionary input).
+fn encode(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool, cast_values: bool) KernelError!ArrayRef {
     const d = to.dictionary;
-    if (d.index_type.bit_width != 32 or !d.index_type.signed or d.ordered) return error.UnsupportedType;
-    if (!d.value_type.eql(arr.data().data_type)) return error.UnsupportedType;
-    return concat.dictionaryEncode(ctx.allocator, arr, d.value_type) catch |err| switch (err) {
+    if (d.ordered) return error.UnsupportedType;
+    switch (d.index_type.bit_width) {
+        8, 16, 32, 64 => {},
+        else => return error.UnsupportedType,
+    }
+    if (!d.value_type.eql(arr.data().data_type)) {
+        if (!cast_values) return error.UnsupportedType;
+        var values = try castArray(ctx, arr, d.value_type.*, safe);
+        defer values.release();
+        return encode(ctx, values, to, safe, false);
+    }
+    var encoded = concat.dictionaryEncode(ctx.allocator, arr, d.value_type) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.UnsupportedType => error.UnsupportedType,
         else => error.InvalidInput,
     };
+    if (d.index_type.bit_width == 32 and d.index_type.signed) return encoded;
+    defer encoded.release();
+    return switch (d.index_type.bit_width) {
+        inline 8, 16, 32, 64 => |w| if (d.index_type.signed) reindex(@Int(.signed, w), ctx, encoded, to) else reindex(@Int(.unsigned, w), ctx, encoded, to),
+        else => unreachable,
+    };
+}
+
+/// The int32-indexed dictionary array `encoded` with its indices stored as `I` (`InvalidCast`
+/// when an index does not fit, in both modes, as Arrow).
+fn reindex(comptime I: type, ctx: *ExecContext, encoded: ArrayRef, to: DataType) KernelError!ArrayRef {
+    const data = encoded.data();
+    // dictionaryEncode output: offset 0, a validity buffer and an int32 index buffer.
+    if (data.offset != 0 or data.buffers.len != 2) return error.InvalidInput;
+    const src = (data.typedBufferAt(1, i32) catch return error.InvalidInput)[0..data.length];
+    var buf = @import("../buffer.zig").OwnedBuffer.init(ctx.allocator, data.length * @sizeOf(I)) catch return error.OutOfMemory;
+    for (buf.typedSlice(I)[0..data.length], src, 0..) |*d, x, i| {
+        // Null rows hold 0 (dictionaryEncode), which every index type holds.
+        d.* = std.math.cast(I, x) orelse {
+            if (data.isNull(i)) continue;
+            buf.deinit();
+            return error.InvalidCast;
+        };
+    }
+    var shared = buf.toShared(data.length * @sizeOf(I)) catch {
+        buf.deinit();
+        return error.OutOfMemory;
+    };
+    defer shared.release();
+    var layout = data.*;
+    layout.data_type = to;
+    const bufs = [2]@import("../buffer.zig").SharedBuffer{ data.buffers[0], shared };
+    layout.buffers = &bufs;
+    return ArrayRef.fromBorrowed(ctx.allocator, layout) catch error.OutOfMemory;
 }
 
 // ------------------------------------------------------------------------------ numbers
@@ -540,16 +646,19 @@ fn copyBytes(ctx: *ExecContext, arr: ArrayRef, to: DataType) KernelError!ArrayRe
 
 /// Nanoseconds per stored unit (date32: a day, date64: a millisecond).
 fn tickNs(dt: DataType) i64 {
-    return switch (dt) {
-        .date32 => 86_400_000_000_000,
-        .date64 => 1_000_000,
-        .timestamp => |ts| switch (ts.unit) {
-            .second => 1_000_000_000,
-            .millisecond => 1_000_000,
-            .microsecond => 1_000,
-            .nanosecond => 1,
-        },
+    const unit = switch (dt) {
+        .date32 => return 86_400_000_000_000,
+        .date64 => return 1_000_000,
+        .timestamp => |ts| ts.unit,
+        .time32, .time64 => |t| t.unit,
+        .duration => |d| d.unit,
         else => unreachable,
+    };
+    return switch (unit) {
+        .second => 1_000_000_000,
+        .millisecond => 1_000_000,
+        .microsecond => 1_000,
+        .nanosecond => 1,
     };
 }
 
@@ -560,26 +669,29 @@ const Plan = struct {
     /// A remainder of `v / div` is a loss (safe mode fails).
     exact_div: bool = true,
     mul: i64 = 1,
+    /// Nonzero: first take `v mod day` (a timestamp to a time of day, in input ticks).
+    day: i64 = 0,
 };
 
 fn plan(from: DataType, to: DataType) Plan {
     const day_ns: i64 = 86_400_000_000_000;
     const f = tickNs(from);
-    if (from == .timestamp and to != .timestamp) {
+    if (from == .timestamp and (to == .date32 or to == .date64)) {
         // To a date: floor to the day (dropping the time of day is not a loss), then to ms for date64.
         return .{ .div = @divExact(day_ns, f), .floor = true, .exact_div = false, .mul = if (to == .date64) 86_400_000 else 1 };
     }
     const t = tickNs(to);
-    if (t > f) return .{ .div = @divExact(t, f), .floor = to == .date32 };
-    return .{ .mul = @divExact(f, t) };
+    const day: i64 = if (from == .timestamp and (to == .time32 or to == .time64)) @divExact(day_ns, f) else 0;
+    if (t > f) return .{ .div = @divExact(t, f), .floor = to == .date32, .day = day };
+    return .{ .mul = @divExact(f, t), .day = day };
 }
 
 fn temporal(ctx: *ExecContext, data: *const ArrayData, to: DataType, safe: bool) KernelError!ArrayRef {
     const p = plan(data.data_type, to);
-    return switch (data.data_type) {
-        .date32 => temporalRun(i32, i64, ctx, data, to, p, safe),
-        else => if (to == .date32) temporalRun(i64, i32, ctx, data, to, p, safe) else temporalRun(i64, i64, ctx, data, to, p, safe),
-    };
+    const from32 = data.data_type == .date32 or data.data_type == .time32;
+    const to32 = to == .date32 or to == .time32;
+    if (from32) return if (to32) temporalRun(i32, i32, ctx, data, to, p, safe) else temporalRun(i32, i64, ctx, data, to, p, safe);
+    return if (to32) temporalRun(i64, i32, ctx, data, to, p, safe) else temporalRun(i64, i64, ctx, data, to, p, safe);
 }
 
 fn temporalRun(comptime F: type, comptime T: type, ctx: *ExecContext, data: *const ArrayData, to: DataType, p: Plan, safe: bool) KernelError!ArrayRef {
@@ -587,7 +699,7 @@ fn temporalRun(comptime F: type, comptime T: type, ctx: *ExecContext, data: *con
     var out = try dense.DenseBinaryOutput(T).initValidity(ctx.allocator, data.length, data, null, to);
     errdefer out.deinit();
     for (out.values(), src, 0..) |*d, x, i| {
-        const v: i64 = x;
+        const v: i64 = if (p.day != 0) @mod(@as(i64, x), p.day) else x;
         var lost = false;
         var q = v;
         if (p.div != 1) {

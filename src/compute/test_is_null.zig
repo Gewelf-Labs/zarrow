@@ -178,3 +178,74 @@ test "is_null family errors: unions and run-end encoded inputs, arity and option
     try std.testing.expectError(error.InvalidArity, ctx.invokeScalar("is_valid", &.{ .{ .array = a }, .{ .array = a } }, none));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_valid", &.{.{ .array = a }}, .{ .cast = .{} }));
 }
+
+test "is_nan, is_finite, is_inf and is_null with nan_is_null on floats, integers, decimals and the null type (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const inf = std.math.inf(f64);
+    // pyarrow 26 results.
+    var f = try common.makeArray(f64, allocator, &.{ 1.0, std.math.nan(f64), inf, -inf, null, -0.0 });
+    defer f.release();
+    const fa = [_]Datum{.{ .array = f }};
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &fa, &.{ false, true, false, false, null, false });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_finite", &fa, &.{ true, false, false, false, null, true });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_inf", &fa, &.{ false, false, true, true, null, false });
+    // Sliced float32.
+    var g_full = try common.makeArray(f32, allocator, &.{ 0, 0, std.math.nan(f32), 2, -std.math.inf(f32) });
+    defer g_full.release();
+    var g = try g_full.slice(2, 3);
+    defer g.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .array = g }}, &.{ true, false, false });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_inf", &.{.{ .array = g }}, &.{ false, false, true });
+    // Integers: finite, never NaN or infinite; nulls stay null.
+    var ints = try common.makeArray(i32, allocator, &.{ 1, null, std.math.minInt(i32) });
+    defer ints.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_finite", &.{.{ .array = ints }}, &.{ true, null, true });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .array = ints }}, &.{ false, null, false });
+    // Decimals likewise; the null type gives nulls.
+    const dec = DataType{ .decimal128 = .{ .precision = 5, .scale = 1 } };
+    const dvals = [_]i128{ 15, 0 };
+    const dbufs = [_]common.SharedBuffer{ .empty, .fromSlice(std.mem.sliceAsBytes(&dvals)) };
+    var d = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dec, .length = 2, .null_count = 0, .buffers = &dbufs });
+    defer d.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_inf", &.{.{ .array = d }}, &.{ false, false });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_finite", &.{.{ .array = d }}, &.{ true, true });
+    var nb = try common.array_mod.NullBuilder.init(allocator, 2);
+    defer nb.deinit();
+    try nb.appendNulls(2);
+    var null_arr = try nb.finish();
+    defer null_arr.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .array = null_arr }}, &.{ null, null });
+    // Scalars and chunked input.
+    try common.expectInvoke(bool, &ctx, .scalar, "is_inf", &.{.{ .scalar = common.scalarOf(f32, std.math.inf(f32)) }}, &.{true});
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .scalar = common.scalarOf(f64, null) }}, &.{null});
+    var cf = try common.chunkedAt(allocator, f, &.{ 2, 5 });
+    defer cf.release();
+    var out = try ctx.invokeScalar("is_finite", &.{.{ .chunked = cf }}, none);
+    defer out.release();
+    try std.testing.expectEqual(@as(usize, 3), out.chunked.numChunks());
+    const rows = try common.collect(bool, allocator, out);
+    defer allocator.free(rows);
+    try common.expectRows(bool, &.{ true, false, false, false, null, true }, rows);
+
+    // is_null: a NaN is null only with nan_is_null; other types ignore the option.
+    const nan_null = common.Options{ .null_options = .{ .nan_is_null = true } };
+    var h = try common.makeArray(f64, allocator, &.{ 1.0, std.math.nan(f64), null });
+    defer h.release();
+    try common.expectInvokeWith(bool, &ctx, "is_null", &.{.{ .array = h }}, nan_null, &.{ false, true, true });
+    try common.expectInvokeWith(bool, &ctx, "is_null", &.{.{ .array = h }}, .{ .null_options = .{} }, &.{ false, false, true });
+    try common.expectInvokeWith(bool, &ctx, "is_null", &.{.{ .array = ints }}, nan_null, &.{ false, true, false });
+    try common.expectInvokeWith(bool, &ctx, "is_null", &.{.{ .scalar = common.scalarOf(f32, std.math.nan(f32)) }}, nan_null, &.{true});
+    var hc = try common.chunkedAt(allocator, h, &.{1});
+    defer hc.release();
+    try common.expectInvokeWith(bool, &ctx, "is_null", &.{.{ .chunked = hc }}, nan_null, &.{ false, true, true });
+
+    // Errors: bool has no kernel (as in Arrow); options are checked.
+    var flags = try common.makeArray(bool, allocator, &.{true});
+    defer flags.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("is_nan", &.{.{ .array = flags }}, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_nan", &fa, nan_null));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_valid", &fa, nan_null));
+}

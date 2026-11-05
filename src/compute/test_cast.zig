@@ -362,12 +362,13 @@ test "cast errors: unsupported pairs, options, unparsable text, mismatched scala
     var i = try common.makeArray(i32, allocator, &.{1});
     defer i.release();
     const args = [_]Datum{.{ .array = i }};
-    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(date32)));
+    // int32 casts to date32 / time32 only (Arrow's zero-copy casts), not to date64.
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .date64 = {} })));
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .binary = {} })));
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(.{ .decimal128 = .{ .precision = 10, .scale = 2 } })));
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(dict_string)));
-    const dict8 = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 8, .signed = true }, .value_type = &int32_type } };
-    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(dict8)));
+    const ordered = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 8, .signed = true }, .value_type = &int32_type, .ordered = true } };
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &args, to(ordered)));
     var bin = try common.makeStrings(.binary, allocator, &.{"1"});
     defer bin.release();
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = bin }}, to(int32_type)));
@@ -400,4 +401,123 @@ test "cast errors: unsupported pairs, options, unparsable text, mismatched scala
     var malformed = try ArrayRef.fromBorrowed(allocator, .{ .data_type = int32_type, .length = 2, .null_count = 0, .buffers = &bufs });
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("cast", &.{.{ .array = malformed }}, to(.{ .int64 = {} })));
+}
+
+const large_string_type = DataType{ .large_string = {} };
+const int64_type = DataType{ .int64 = {} };
+
+fn dictOf(comptime bits: u16, comptime signed: bool, value: *const DataType) DataType {
+    return .{ .dictionary = .{ .index_type = .{ .bit_width = bits, .signed = signed }, .value_type = value } };
+}
+
+test "cast times, durations, timestamp to time of day, integer reinterpretation and dictionary index widths (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const t32s = DataType{ .time32 = .{ .unit = .second } };
+    const t32ms = DataType{ .time32 = .{ .unit = .millisecond } };
+    const t64us = DataType{ .time64 = .{ .unit = .microsecond } };
+    const t64ns = DataType{ .time64 = .{ .unit = .nanosecond } };
+    const dur_s = DataType{ .duration = .{ .unit = .second } };
+    const dur_ms = DataType{ .duration = .{ .unit = .millisecond } };
+
+    // Time units (pyarrow 26): a coarser unit that drops a fraction fails when safe, truncates when not.
+    var tu = try common.makeTyped(i64, t64us, allocator, &.{ 1500, -1, null });
+    defer tu.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = tu }}, to(t32ms)));
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = tu }}, unsafeTo(t32ms), &.{ 1, 0, null });
+    var tm = try common.makeTyped(i32, t32ms, allocator, &.{1500});
+    defer tm.release();
+    try common.expectInvokeWith(i64, &ctx, "cast", &.{.{ .array = tm }}, to(t64ns), &.{1500000000});
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = tm }}, unsafeTo(t32s), &.{1});
+
+    // A timestamp to its time of day (floored to the day first).
+    var ts = try common.makeTyped(i64, ts_ms, allocator, &.{ 90061001, -1 });
+    defer ts.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = ts }}, to(t32s)));
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = ts }}, unsafeTo(t32s), &.{ 3661, 86399 });
+    var ts_whole = try common.makeTyped(i64, ts_ms, allocator, &.{ 90061000, -1000 });
+    defer ts_whole.release();
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = ts_whole }}, to(t32s), &.{ 3661, 86399 });
+    try common.expectInvokeWith(i64, &ctx, "cast", &.{.{ .array = ts }}, to(t64us), &.{ 3661001000, 86399999000 });
+    // A timezone other than UTC needs local time: not implemented; UTC works.
+    var ny = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .second, .timezone = "America/New_York" } }, allocator, &.{0});
+    defer ny.release();
+    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("cast", &.{.{ .array = ny }}, to(t32s)));
+    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("cast", &.{.{ .array = ny }}, to(date32)));
+    var utc = try common.makeTyped(i64, ts_s_utc, allocator, &.{86401});
+    defer utc.release();
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = utc }}, to(t32s), &.{1});
+
+    // Durations: loss and overflow fail when safe; unsafe truncates and wraps.
+    var dm = try common.makeTyped(i64, dur_ms, allocator, &.{ 1500, -2 });
+    defer dm.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = dm }}, to(dur_s)));
+    try common.expectInvokeWith(i64, &ctx, "cast", &.{.{ .array = dm }}, unsafeTo(dur_s), &.{ 1, 0 });
+    var dbig = try common.makeTyped(i64, dur_s, allocator, &.{1 << 62});
+    defer dbig.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = dbig }}, to(dur_ms)));
+    try common.expectInvokeWith(i64, &ctx, "cast", &.{.{ .array = dbig }}, unsafeTo(dur_ms), &.{0});
+
+    // Same-width integers keep the stored values, both ways (the buffers are shared).
+    var i32s = try common.makeArray(i32, allocator, &.{ 90000, null, -1 });
+    defer i32s.release();
+    var as_time = try ctx.invokeScalar("cast", &.{.{ .array = i32s }}, to(t32s));
+    defer as_time.release();
+    try std.testing.expect(as_time.array.data().data_type.eql(t32s));
+    try std.testing.expectEqual(i32s.data().buffers[1].data.ptr, as_time.array.data().buffers[1].data.ptr);
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{as_time}, to(int32_type), &.{ 90000, null, -1 });
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = i32s }}, to(date32), &.{ 90000, null, -1 });
+    var i64s = try common.makeArray(i64, allocator, &.{ 5, null });
+    defer i64s.release();
+    inline for (.{ ts_ns, date64, t64ns, dur_ms }) |dt| {
+        var cast_out = try ctx.invokeScalar("cast", &.{.{ .array = i64s }}, to(dt));
+        defer cast_out.release();
+        try std.testing.expect(cast_out.array.data().data_type.eql(dt));
+        try common.expectInvokeWith(i64, &ctx, "cast", &.{cast_out}, to(int64_type), &.{ 5, null });
+    }
+    // Pairs Arrow does not cast.
+    for ([_]struct { from: ArrayRef, to: DataType }{
+        .{ .from = i64s, .to = date32 },
+        .{ .from = i64s, .to = t32s },
+        .{ .from = i32s, .to = ts_s },
+        .{ .from = tm, .to = ts_ms },
+        .{ .from = dm, .to = t64us },
+        .{ .from = tm, .to = int64_type },
+    }) |c| try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = c.from }}, to(c.to)));
+    var d32 = try common.makeTyped(i32, date32, allocator, &.{1});
+    defer d32.release();
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = d32 }}, to(t32s)));
+
+    // Dictionary targets of every index width; too many values for the width fail.
+    var s = try common.makeStrings(.string, allocator, &.{ "a", "b", null, "a" });
+    defer s.release();
+    inline for (.{ dictOf(8, true, &string_type), dictOf(16, false, &string_type), dictOf(64, true, &string_type), dictOf(8, false, &string_type) }) |dt| {
+        var enc = try ctx.invokeScalar("cast", &.{.{ .array = s }}, to(dt));
+        defer enc.release();
+        try enc.array.data().validateFull();
+        try std.testing.expect(enc.array.data().data_type.eql(dt));
+        try common.expectInvokeStrings(&ctx, "cast", &.{enc}, to(string_type), &.{ "a", "b", null, "a" });
+    }
+    var many_rows: [300]?[]const u8 = undefined;
+    var names: [300][4]u8 = undefined;
+    for (&many_rows, &names, 0..) |*r, *n, k| r.* = std.fmt.bufPrint(n, "{d}", .{k}) catch unreachable;
+    var many = try common.makeStrings(.string, allocator, &many_rows);
+    defer many.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = many }}, to(dictOf(8, true, &string_type))));
+    var wide_enough = try ctx.invokeScalar("cast", &.{.{ .array = many }}, to(dictOf(16, true, &string_type)));
+    wide_enough.release();
+    // A dictionary to another index and value type: the values are cast first (pyarrow 26).
+    var dict = try ctx.invokeScalar("cast", &.{.{ .array = s }}, to(dict_string));
+    defer dict.release();
+    const target = dictOf(64, true, &large_string_type);
+    var redone = try ctx.invokeScalar("cast", &.{dict}, to(target));
+    defer redone.release();
+    try std.testing.expect(redone.array.data().data_type.eql(target));
+    try common.expectInvokeStrings(&ctx, "cast", &.{redone}, to(large_string_type), &.{ "a", "b", null, "a" });
+    // A plain array to a dictionary of another value type is not cast (Arrow: unsupported).
+    var ints = try common.makeArray(i32, allocator, &.{ 1, 2 });
+    defer ints.release();
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = ints }}, to(dictOf(16, true, &int64_type))));
 }

@@ -6,7 +6,7 @@ const Datum = common.Datum;
 const ExecContext = common.ExecContext;
 const none = common.none;
 
-const binary_ops = [_][]const u8{ "and", "or", "xor", "and_not", "and_kleene", "or_kleene" };
+const binary_ops = [_][]const u8{ "and", "or", "xor", "and_not", "and_kleene", "or_kleene", "and_not_kleene" };
 
 /// Per-element reference: null intersection, or Kleene logic for the `_kleene` functions.
 fn reference(comptime op: []const u8, x: ?bool, y: ?bool) ?bool {
@@ -16,6 +16,7 @@ fn reference(comptime op: []const u8, x: ?bool, y: ?bool) ?bool {
         if (x == null or y == null) return null;
         return true;
     }
+    if (comptime eq(u8, op, "and_not_kleene")) return reference("and_kleene", x, if (y) |v| !v else null);
     if (comptime eq(u8, op, "or_kleene")) {
         if (x == true or y == true) return true;
         if (x == null or y == null) return null;
@@ -57,6 +58,7 @@ test "logical hand-written truth tables including Kleene logic (Arrow C++ result
     try common.expectInvoke(bool, &ctx, .scalar, "and_not", &ab, &.{ false, true, null, false, false, null, null, null, null });
     try common.expectInvoke(bool, &ctx, .scalar, "and_kleene", &ab, &.{ true, false, null, false, false, false, null, false, null });
     try common.expectInvoke(bool, &ctx, .scalar, "or_kleene", &ab, &.{ true, true, true, true, false, null, true, null, null });
+    try common.expectInvoke(bool, &ctx, .scalar, "and_not_kleene", &ab, &.{ false, true, null, false, false, false, false, null, null });
     try common.expectInvoke(bool, &ctx, .scalar, "invert", &.{.{ .array = a }}, &.{ false, false, false, true, true, true, null, null, null });
 }
 

@@ -1,6 +1,7 @@
 //! Logical kernels on bool operands (Arrow C++ "Logical functions"): and, or, xor, and_not and
-//! invert propagate nulls (intersection); and_kleene and or_kleene use Kleene three-valued logic
-//! (`false and null` is false, `true or null` is true, otherwise a null operand gives null).
+//! invert propagate nulls (intersection); and_kleene, or_kleene and and_not_kleene (`a and not
+//! b`) use Kleene three-valued logic (`false and null` is false, `true or null` is true,
+//! `null and not true` is false, otherwise a null operand gives null).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
@@ -17,10 +18,10 @@ const Options = core.Options;
 const Bits = dense.Bits;
 const OwnedBuffer = @import("../buffer.zig").OwnedBuffer;
 
-const Op = enum { @"and", @"or", xor, and_not, invert, and_kleene, or_kleene };
+const Op = enum { @"and", @"or", xor, and_not, invert, and_kleene, or_kleene, and_not_kleene };
 const bool_type = DataType{ .bool = {} };
 
-/// Register and, or, xor, and_not, invert, and_kleene and or_kleene.
+/// Register and, or, xor, and_not, invert, and_kleene, or_kleene and and_not_kleene.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     inline for (comptime std.meta.tags(Op)) |op| {
         const arity: usize = if (op == .invert) 1 else 2;
@@ -37,7 +38,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
 }
 
 fn Logical(comptime op: Op) type {
-    const kleene = op == .and_kleene or op == .or_kleene;
+    const kleene = op == .and_kleene or op == .or_kleene or op == .and_not_kleene;
     return struct {
         /// Apply the logical operation element-wise (array, chunked or scalar operands).
         fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
@@ -63,7 +64,7 @@ fn Logical(comptime op: Op) type {
                 .@"and", .and_kleene => in[0] & in[1],
                 .@"or", .or_kleene => in[0] | in[1],
                 .xor => in[0] ^ in[1],
-                .and_not => in[0] & ~in[1],
+                .and_not, .and_not_kleene => in[0] & ~in[1],
                 .invert => ~in[0],
             };
         }
@@ -74,10 +75,12 @@ fn Logical(comptime op: Op) type {
             const va = in[1];
             const b = in[2];
             const vb = in[3];
-            return if (op == .and_kleene)
-                (va & vb) | (va & ~a) | (vb & ~b)
-            else
-                (va & vb) | (va & a) | (vb & b);
+            return switch (op) {
+                .and_kleene => (va & vb) | (va & ~a) | (vb & ~b),
+                // a and not b: a false or b true decides alone.
+                .and_not_kleene => (va & vb) | (va & ~a) | (vb & b),
+                else => (va & vb) | (va & a) | (vb & b),
+            };
         }
 
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {

@@ -1,11 +1,14 @@
 //! Temporal component extraction (Arrow C++ "Temporal component extraction"): year, month, day,
-//! day_of_week, day_of_year, iso_year, iso_week, us_week, week, iso_calendar, year_month_day,
-//! quarter and is_leap_year on date32, date64 and timestamp; hour, minute, second, millisecond,
-//! microsecond and nanosecond on date64 and timestamp; subsecond on timestamp. Results are int64
+//! day_of_week, day_of_year, iso_year, iso_week, us_week, us_year, week, iso_calendar,
+//! year_month_day, quarter and is_leap_year on date32, date64 and timestamp; hour, minute, second,
+//! millisecond, microsecond and nanosecond on date64, timestamp, time32 and time64; subsecond on
+//! timestamp, time32 and time64 (a time is read like a timestamp of its unit, days dropped: a
+//! value past one day or below zero wraps, as in Arrow). Results are int64
 //! (is_leap_year: bool; subsecond: float64; iso_calendar: struct of int64 `iso_year`, `iso_week`,
 //! `iso_day_of_week`; year_month_day: struct of int64 `year`, `month`, `day`); null handling is
 //! intersection. week takes `WeekOptions` (Arrow defaults when `none`); us_week is week with
-//! Sunday-based weeks whose week 1 holds the year's 4th day (Arrow's `WeekOptions::USWeek()`).
+//! Sunday-based weeks whose week 1 holds the year's 4th day (Arrow's `WeekOptions::USWeek()`), and
+//! us_year the year that week belongs to.
 //!
 //! Dates follow the proleptic Gregorian calendar over the whole input range (days are floored, so
 //! instants before 1970 land on the right day). Timestamps without a timezone and with a UTC
@@ -34,7 +37,7 @@ const Options = core.Options;
 const TypeTag = std.meta.Tag(DataType);
 
 /// The extraction functions, by Arrow C++ name.
-pub const Field = enum { year, month, day, day_of_week, day_of_year, hour, minute, second, millisecond, microsecond, nanosecond, iso_year, iso_week, iso_calendar, quarter, is_leap_year, week, us_week, subsecond, year_month_day };
+pub const Field = enum { year, month, day, day_of_week, day_of_year, hour, minute, second, millisecond, microsecond, nanosecond, iso_year, iso_week, iso_calendar, quarter, is_leap_year, week, us_week, subsecond, year_month_day, us_year };
 
 const int64_type = DataType{ .int64 = {} };
 const bool_type = DataType{ .bool = {} };
@@ -77,12 +80,15 @@ const us_week_options = WeekOptions{ .week_starts_monday = false, .count_from_ze
 /// Options read by the extraction loop.
 const Opts = struct { dow: DayOfWeekOptions = .{}, week: WeekOptions = .{} };
 
-/// Register every extraction function for date32 (date parts only), date64 and timestamp.
+/// Register every extraction function for date32 (date parts only), date64, timestamp and time32 /
+/// time64 (time parts only).
 pub fn register(registry: *FunctionRegistry) KernelError!void {
+    @setEvalBranchQuota(10_000);
     inline for (comptime std.meta.tags(Field)) |f| {
-        inline for (.{ TypeTag.date32, TypeTag.date64, TypeTag.timestamp }) |tag| {
-            // Arrow registers subsecond for timestamps (and times), not for date64.
-            if (!(isTimePart(f) and tag == .date32) and !(f == .subsecond and tag == .date64)) try registry.registerScalarKernel(@tagName(f), .{
+        inline for (.{ TypeTag.date32, TypeTag.date64, TypeTag.timestamp, TypeTag.time32, TypeTag.time64 }) |tag| {
+            const time = tag == .time32 or tag == .time64;
+            // Arrow registers subsecond for timestamps and times, not for date64.
+            if (!(isTimePart(f) and tag == .date32) and !(f == .subsecond and tag == .date64) and !(time and !isTimePart(f))) try registry.registerScalarKernel(@tagName(f), .{
                 .signature = .{
                     .arity = 1,
                     .type_check = dense.argsOfType(tag, 1),
@@ -147,6 +153,16 @@ fn Extract(comptime f: Field) type {
                     .millisecond => run(i64, 86_400_000, 1_000_000, ctx, data, len, dow),
                     .microsecond => run(i64, 86_400_000_000, 1_000, ctx, data, len, dow),
                     .nanosecond => run(i64, 86_400_000_000_000, 1, ctx, data, len, dow),
+                },
+                .time32 => |t| switch (t.unit) {
+                    .second => run(i32, 86_400, 1_000_000_000, ctx, data, len, dow),
+                    .millisecond => run(i32, 86_400_000, 1_000_000, ctx, data, len, dow),
+                    else => error.InvalidInput,
+                },
+                .time64 => |t| switch (t.unit) {
+                    .microsecond => run(i64, 86_400_000_000, 1_000, ctx, data, len, dow),
+                    .nanosecond => run(i64, 86_400_000_000_000, 1, ctx, data, len, dow),
+                    else => error.InvalidInput,
                 },
                 else => error.UnsupportedType,
             };
@@ -281,6 +297,8 @@ fn Extract(comptime f: Field) type {
                 .iso_year => isoWeekWith(civ, days).year,
                 .iso_week => isoWeekWith(civ, days).week,
                 .week, .us_week => weekWith(civ, days, opts.week),
+                // The year of the Wednesday of the Sunday-based week (its 4th day).
+                .us_year => civ(days - @mod(days + 4, 7) + 3).year,
                 else => unreachable,
             };
         }

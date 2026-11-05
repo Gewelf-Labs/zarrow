@@ -1,10 +1,18 @@
 //! String transforms that change lengths or split rows (Arrow C++ "String transforms", "String
 //! padding", "String splitting", "String slicing", "Containment tests"): replace_substring,
 //! split_pattern, ascii_split_whitespace, utf8_split_whitespace, ascii_lpad / rpad / center,
-//! utf8_lpad / rpad / center, count_substring, find_substring, binary_slice, binary_repeat and
-//! binary_reverse. A string output keeps the input layout; a split gives `list<T>` of the input
-//! layout `T`; counts and positions are int32 (int64 for the large layouts). Null handling is
-//! intersection.
+//! utf8_lpad / rpad / center, utf8_zero_fill, count_substring, find_substring, binary_slice,
+//! binary_repeat, binary_reverse, utf8_replace_slice, binary_replace_slice and binary_join. A
+//! string output keeps the input layout; a split gives `list<T>` of the input layout `T`; counts
+//! and positions are int32 (int64 for the large layouts). Null handling is intersection
+//! (binary_join: a null list, a null separator or a null list item gives a null row, as in Arrow).
+//!
+//! utf8_replace_slice / binary_replace_slice (`ReplaceSliceOptions`) replace the code points /
+//! bytes `[start, stop)`: a negative position counts from the end, both are clamped to the row and
+//! a stop before the start inserts at the start (Arrow C++). utf8_zero_fill (`ZeroFillOptions`)
+//! left-pads to `width` code points with one padding code point, after a leading `+` or `-`.
+//! binary_join joins the items of a `list<T>` / `large_list<T>` row (T string, large_string,
+//! binary or large_binary) with a separator of type T (array or scalar).
 //!
 //! Scope against Arrow C++: patterns are literal (no regex); `ignore_case` folds ASCII letters
 //! only (Arrow folds through RE2). For a string layout, the pattern, replacement and padding of an
@@ -23,6 +31,7 @@ const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const string = @import("string.zig");
 
+const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
 const DataType = core.DataType;
 const Datum = core.Datum;
@@ -41,6 +50,7 @@ const all_tags = string_tags ++ binary_tags;
 
 /// Pad functions, by Arrow name.
 const Pad = enum { ascii_lpad, ascii_rpad, ascii_center, utf8_lpad, utf8_rpad, utf8_center };
+const offset_tags = [_]TypeTag{ .string, .large_string, .binary, .large_binary };
 
 /// Register every function of the family for the layouts it supports.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
@@ -56,13 +66,26 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         });
     }
     inline for (string_tags) |tag| {
+        try registry.registerScalarKernel("utf8_replace_slice", unary(tag, replaceSliceOptions(true), sameType(tag), Transform(.replace_slice_utf8).exec));
+        try registry.registerScalarKernel("utf8_zero_fill", unary(tag, zeroFillOptions, sameType(tag), Transform(.zero_fill).exec));
         try registry.registerScalarKernel("ascii_split_whitespace", unary(tag, splitOptions, dense.resultTypeOf(listOf(tag)), Splitter(.ascii_whitespace).exec));
         try registry.registerScalarKernel("utf8_split_whitespace", unary(tag, splitOptions, dense.resultTypeOf(listOf(tag)), Splitter(.utf8_whitespace).exec));
         inline for (comptime std.meta.tags(Pad)) |p| {
             try registry.registerScalarKernel(@tagName(p), unary(tag, padOptions(p), sameType(tag), Transform(.{ .pad = p }).exec));
         }
     }
+    // binary_join: list<T> / large_list<T> with a T separator.
+    inline for (offset_tags) |tag| {
+        inline for (.{ TypeTag.list, TypeTag.large_list }) |list_tag| {
+            try registry.registerScalarKernel("binary_join", .{
+                .signature = .{ .arity = 2, .type_check = joinArgs(list_tag, tag), .options_check = dense.noOptions, .result_type_fn = sameType(tag) },
+                .exec = joinList,
+            });
+        }
+    }
     inline for (binary_tags) |tag| {
+        // Byte positions could split a code point, so the string layouts are not registered.
+        try registry.registerScalarKernel("binary_replace_slice", unary(tag, replaceSliceOptions(false), sameType(tag), Transform(.replace_slice_bytes).exec));
         try registry.registerScalarKernel("binary_slice", unary(tag, sliceOptions, sameType(tag), Transform(.slice).exec));
         try registry.registerScalarKernel("binary_reverse", unary(tag, dense.noOptions, sameType(tag), Transform(.reverse).exec));
     }
@@ -150,6 +173,38 @@ fn sliceOptions(options: Options) bool {
     return options == .slice and options.slice.step != 0;
 }
 
+fn replaceSliceOptions(comptime text: bool) core.OptionsCheckFn {
+    return &struct {
+        /// A UTF-8 replacement for text, so a valid row stays valid.
+        fn check(options: Options) bool {
+            return options == .replace_slice and (!text or std.unicode.utf8ValidateSlice(options.replace_slice.replacement));
+        }
+    }.check;
+}
+
+/// One code point of padding and a width that fits an offset.
+fn zeroFillOptions(options: Options) bool {
+    if (options != .zero_fill) return false;
+    const o = options.zero_fill;
+    if (o.width > max_width or o.padding.len == 0) return false;
+    const n = std.unicode.utf8ByteSequenceLength(o.padding[0]) catch return false;
+    return n == o.padding.len and std.unicode.utf8ValidateSlice(o.padding);
+}
+
+/// `list_tag` of `tag` items, then a `tag` separator.
+fn joinArgs(comptime list_tag: TypeTag, comptime tag: TypeTag) core.TypeCheckFn {
+    return &struct {
+        fn check(args: []const Datum) bool {
+            if (args.len != 2 or std.meta.activeTag(args[0].dataType()) != list_tag or std.meta.activeTag(args[1].dataType()) != tag) return false;
+            const item = switch (args[0].dataType()) {
+                .list, .large_list => |l| l.value_field.data_type.*,
+                else => return false,
+            };
+            return std.meta.activeTag(item) == tag;
+        }
+    }.check;
+}
+
 /// Widths past `maxInt(i32)` cannot be stored in a 32-bit offset layout and are rejected for all.
 const max_width: usize = std.math.maxInt(i32);
 
@@ -199,7 +254,7 @@ fn mapRows(ctx: *ExecContext, value: ExecChunkValue, len: usize, out_type: DataT
 
 // ------------------------------------------------------------------------------ transforms
 
-const TransformKind = union(enum) { replace, slice, reverse, pad: Pad };
+const TransformKind = union(enum) { replace, slice, reverse, pad: Pad, replace_slice_utf8, replace_slice_bytes, zero_fill };
 
 fn Transform(comptime kind: TransformKind) type {
     return struct {
@@ -211,6 +266,7 @@ fn Transform(comptime kind: TransformKind) type {
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
             const utf8 = comptime switch (kind) {
                 .pad => |p| !isAsciiPad(p),
+                .replace_slice_utf8, .zero_fill => true,
                 else => false,
             };
             if (kind == .replace) if (try replaceWindow(ctx, values[0], len, options.replace_substring)) |arr| return arr;
@@ -262,6 +318,44 @@ fn Transform(comptime kind: TransformKind) type {
                     for (src, 0..) |c, k| dst[src.len - 1 - k] = c;
                     try out.commit(src.len);
                 },
+                .replace_slice_utf8, .replace_slice_bytes => {
+                    const o = &s.options.replace_slice;
+                    // Positions in code points (utf8) or bytes, mapped to byte offsets.
+                    var n: usize = src.len;
+                    if (kind == .replace_slice_utf8) {
+                        s.scratch.clearRetainingCapacity();
+                        var i: usize = 0;
+                        while (i < src.len) : (i += string.cpLen(src[i])) s.scratch.append(s.allocator, i) catch return error.OutOfMemory;
+                        s.scratch.append(s.allocator, src.len) catch return error.OutOfMemory;
+                        n = s.scratch.items.len - 1;
+                    }
+                    const begin = clampPosition(o.start, n);
+                    const end = @max(begin, clampPosition(o.stop, n));
+                    const lo = if (kind == .replace_slice_utf8) s.scratch.items[begin] else begin;
+                    const hi = if (kind == .replace_slice_utf8) s.scratch.items[end] else end;
+                    const size = std.math.add(usize, lo + (src.len - hi), o.replacement.len) catch return error.Overflow;
+                    const dst = try out.reserve(size);
+                    @memcpy(dst[0..lo], src[0..lo]);
+                    @memcpy(dst[lo..][0..o.replacement.len], o.replacement);
+                    @memcpy(dst[lo + o.replacement.len ..][0 .. src.len - hi], src[hi..]);
+                    try out.commit(size);
+                },
+                .zero_fill => {
+                    const o = &s.options.zero_fill;
+                    const n = std.unicode.utf8CountCodepoints(src) catch unreachable;
+                    const total = o.width -| n;
+                    const sign: usize = if (src.len > 0 and (src[0] == '+' or src[0] == '-')) 1 else 0;
+                    const size = src.len + total * o.padding.len;
+                    const dst = try out.reserve(size);
+                    @memcpy(dst[0..sign], src[0..sign]);
+                    var w: usize = sign;
+                    for (0..total) |_| {
+                        @memcpy(dst[w..][0..o.padding.len], o.padding);
+                        w += o.padding.len;
+                    }
+                    @memcpy(dst[w..][0 .. src.len - sign], src[sign..]);
+                    try out.commit(size);
+                },
                 .pad => |p| {
                     const o = &s.options.pad;
                     const n = if (comptime isAsciiPad(p)) src.len else std.unicode.utf8CountCodepoints(src) catch unreachable;
@@ -288,6 +382,100 @@ fn Transform(comptime kind: TransformKind) type {
                 },
             }
         }
+    };
+}
+
+/// A replace_slice position in `[0, n]`: negative counts from the end (Arrow C++).
+fn clampPosition(pos: i64, n: usize) usize {
+    const len: i64 = @intCast(n);
+    const p = if (pos < 0) @max(len +| pos, 0) else @min(pos, len);
+    return @intCast(p);
+}
+
+// ------------------------------------------------------------------------------ binary_join
+
+/// Join the items of each list row with the separator of the row.
+fn joinList(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+    return dense.execElementwiseWith(ctx, args, options, args[1].dataType(), true, joinListChunk);
+}
+
+fn joinListChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, _: Options) KernelError!ArrayRef {
+    var lists = try dense.chunkArray(ctx.allocator, values[0]);
+    defer lists.release();
+    const ld = lists.data();
+    if (ld.children.len != 1) return error.InvalidInput;
+    const child = ld.children[0].data();
+    // validateLayout of the list bounds its offsets by the child length; the child's own buffers
+    // are checked here, and the child must have the separator's layout.
+    child.validateLayout() catch return error.InvalidInput;
+    const out_type = values[1].dataType();
+    if (std.meta.activeTag(datatype.storageDataType(child.data_type)) != std.meta.activeTag(datatype.storageDataType(out_type))) return error.InvalidInput;
+    var child_ref = ld.children[0].retain();
+    defer child_ref.release();
+    const items = try dense.StringOperand.init(.{ .array = child_ref });
+    const seps = try dense.StringOperand.init(values[1]);
+    return switch (ld.data_type) {
+        .list => joinListRows(i32, ctx, ld, items, seps, values[1], len, out_type),
+        .large_list => joinListRows(i64, ctx, ld, items, seps, values[1], len, out_type),
+        else => error.UnsupportedType,
+    };
+}
+
+fn joinListRows(comptime O: type, ctx: *ExecContext, ld: *const ArrayData, items: dense.StringOperand, seps: dense.StringOperand, sep_value: ExecChunkValue, len: usize, out_type: DataType) KernelError!ArrayRef {
+    const all = ld.buffers[1].typedSlice(O) catch return error.InvalidInput;
+    const offsets = all[ld.offset..][0 .. len + 1];
+    const child = ld.children[0].data();
+    // Pass 1: the validity and the byte total of every row.
+    var validity = dense.bitsBuffer(ctx.allocator, len) catch return error.OutOfMemory;
+    var validity_owned = true;
+    defer if (validity_owned) validity.deinit();
+    @memset(validity.data[0..bitmap.byteLength(len)], 0);
+    var total: usize = 0;
+    for (0..len) |i| {
+        if (ld.isNull(i) or sep_value.isNullAt(i)) continue;
+        const lo: usize = @intCast(offsets[i]);
+        const hi: usize = @intCast(offsets[i + 1]);
+        var n: usize = 0;
+        var valid = true;
+        for (lo..hi) |j| {
+            if (child.isNull(j)) {
+                valid = false;
+                break;
+            }
+            n += rowOf(items, j).len;
+        }
+        if (!valid) continue;
+        bitmap.setBit(validity.data, i);
+        total += n + rowOf(seps, i).len * ((hi - lo) -| 1);
+    }
+    // Pass 2: fill.
+    validity_owned = false;
+    var out = try dense.VarBinaryOutput.init(ctx.allocator, out_type, len, validity, total);
+    errdefer out.deinit();
+    for (0..len) |i| {
+        if (!bitmap.bitIsSet(out.validity.?.data, i)) {
+            try out.commit(0);
+            continue;
+        }
+        const sep = rowOf(seps, i);
+        var w: usize = 0;
+        for (@as(usize, @intCast(offsets[i]))..@as(usize, @intCast(offsets[i + 1]))) |j| {
+            if (j > offsets[i]) {
+                @memcpy((try out.reserve(w + sep.len))[w..], sep);
+                w += sep.len;
+            }
+            const part = rowOf(items, j);
+            @memcpy((try out.reserve(w + part.len))[w..], part);
+            w += part.len;
+        }
+        try out.commit(w);
+    }
+    return out.finish();
+}
+
+fn rowOf(op: dense.StringOperand, i: usize) []const u8 {
+    return switch (op) {
+        inline else => |r| r.get(i),
     };
 }
 

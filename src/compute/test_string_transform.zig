@@ -148,13 +148,13 @@ test "string transform hand-written values: replace, split, pad, count, find, sl
         defer e.release();
         try common.expectInvokeStrings(&ctx, "utf8_center", &.{.{ .array = e }}, pad(4, "€"), &.{"€é€€"});
 
-        // Case: ASCII letters only (Arrow's utf8_capitalize also maps é to É).
+        // Case: the utf8_* functions map every cased code point, the ascii_* ones ASCII letters only.
         var k = try common.makeStrings(tag, allocator, &.{ "hELLO wORLD", "éa", "", null, "HeLLo 9" });
         defer k.release();
         const kargs = [_]Datum{.{ .array = k }};
-        try common.expectInvokeStrings(&ctx, "utf8_capitalize", &kargs, none, &.{ "Hello world", "éa", "", null, "Hello 9" });
+        try common.expectInvokeStrings(&ctx, "utf8_capitalize", &kargs, none, &.{ "Hello world", "Éa", "", null, "Hello 9" });
         try common.expectInvokeStrings(&ctx, "ascii_capitalize", &kargs, none, &.{ "Hello world", "éa", "", null, "Hello 9" });
-        try common.expectInvokeStrings(&ctx, "utf8_swapcase", &kargs, none, &.{ "Hello World", "éA", "", null, "hEllO 9" });
+        try common.expectInvokeStrings(&ctx, "utf8_swapcase", &kargs, none, &.{ "Hello World", "ÉA", "", null, "hEllO 9" });
         try common.expectInvokeStrings(&ctx, "ascii_swapcase", &kargs, none, &.{ "Hello World", "éA", "", null, "hEllO 9" });
 
         var n = try common.makeArray(i64, allocator, &.{ 2, 0, 1, null, 3 });
@@ -287,7 +287,7 @@ test "string transform oracle matches a per-row loop on random sliced inputs wit
             };
             break :blk o;
         } else null;
-        try common.expectInvokeStrings(&ctx, "utf8_swapcase", &args, none, swapped);
+        try common.expectInvokeStrings(&ctx, "ascii_swapcase", &args, none, swapped);
     }
 
     inline for (binary_tags) |tag| {
@@ -474,4 +474,103 @@ test "string transform errors: options, invalid UTF-8 rows, negative and huge re
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("split_pattern", &.{.{ .array = broken }}, splitOn(",", null, false)));
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("replace_substring", &.{.{ .array = broken }}, replace("a", "b", null)));
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_repeat", &.{ .{ .array = broken }, .{ .array = counts } }, none));
+}
+
+fn replaceSlice(start: i64, stop: i64, r: []const u8) Options {
+    return .{ .replace_slice = .{ .start = start, .stop = stop, .replacement = r } };
+}
+
+const string_item = DataType{ .string = {} };
+const large_string_item = DataType{ .large_string = {} };
+const binary_item = DataType{ .binary = {} };
+
+/// list<item> (or large_list) over `items` with `offsets` and an optional validity bitmap.
+fn makeList(comptime large: bool, allocator: std.mem.Allocator, item: *const DataType, items: ArrayRef, offsets: anytype, validity: ?[]const u8, nulls: usize) !ArrayRef {
+    const field = common.datatype.Field{ .name = "item", .data_type = item };
+    const dt: DataType = if (large) .{ .large_list = .{ .value_field = field } } else .{ .list = .{ .value_field = field } };
+    const bufs = [_]common.SharedBuffer{ if (validity) |v| .fromSlice(v) else .empty, .fromSlice(std.mem.sliceAsBytes(offsets)) };
+    return ArrayRef.fromBorrowed(allocator, .{ .data_type = dt, .length = offsets.len - 1, .null_count = nulls, .buffers = &bufs, .children = &.{items} });
+}
+
+test "string transform replace_slice, zero_fill and binary_join on lists (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // pyarrow 26 results; positions count code points (utf8) or bytes (binary).
+    const R = struct { o: Options, text: [4]?[]const u8, bytes: [4]?[]const u8 };
+    const cases = [_]R{
+        .{ .o = replaceSlice(1, 3, "XY"), .text = .{ "hXYlo", "XY", null, "aXY" }, .bytes = .{ "hXYllo", "XY", null, "aXY" } },
+        .{ .o = replaceSlice(-2, -1, "Z"), .text = .{ "hélZo", "Z", null, "Zb" }, .bytes = .{ "h\xc3\xa9lZo", "Z", null, "Zb" } },
+        .{ .o = replaceSlice(3, 1, "Q"), .text = .{ "hélQlo", "Q", null, "abQ" }, .bytes = .{ "h\xc3\xa9Qllo", "Q", null, "abQ" } },
+        .{ .o = replaceSlice(0, 0, "P"), .text = .{ "Phéllo", "P", null, "Pab" }, .bytes = .{ "Ph\xc3\xa9llo", "P", null, "Pab" } },
+        .{ .o = replaceSlice(10, 20, "R"), .text = .{ "hélloR", "R", null, "abR" }, .bytes = .{ "h\xc3\xa9lloR", "R", null, "abR" } },
+        .{ .o = replaceSlice(-10, 2, "S"), .text = .{ "Sllo", "S", null, "S" }, .bytes = .{ "S\xa9llo", "S", null, "S" } },
+        .{ .o = replaceSlice(2, -10, "T"), .text = .{ "héTllo", "T", null, "abT" }, .bytes = .{ "h\xc3T\xa9llo", "T", null, "abT" } },
+    };
+    inline for (string_tags) |tag| {
+        var a = try common.makeStrings(tag, allocator, &.{ "héllo", "", null, "ab" });
+        defer a.release();
+        for (cases) |c| try common.expectInvokeStrings(&ctx, "utf8_replace_slice", &.{.{ .array = a }}, c.o, &c.text);
+        var z = try common.makeStrings(tag, allocator, &.{ "12", "-12", "+1", "-", "abc", "é1", "", null, "12345" });
+        defer z.release();
+        try common.expectInvokeStrings(&ctx, "utf8_zero_fill", &.{.{ .array = z }}, .{ .zero_fill = .{ .width = 4 } }, &.{ "0012", "-012", "+001", "-000", "0abc", "00é1", "0000", null, "12345" });
+        try common.expectInvokeStrings(&ctx, "utf8_zero_fill", &.{.{ .array = z }}, .{ .zero_fill = .{ .width = 4, .padding = "é" } }, &.{ "éé12", "-é12", "+éé1", "-ééé", "éabc", "ééé1", "éééé", null, "12345" });
+    }
+    inline for (binary_tags) |tag| {
+        var b = try common.makeStrings(tag, allocator, &.{ "h\xc3\xa9llo", "", null, "ab" });
+        defer b.release();
+        for (cases) |c| try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .array = b }}, c.o, &c.bytes);
+    }
+
+    // binary_join: a null list, a null item or a null separator gives null; [] gives "".
+    var items = try common.makeStrings(.string, allocator, &.{ "a", "b", "x", null, "c" });
+    defer items.release();
+    const offs = [_]i32{ 0, 2, 2, 2, 4, 5 };
+    const valid = [_]u8{0b11101};
+    var lists = try makeList(false, allocator, &string_item, items, &offs, &valid, 1);
+    defer lists.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = lists }, .{ .scalar = Scalar.init(string_item, .{ .string = "-" }) } }, none, &.{ "a-b", null, "", null, "c" });
+    var seps = try common.makeStrings(.string, allocator, &.{ "+", "+", "+", "+", null });
+    defer seps.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = lists }, .{ .array = seps } }, none, &.{ "a+b", null, "", null, null });
+    var sliced = try lists.slice(3, 2);
+    defer sliced.release();
+    var sep_slice = try seps.slice(3, 2);
+    defer sep_slice.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = sliced }, .{ .array = sep_slice } }, none, &.{ null, null });
+    // large_list<large_string> with a large_string separator; list<binary>.
+    var large_items = try common.makeStrings(.large_string, allocator, &.{ "x", "y", "z" });
+    defer large_items.release();
+    const loffs = [_]i64{ 0, 3, 3 };
+    var large = try makeList(true, allocator, &large_string_item, large_items, &loffs, null, 0);
+    defer large.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = large }, .{ .scalar = Scalar.init(large_string_item, .{ .string = ", " }) } }, none, &.{ "x, y, z", "" });
+    var bin_items = try common.makeStrings(.binary, allocator, &.{ "\x00", "\xff" });
+    defer bin_items.release();
+    const boffs = [_]i32{ 0, 2 };
+    var bins = try makeList(false, allocator, &binary_item, bin_items, &boffs, null, 0);
+    defer bins.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = bins }, .{ .scalar = Scalar.init(binary_item, .{ .binary = "-" }) } }, none, &.{"\x00-\xff"});
+    var chunks = try common.chunkedAt(allocator, lists, &.{ 1, 4 });
+    defer chunks.release();
+    var joined = try ctx.invokeScalar("binary_join", &.{ .{ .chunked = chunks }, .{ .scalar = Scalar.init(string_item, .{ .string = "-" }) } }, none);
+    defer joined.release();
+    try std.testing.expectEqual(@as(usize, 3), joined.chunked.numChunks());
+    const got = try common.collectStrings(allocator, joined);
+    defer allocator.free(got);
+    try common.expectStrings(&.{ "a-b", null, "", null, "c" }, got);
+
+    // Errors: options, a separator of another layout, a child that is not the declared layout.
+    var s = try common.makeStrings(.string, allocator, &.{"abc"});
+    defer s.release();
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_replace_slice", &.{.{ .array = s }}, replaceSlice(0, 1, "\xff")));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_zero_fill", &.{.{ .array = s }}, .{ .zero_fill = .{ .width = 3, .padding = "00" } }));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_zero_fill", &.{.{ .array = s }}, .{ .pad = .{ .width = 3 } }));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_replace_slice", &.{.{ .array = s }}, replaceSlice(0, 1, "x")));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_join", &.{ .{ .array = lists }, .{ .scalar = Scalar.init(large_string_item, .{ .string = "-" }) } }, none));
+    var liar = try makeList(false, allocator, &string_item, bin_items, &boffs, null, 0);
+    defer liar.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_join", &.{ .{ .array = liar }, .{ .scalar = Scalar.init(string_item, .{ .string = "-" }) } }, none));
 }

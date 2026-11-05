@@ -6,7 +6,9 @@
 //! division truncates toward zero and a zero divisor in a valid row is `DivideByZero` in both
 //! variants (as in Arrow C++); `divide(minInt, -1)` is 0 (Arrow C++) or `maxInt` when saturating.
 //! Float division by zero gives inf / nan unless checked. Float add / subtract / multiply never
-//! report overflow. Both operands must have the same type (no implicit casts).
+//! report overflow. Operands of different numeric types are first cast to their common type
+//! (Arrow's implicit casts, `registry.commonNumericType`: int32 + int64 is int64, int + float32 is
+//! float32, uint32 + int32 is int64; a value the cast cannot represent is `InvalidCast`).
 const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
@@ -32,6 +34,10 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             if (!(op == .negate and @typeInfo(T) == .int and @typeInfo(T).int.signedness == .unsigned)) {
                 try registry.registerScalarKernel(@tagName(op) ++ "_checked", kernel(T, op, true));
             }
+        }
+        if (op != .negate and op != .abs) {
+            try registry.setImplicitCast(@tagName(op), .scalar, .numeric);
+            try registry.setImplicitCast(@tagName(op) ++ "_checked", .scalar, .numeric);
         }
     }
 }

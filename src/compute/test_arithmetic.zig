@@ -6,6 +6,8 @@ const Datum = common.Datum;
 const ExecContext = common.ExecContext;
 const dense = common.dense;
 const none = common.none;
+const Options = common.Options;
+const TypeTag = std.meta.Tag(common.DataType);
 
 const binary_ops = [_][]const u8{ "add", "subtract", "multiply", "divide" };
 const unary_ops = [_][]const u8{ "negate", "abs" };
@@ -305,11 +307,12 @@ test "arithmetic errors: Overflow, DivideByZero, mismatched types, options, leng
     defer u.release();
     try std.testing.expectError(error.Overflow, ctx.invokeScalar("subtract_checked", &.{ .{ .array = u }, .{ .scalar = common.scalarOf(u8, 1) } }, none));
 
-    // Arrow C++ has no negate_checked for unsigned integers; there are no implicit casts.
+    // Arrow C++ has no negate_checked for unsigned integers; numeric operands of different types
+    // are cast to their common type (int8 + int16 is int16), other types are not.
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("negate_checked", &.{.{ .array = u }}, none));
     var wide = try common.makeArray(i16, allocator, &.{ 1, 2 });
     defer wide.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("add", &.{ .{ .array = ones8 }, .{ .array = wide } }, none));
+    try common.expectInvoke(i16, &ctx, .scalar, "add", &.{ .{ .array = ones8 }, .{ .array = wide } }, &.{ 2, 3 });
     var b = try common.makeArray(bool, allocator, &.{ true, false });
     defer b.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("add", &.{ .{ .array = b }, .{ .array = b } }, none));
@@ -327,4 +330,81 @@ test "arithmetic errors: Overflow, DivideByZero, mismatched types, options, leng
     var malformed = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .int8 = {} }, .length = 2, .null_count = 0, .buffers = &bufs });
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("add", &.{ .{ .array = malformed }, .{ .array = ones8 } }, none));
+}
+
+test "arithmetic implicit casts: mixed numeric operands use Arrow's common type (pyarrow 26 table)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const types = [_]type{ i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 };
+    // pyarrow 26: pc.add(a, b).type for every pair (row a, column b).
+    const table = [10][10]TypeTag{
+        .{ .int8, .int16, .int32, .int64, .int16, .int32, .int64, .int64, .float, .double },
+        .{ .int16, .int16, .int32, .int64, .int16, .int32, .int64, .int64, .float, .double },
+        .{ .int32, .int32, .int32, .int64, .int32, .int32, .int64, .int64, .float, .double },
+        .{ .int64, .int64, .int64, .int64, .int64, .int64, .int64, .int64, .float, .double },
+        .{ .int16, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double },
+        .{ .int32, .int32, .int32, .int64, .uint16, .uint16, .uint32, .uint64, .float, .double },
+        .{ .int64, .int64, .int64, .int64, .uint32, .uint32, .uint32, .uint64, .float, .double },
+        .{ .int64, .int64, .int64, .int64, .uint64, .uint64, .uint64, .uint64, .float, .double },
+        .{ .float, .float, .float, .float, .float, .float, .float, .float, .float, .double },
+        .{ .double, .double, .double, .double, .double, .double, .double, .double, .double, .double },
+    };
+    const to_double = Options{ .cast = .{ .to_type = .{ .double = {} } } };
+    inline for (types, 0..) |A, i| {
+        var a = try common.makeArray(A, allocator, &.{ 1, null, 3, 4 });
+        defer a.release();
+        inline for (types, 0..) |B, j| {
+            var b = try common.makeArray(B, allocator, &.{ 2, 5, null, 6 });
+            defer b.release();
+            const args = [_]Datum{ .{ .array = a }, .{ .array = b } };
+            try std.testing.expectEqual(table[i][j], std.meta.activeTag(try registry.resolveResultType("add", .scalar, &args, none)));
+            var sum = try ctx.invokeScalar("add_checked", &args, none);
+            defer sum.release();
+            try std.testing.expectEqual(table[i][j], std.meta.activeTag(sum.dataType()));
+            try common.expectInvokeWith(f64, &ctx, "cast", &.{sum}, to_double, &.{ 3, null, null, 10 });
+        }
+    }
+
+    // Scalars are cast too; the common type decides overflow (int8 127 + int16 1 is 128).
+    var small = try common.makeArray(i32, allocator, &.{ 1, 2 });
+    defer small.release();
+    var out = try ctx.invokeScalar("add", &.{ .{ .array = small }, .{ .scalar = common.scalarOf(i64, 1 << 40) } }, none);
+    defer out.release();
+    try std.testing.expectEqual(TypeTag.int64, std.meta.activeTag(out.dataType()));
+    try common.expectInvoke(i16, &ctx, .scalar, "add_checked", &.{ .{ .scalar = common.scalarOf(i8, 127) }, .{ .scalar = common.scalarOf(i16, 1) } }, &.{128});
+    try common.expectInvoke(i32, &ctx, .scalar, "divide", &.{ .{ .scalar = common.scalarOf(i8, 7) }, .{ .array = small } }, &.{ 7, 3 });
+    // Chunked operands keep their chunks.
+    var wide = try common.makeArray(i64, allocator, &.{ 10, 20, 30, 40, 50 });
+    defer wide.release();
+    var narrow = try common.makeArray(u16, allocator, &.{ 1, 2, 3, 4, 5 });
+    defer narrow.release();
+    var chunks = try common.chunkedAt(allocator, narrow, &.{2});
+    defer chunks.release();
+    var mixed = try ctx.invokeScalar("subtract", &.{ .{ .array = wide }, .{ .chunked = chunks } }, none);
+    defer mixed.release();
+    try std.testing.expectEqual(@as(usize, 2), mixed.chunked.numChunks());
+    const got = try common.collect(i64, allocator, mixed);
+    defer allocator.free(got);
+    try common.expectRows(i64, &.{ 9, 18, 27, 36, 45 }, got);
+    // The implicit cast is safe (Arrow): values it cannot represent are InvalidCast.
+    var big = try common.makeArray(i64, allocator, &.{1 << 60});
+    defer big.release();
+    var one_f = try common.makeArray(f64, allocator, &.{1.0});
+    defer one_f.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("add", &.{ .{ .array = big }, .{ .array = one_f } }, none));
+    var huge = try common.makeArray(u64, allocator, &.{1 << 63});
+    defer huge.release();
+    var one = try common.makeArray(i64, allocator, &.{1});
+    defer one.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("multiply", &.{ .{ .array = huge }, .{ .array = one } }, none));
+    var unsafe_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .safe_cast = false });
+    var wrapped = try unsafe_ctx.invokeScalar("add", &.{ .{ .array = huge }, .{ .array = one } }, none);
+    wrapped.release();
+    // Non-numeric mismatches stay errors; negate / abs take one operand and never cast.
+    var flags = try common.makeArray(bool, allocator, &.{ true, false });
+    defer flags.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("add", &.{ .{ .array = small }, .{ .array = flags } }, none));
+    try std.testing.expectEqual(@as(?common.DataType, null), common.core.commonNumericType(&.{ .{ .array = small }, .{ .array = small } }));
 }

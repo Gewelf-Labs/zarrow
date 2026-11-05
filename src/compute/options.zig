@@ -39,6 +39,18 @@ pub const OptionsTag = enum {
     week,
     /// Value set of is_in / index_in.
     set_lookup,
+    /// NaN handling of is_null.
+    null_options,
+    /// Null handling and minimum count of sum, mean, min, max, min_max, any and all.
+    scalar_aggregate,
+    /// Which rows count does count.
+    count,
+    /// Null handling of min_element_wise / max_element_wise.
+    element_wise_aggregate,
+    /// Slice and replacement of utf8_replace_slice / binary_replace_slice.
+    replace_slice,
+    /// Width and padding of utf8_zero_fill.
+    zero_fill,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -221,6 +233,50 @@ pub const SetLookupOptions = struct {
     null_matching_behavior: NullMatchingBehavior = .match,
 };
 
+/// Options of is_null (Arrow `NullOptions`).
+pub const NullOptions = struct {
+    /// A floating-point NaN counts as null.
+    nan_is_null: bool = false,
+};
+
+/// Options of sum, mean, min, max, min_max, any and all (Arrow `ScalarAggregateOptions`).
+pub const ScalarAggregateOptions = struct {
+    /// Skip null rows (false: any null row makes the result null; any / all use Kleene logic).
+    skip_nulls: bool = true,
+    /// Fewer valid rows than this give a null result.
+    min_count: u32 = 1,
+};
+
+/// Rows counted by count (Arrow `CountOptions::CountMode`).
+pub const CountMode = enum { only_valid, only_null, all };
+
+/// Options of count (Arrow `CountOptions`).
+pub const CountOptions = struct {
+    mode: CountMode = .only_valid,
+};
+
+/// Options of min_element_wise and max_element_wise (Arrow `ElementWiseAggregateOptions`).
+pub const ElementWiseAggregateOptions = struct {
+    /// Ignore null operands of a row (false: a null operand makes the row null).
+    skip_nulls: bool = true,
+};
+
+/// Options of utf8_replace_slice (code points) and binary_replace_slice (bytes) (Arrow
+/// `ReplaceSliceOptions`): `[start, stop)` is replaced; negative positions count from the end.
+pub const ReplaceSliceOptions = struct {
+    start: i64,
+    stop: i64,
+    replacement: []const u8,
+};
+
+/// Options of utf8_zero_fill (Arrow `ZeroFillOptions`).
+pub const ZeroFillOptions = struct {
+    /// Output length in code points; longer rows are kept as is.
+    width: usize,
+    /// One code point inserted after a leading `+` or `-`.
+    padding: []const u8 = "0",
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -248,6 +304,12 @@ pub const Options = union(OptionsTag) {
     round_temporal: RoundTemporalOptions,
     week: WeekOptions,
     set_lookup: SetLookupOptions,
+    null_options: NullOptions,
+    scalar_aggregate: ScalarAggregateOptions,
+    count: CountOptions,
+    element_wise_aggregate: ElementWiseAggregateOptions,
+    replace_slice: ReplaceSliceOptions,
+    zero_fill: ZeroFillOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {
