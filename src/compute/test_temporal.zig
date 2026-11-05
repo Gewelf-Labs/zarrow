@@ -351,3 +351,89 @@ test "temporal 32-bit and vector calendar paths agree with the 64-bit algorithm 
         try common.expectInvoke(i64, &ctx, .scalar, name, &.{.{ .array = d }}, &expected);
     }
 }
+
+test "temporal week, us_week, subsecond and year_month_day: every WeekOptions combination (Arrow C++ results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // 2021-01-01, 2021-01-03, 2021-01-04, 2020-12-31, 2019-12-30, 2023-01-01, 2022-01-01,
+    // 2024-12-30, null; expected values from pyarrow 26.
+    var d = try common.makeTyped(i32, date32, allocator, &.{ 18628, 18630, 18631, 18627, 18260, 19358, 18993, 20087, null });
+    defer d.release();
+    const args = [_]Datum{.{ .array = d }};
+    try common.expectInvoke(i64, &ctx, .scalar, "us_week", &args, &.{ 53, 1, 1, 53, 1, 1, 52, 1, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "week", &args, &.{ 53, 53, 1, 53, 1, 52, 52, 1, null });
+    const Case = struct { monday: bool, zero: bool, full: bool, want: [8]i64 };
+    for ([_]Case{
+        .{ .monday = true, .zero = true, .full = true, .want = .{ 0, 0, 1, 52, 52, 0, 0, 53 } },
+        .{ .monday = true, .zero = true, .full = false, .want = .{ 0, 0, 1, 53, 53, 0, 0, 53 } },
+        .{ .monday = true, .zero = false, .full = true, .want = .{ 52, 52, 1, 52, 52, 52, 52, 53 } },
+        .{ .monday = true, .zero = false, .full = false, .want = .{ 53, 53, 1, 53, 1, 52, 52, 1 } },
+        .{ .monday = false, .zero = true, .full = true, .want = .{ 0, 1, 1, 52, 52, 1, 0, 52 } },
+        .{ .monday = false, .zero = true, .full = false, .want = .{ 0, 1, 1, 53, 53, 1, 0, 53 } },
+        .{ .monday = false, .zero = false, .full = true, .want = .{ 52, 1, 1, 52, 52, 1, 52, 52 } },
+        .{ .monday = false, .zero = false, .full = false, .want = .{ 53, 1, 1, 53, 1, 1, 52, 1 } },
+    }) |c| {
+        const o = common.Options{ .week = .{ .week_starts_monday = c.monday, .count_from_zero = c.zero, .first_week_is_fully_in_year = c.full } };
+        common.expectInvokeWith(i64, &ctx, "week", &args, o, &.{ c.want[0], c.want[1], c.want[2], c.want[3], c.want[4], c.want[5], c.want[6], c.want[7], null }) catch |err| {
+            std.debug.print("week {any}\n", .{o.week});
+            return err;
+        };
+    }
+
+    // year_month_day: struct of int64 year, month, day; null rows stay null.
+    var ymd = try ctx.invokeScalar("year_month_day", &args, none);
+    defer ymd.release();
+    try ymd.array.data().validateFull();
+    try std.testing.expect(ymd.array.data().data_type.eql(common.kernels.temporal.year_month_day_type));
+    try std.testing.expect(ymd.array.data().isNull(8));
+    inline for (.{ [_]i64{ 2021, 2021, 2021, 2020, 2019, 2023, 2022, 2024 }, [_]i64{ 1, 1, 1, 12, 12, 1, 1, 12 }, [_]i64{ 1, 3, 4, 31, 30, 1, 1, 30 } }, 0..) |want, k| {
+        const got = try common.collect(i64, allocator, .{ .array = ymd.array.data().children[k] });
+        defer allocator.free(got);
+        try common.expectRows(i64, &.{ want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7] }, got[0..8]);
+    }
+
+    // subsecond: the fraction of the second as float64 (timestamps only, as in Arrow).
+    var t = try common.makeTyped(i64, ts_ms, allocator, &.{ 1500, -1, null, 7000 });
+    defer t.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "subsecond", &.{.{ .array = t }}, &.{ 0.5, 0.999, null, 0 });
+    var tn = try common.makeTyped(i64, ts_ns, allocator, &.{ 1_234_567_891, -1 });
+    defer tn.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "subsecond", &.{.{ .array = tn }}, &.{ 0.234567891, 0.999999999 });
+    var d64 = try common.makeTyped(i64, date64, allocator, &.{0});
+    defer d64.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("subsecond", &.{.{ .array = d64 }}, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("us_week", &args, .{ .week = .{} }));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("week", &args, .{ .day_of_week = .{} }));
+
+    // Oracle: week with the default options is iso_week, on random sliced dates with nulls; the
+    // ymd fields equal year / month / day.
+    var prng = std.Random.DefaultPrng.init(0x7E52);
+    const rows = try randomRows(allocator, prng.random(), 400, 1);
+    defer allocator.free(rows);
+    var narrow: [400]?i32 = undefined;
+    for (rows, &narrow) |r, *n| n.* = if (r) |x| @intCast(x) else null;
+    var full = try common.makeTyped(i32, date32, allocator, &narrow);
+    defer full.release();
+    var sliced = try full.slice(7, 390);
+    defer sliced.release();
+    const sargs = [_]Datum{.{ .array = sliced }};
+    var iso = try ctx.invokeScalar("iso_week", &sargs, none);
+    defer iso.release();
+    const expected = try common.collect(i64, allocator, iso);
+    defer allocator.free(expected);
+    try common.expectInvoke(i64, &ctx, .scalar, "week", &sargs, expected);
+    var parts = try ctx.invokeScalar("year_month_day", &sargs, none);
+    defer parts.release();
+    inline for (.{ "year", "month", "day" }, 0..) |name, k| {
+        var whole = try ctx.invokeScalar(name, &sargs, none);
+        defer whole.release();
+        const want = try common.collect(i64, allocator, whole);
+        defer allocator.free(want);
+        const got = try common.collect(i64, allocator, .{ .array = parts.array.data().children[k] });
+        defer allocator.free(got);
+        for (want, got) |w, g| if (w) |x| try std.testing.expectEqual(x, g.?);
+    }
+}

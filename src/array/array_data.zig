@@ -391,6 +391,18 @@ pub const ArrayData = struct {
 
     /// A struct child is either row-aligned with the parent (same length, as produced by
     /// `ArrayRef.slice`) or in parent coordinates, where it must reach `end = offset + length`.
+    /// The exact Arrow buffer count of a layout, or null for the view types, whose data buffers
+    /// are variadic.
+    pub fn maxBufferCount(dt: DataType) ?usize {
+        return switch (dt) {
+            .null, .run_end_encoded => 0,
+            .struct_, .fixed_size_list, .sparse_union => 1,
+            .string, .binary, .large_string, .large_binary, .list_view, .large_list_view => 3,
+            .string_view, .binary_view => null,
+            else => 2,
+        };
+    }
+
     fn childCoversRange(child_data: *const ArrayData, parent_len: usize, end: usize) ValidationError!void {
         if (child_data.length == parent_len) return;
         if (child_data.length < end) return error.InvalidChildren;
@@ -541,6 +553,12 @@ pub const ArrayData = struct {
             }
         }
 
+        // Arrow fixes the buffer count of every layout except the view types (variadic data
+        // buffers); the per-type checks below bound it only from below. Fuzz finding: a
+        // fixed_size_list carrying three buffers passed here and the take behind a dictionary
+        // cast rejected it (fuzz/corpus/array-layout/regress-fsl-3buf.bin).
+        if (maxBufferCount(dt)) |max| if (self.buffers.len > max) return error.InvalidBufferCount;
+
         const total_len = std.math.add(usize, self.offset, self.length) catch return error.InvalidOffsets;
         const has_top_level_validity = hasTopLevelValidityBitmap(dt);
         if (has_top_level_validity and self.buffers.len > 0 and !self.buffers[0].isEmpty()) {
@@ -634,6 +652,12 @@ pub const ArrayData = struct {
                 if (self.buffers[0].len() < total_len) return error.BufferTooSmall;
                 const type_ids = self.buffers[0].typedSlice(i8) catch return error.InvalidOffsetBuffer;
                 try validateUnionTypeIds(uni, type_ids, self.offset, total_len);
+                // Sparse union children share the union's coordinate space and are never sliced
+                // with it (`ArrayRef.slice` keeps them whole), so every child must reach
+                // offset + length. Fuzz findings: a zero-length child passed the layout check and
+                // the take behind a dictionary cast rejected the array; a child as long as a sliced
+                // union failed validation again once the union was sliced further.
+                for (self.children) |child| if (child.data().length < total_len) return error.InvalidChildren;
             },
             .dense_union => |uni| {
                 if (self.buffers.len < 2) return error.InvalidBufferCount;
@@ -960,6 +984,72 @@ test "array data validateLayout rejects null type invalid null count" {
     };
 
     try std.testing.expectError(error.InvalidNullCount, data.validateLayout());
+}
+
+test "array data validateLayout rejects surplus buffers on layouts with a fixed buffer count" {
+    // fuzz/corpus/array-layout/regress-fsl-3buf.bin: a fixed_size_list with three buffers.
+    const value_type = DataType{ .int32 = {} };
+    const fsl_type = DataType{ .fixed_size_list = .{ .value_field = .{ .name = "item", .data_type = &value_type, .nullable = true }, .list_size = 1 } };
+    var values: [4 * @sizeOf(i32)]u8 align(buffer.ALIGNMENT) = undefined;
+    @memcpy(values[0..], std.mem.sliceAsBytes(&[_]i32{ 1, 2, 3, 4 }));
+    var child = try ArrayRef.fromBorrowed(std.testing.allocator, .{
+        .data_type = value_type,
+        .length = 4,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(values[0..]) },
+    });
+    defer child.release();
+    const children = &[_]ArrayRef{child};
+    const one = [_]SharedBuffer{SharedBuffer.empty};
+    const three = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(values[0..]), SharedBuffer.fromSlice(values[0..]) };
+    var data = ArrayData{ .data_type = fsl_type, .length = 4, .null_count = 0, .buffers = &one, .children = children };
+    try data.validateLayout();
+    data.buffers = &three;
+    try std.testing.expectError(error.InvalidBufferCount, data.validateLayout());
+    // A primitive array with a third buffer is rejected the same way.
+    const prim = ArrayData{ .data_type = value_type, .length = 4, .null_count = 0, .buffers = &three };
+    try std.testing.expectError(error.InvalidBufferCount, prim.validateLayout());
+}
+
+test "array data validateLayout rejects a sparse union whose child does not cover its rows" {
+    // fuzz/corpus/array-layout/regress-abd38988.bin: a sliced sparse union (offset 10, length 2)
+    // over a zero-length null child.
+    const value_type = DataType{ .null = {} };
+    const union_fields = [_]datatype.Field{.{ .name = "n", .data_type = &value_type, .nullable = true }};
+    const union_type_ids = [_]i8{0};
+    const sparse_union_type = DataType{
+        .sparse_union = .{ .type_ids = union_type_ids[0..], .fields = union_fields[0..], .mode = .sparse },
+    };
+    const child_data = ArrayData{ .data_type = value_type, .length = 0, .null_count = 0, .buffers = &[_]SharedBuffer{} };
+    var child_ref = try ArrayRef.fromBorrowed(std.testing.allocator, child_data);
+    defer child_ref.release();
+    const children = &[_]ArrayRef{child_ref.retain()};
+    defer {
+        var owned = children[0];
+        owned.release();
+    }
+    const type_ids: [12]u8 = @splat(0);
+    const data = ArrayData{
+        .data_type = sparse_union_type,
+        .offset = 10,
+        .length = 2,
+        .null_count = 0,
+        .buffers = &[_]SharedBuffer{SharedBuffer.fromSlice(type_ids[0..])},
+        .children = children,
+    };
+    try std.testing.expectError(error.InvalidChildren, data.validateLayout());
+    // A child that reaches offset + length is fine; one only as long as the slice is not, because
+    // slicing the union further would leave it short (fuzz/corpus/array-layout/regress-1bdc90e9.bin).
+    var covering = try ArrayRef.fromBorrowed(std.testing.allocator, .{ .data_type = value_type, .length = 12, .null_count = 12, .buffers = &[_]SharedBuffer{} });
+    defer covering.release();
+    var short = try ArrayRef.fromBorrowed(std.testing.allocator, .{ .data_type = value_type, .length = 2, .null_count = 2, .buffers = &[_]SharedBuffer{} });
+    defer short.release();
+    for ([_]ArrayRef{ covering, short }, [_]bool{ true, false }) |c, ok_expected| {
+        const c_children = &[_]ArrayRef{c};
+        var d = data;
+        d.children = c_children;
+        if (ok_expected) try d.validateLayout() else try std.testing.expectError(error.InvalidChildren, d.validateLayout());
+    }
 }
 
 test "array data validateLayout rejects sparse union nonzero null count" {

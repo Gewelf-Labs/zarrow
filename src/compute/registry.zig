@@ -337,7 +337,8 @@ pub const FunctionRegistry = struct {
         return self.invoke(ctx, name, .aggregate, args, options);
     }
 
-    /// Create a stateful aggregate session from an aggregate kernel lifecycle.
+    /// Create a stateful aggregate session from an aggregate (or `hash_*` grouped aggregate)
+    /// kernel lifecycle.
     pub fn beginAggregate(
         self: *const FunctionRegistry,
         ctx: *ExecContext,
@@ -345,7 +346,8 @@ pub const FunctionRegistry = struct {
         prototype_args: []const Datum,
         options: Options,
     ) KernelError!AggregateSession {
-        const kernel = try self.resolveKernel(name, .aggregate, prototype_args, options);
+        const kind: FunctionKind = if (self.findFunction(name, .aggregate) == null and self.findFunction(name, .hash_aggregate) != null) .hash_aggregate else .aggregate;
+        const kernel = try self.resolveKernel(name, kind, prototype_args, options);
         const lifecycle = kernel.aggregate_lifecycle orelse return error.MissingLifecycle;
         const state = try lifecycle.init(ctx, options);
         return .{

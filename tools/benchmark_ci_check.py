@@ -59,6 +59,11 @@ EXPECTED_BENCHES = {
     "compute_cast_int32_to_string",
     "compute_utf8_upper",
     "compute_temporal_year",
+    "compute_replace_substring",
+    "compute_split_whitespace",
+    "compute_floor_temporal_day",
+    "compute_is_in_int32",
+    "compute_hash_sum_int64",
 }
 
 

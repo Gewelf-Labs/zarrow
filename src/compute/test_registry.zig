@@ -484,26 +484,46 @@ test "registerAll registers every kernel family function name with its kind" {
         "ends_with",              "match_substring",        "string_is_ascii",      "ascii_is_alpha",
         "ascii_is_decimal",       "ascii_is_space",         "utf8_is_alpha",        "utf8_is_digit",
         "utf8_is_space",          "utf8_length",            "binary_length",        "binary_join_element_wise",
+        "ascii_swapcase",         "utf8_swapcase",          "ascii_capitalize",     "utf8_capitalize",
+    };
+    const string_transform_names = [_][]const u8{
+        "replace_substring", "split_pattern", "ascii_split_whitespace", "utf8_split_whitespace",
+        "ascii_lpad",        "ascii_rpad",    "ascii_center",           "utf8_lpad",
+        "utf8_rpad",         "utf8_center",   "count_substring",        "find_substring",
+        "binary_slice",      "binary_repeat", "binary_reverse",
     };
     const temporal_names = [_][]const u8{
-        "year",        "month",       "day",        "day_of_week", "day_of_year", "hour",         "minute",  "second",
-        "millisecond", "microsecond", "nanosecond", "iso_year",    "iso_week",    "iso_calendar", "quarter", "is_leap_year",
+        "year",        "month",       "day",        "day_of_week",    "day_of_year", "hour",         "minute",  "second",
+        "millisecond", "microsecond", "nanosecond", "iso_year",       "iso_week",    "iso_calendar", "quarter", "is_leap_year",
+        "week",        "us_week",     "subsecond",  "year_month_day",
+    };
+    const temporal_round_names = [_][]const u8{
+        "floor_temporal",       "ceil_temporal",          "round_temporal",  "years_between",
+        "quarters_between",     "month_interval_between", "weeks_between",   "days_between",
+        "hours_between",        "minutes_between",        "seconds_between", "milliseconds_between",
+        "microseconds_between", "nanoseconds_between",
     };
     const scalar_names = [_][]const u8{
         "add",       "add_checked",    "subtract", "subtract_checked", "multiply", "multiply_checked",
         "divide",    "divide_checked", "negate",   "negate_checked",   "abs",      "abs_checked",
         "equal",     "not_equal",      "less",     "less_equal",       "greater",  "greater_equal",
         "and",       "or",             "xor",      "and_not",          "invert",   "and_kleene",
-        "or_kleene", "is_null",        "is_valid", "true_unless_null", "cast",
-    } ++ string_names ++ temporal_names;
+        "or_kleene", "is_null",        "is_valid", "true_unless_null", "cast",     "is_in",
+        "index_in",
+    } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names;
     const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
+    const hash_names = [_][]const u8{ "hash_sum", "hash_mean", "hash_min", "hash_max", "hash_min_max", "hash_count", "hash_count_all", "hash_any", "hash_all", "hash_count_distinct", "hash_distinct" };
     for (scalar_names) |name| try std.testing.expect(registry.containsFunction(name, .scalar));
     for (aggregate_names) |name| {
         try std.testing.expect(registry.containsFunction(name, .aggregate));
         // Every aggregate kernel also carries the init / update / merge / finalize lifecycle.
         for (registry.findFunction(name, .aggregate).?.kernelsSlice()) |kernel| try std.testing.expect(kernel.supportsAggregateLifecycle());
     }
-    try std.testing.expectEqual(scalar_names.len + aggregate_names.len, registry.functionCount());
+    for (hash_names) |name| {
+        try std.testing.expect(registry.containsFunction(name, .hash_aggregate));
+        for (registry.findFunction(name, .hash_aggregate).?.kernelsSlice()) |kernel| try std.testing.expect(kernel.supportsAggregateLifecycle());
+    }
+    try std.testing.expectEqual(scalar_names.len + aggregate_names.len + hash_names.len, registry.functionCount());
 
     // One kernel per input type: 10 numeric types; negate_checked has no unsigned kernels;
     // comparisons add bool and the three string layouts.
@@ -519,6 +539,12 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("binary_length", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("year", .scalar));
     try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("hour", .scalar));
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("subsecond", .scalar));
+    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("replace_substring", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("binary_slice", .scalar));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("floor_temporal", .scalar));
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
+    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("hash_sum", .hash_aggregate));
     // Kinds are separate namespaces: no scalar "sum".
     try std.testing.expect(!registry.containsFunction("sum", .scalar));
 }

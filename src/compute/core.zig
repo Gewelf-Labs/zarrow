@@ -14,6 +14,8 @@ pub const FunctionKind = enum {
     scalar,
     vector,
     aggregate,
+    /// Grouped aggregation (`hash_*`): values plus a group id array in, one row per group out.
+    hash_aggregate,
 };
 
 pub const ScalarValue = union(enum) {
@@ -236,6 +238,15 @@ pub const SliceOptions = options_mod.SliceOptions;
 pub const JoinNullHandling = options_mod.JoinNullHandling;
 pub const JoinOptions = options_mod.JoinOptions;
 pub const TrimOptions = options_mod.TrimOptions;
+pub const ReplaceSubstringOptions = options_mod.ReplaceSubstringOptions;
+pub const SplitPatternOptions = options_mod.SplitPatternOptions;
+pub const SplitOptions = options_mod.SplitOptions;
+pub const PadOptions = options_mod.PadOptions;
+pub const CalendarUnit = options_mod.CalendarUnit;
+pub const RoundTemporalOptions = options_mod.RoundTemporalOptions;
+pub const WeekOptions = options_mod.WeekOptions;
+pub const NullMatchingBehavior = options_mod.NullMatchingBehavior;
+pub const SetLookupOptions = options_mod.SetLookupOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;

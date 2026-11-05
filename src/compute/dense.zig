@@ -401,7 +401,7 @@ pub fn finishFixed(allocator: std.mem.Allocator, out_type: DataType, len: usize,
 }
 
 /// Return row 0 of a kernel output as a scalar. A string / binary scalar borrows its bytes from
-/// `payload`, which it retains; a struct scalar is a nested scalar over the row.
+/// `payload`, which it retains; a struct or list scalar is a nested scalar over the row.
 fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
     const data = arr.data();
     if (data.length != 1) return error.InvalidInput;
@@ -420,9 +420,9 @@ fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
             s.payload = arr.retain();
             return s;
         },
-        .struct_ => return Scalar.initNested(data.data_type, arr),
-        inline .date32, .date64, .timestamp, .time32, .time64, .duration => |_, tag| {
-            const T = if (tag == .date32 or tag == .time32) i32 else i64;
+        .struct_, .list => return Scalar.initNested(data.data_type, arr),
+        inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months => |_, tag| {
+            const T = if (tag == .date32 or tag == .time32 or tag == .interval_months) i32 else i64;
             const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
             return Scalar.init(data.data_type, @unionInit(ScalarValue, @tagName(tag), values[0]));
         },
@@ -675,7 +675,7 @@ pub const VarBinaryOutput = struct {
 
     /// Copy `bytes` into the next row.
     pub fn append(self: *Self, bytes: []const u8) KernelError!void {
-        @memcpy(try self.reserve(bytes.len), bytes);
+        copyBytes(try self.reserve(bytes.len), bytes);
         try self.commit(bytes.len);
     }
 
@@ -712,6 +712,21 @@ pub const VarBinaryOutput = struct {
         }) catch error.OutOfMemory;
     }
 };
+
+/// `@memcpy(dst[0..src.len], src)` without a call for short rows: up to 16 bytes move as two
+/// overlapping loads and stores (the common size of a string row or part).
+pub inline fn copyBytes(dst: []u8, src: []const u8) void {
+    const n = src.len;
+    if (n >= 8 and n <= 16) {
+        std.mem.writeInt(u64, dst[0..8], std.mem.readInt(u64, src[0..8], .little), .little);
+        std.mem.writeInt(u64, dst[n - 8 ..][0..8], std.mem.readInt(u64, src[n - 8 ..][0..8], .little), .little);
+    } else if (n >= 4 and n < 8) {
+        std.mem.writeInt(u32, dst[0..4], std.mem.readInt(u32, src[0..4], .little), .little);
+        std.mem.writeInt(u32, dst[n - 4 ..][0..4], std.mem.readInt(u32, src[n - 4 ..][0..4], .little), .little);
+    } else if (n < 4) {
+        for (dst[0..n], src) |*d, c| d.* = c;
+    } else @memcpy(dst[0..n], src);
+}
 
 /// Packed bits read 8 rows at a time: an array buffer at a bit offset, or a broadcast byte.
 pub const Bits = struct {

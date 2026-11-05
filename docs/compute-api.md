@@ -41,11 +41,27 @@ defer sum.release();
 | Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `count`, `count_all`, `any`, `all` |
 | Categorizations | `is_null.zig` | `is_null`, `is_valid`, `true_unless_null` |
 | Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp units, dictionary decode and encode, the null type |
-| Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `utf8_upper`, `utf8_lower` (ASCII letters), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_space`, `utf8_is_alpha`, `utf8_is_digit`, `utf8_is_space` (string, large_string, string_view) |
-| Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `iso_calendar`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp) |
+| Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `utf8_upper`, `utf8_lower`, `ascii_swapcase`, `utf8_swapcase`, `ascii_capitalize`, `utf8_capitalize` (ASCII letters), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_space`, `utf8_is_alpha`, `utf8_is_digit`, `utf8_is_space` (string, large_string, string_view) |
+| String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding and whitespace splits on the string layouts), `binary_slice`, `binary_reverse` (binary layouts) |
+| Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp); `subsecond` (timestamp) |
+| Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between`, `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between` (date32, date64, timestamp) |
+| Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, string and binary layouts) |
+| Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy`; kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_count`, `hash_count_all`, `hash_any`, `hash_all`, `hash_count_distinct`, `hash_distinct` (values plus uint32 group ids, one row per group) |
 
 Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
-scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar.
+scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar; grouped
+aggregates take a value array (or chunked array) and the uint32 group ids of a `Grouper` and return one
+row per group:
+
+```zig
+const hash = zarrow.compute.kernels.hash_aggregate;
+var batch = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = keys }}, &.{
+    .{ .function = "hash_sum", .input = values, .name = "total" },
+    .{ .function = "hash_count_all", .name = "rows" },
+});
+defer batch.deinit(); // columns: k (one row per group, first-seen order), total, rows
+```
+
 Operands of a binary function must have the same type: there are no implicit casts (call `cast`). Exact semantics,
 including the differences from Arrow C++, are in [compute-support-matrix.md](compute-support-matrix.md).
 
@@ -60,7 +76,8 @@ Arrow C++ function catalog to its status here.
 |---|---|
 | `arrow::compute::Function` (name + kernels) | `Function` |
 | `arrow::compute::Initialize()` (built-in function catalog) | `registerAll` (per family: `kernels.<family>.register`) |
-| `ScalarKernel` / `VectorKernel` / `ScalarAggregateKernel` | `Kernel` with `FunctionKind.scalar` / `.vector` / `.aggregate` |
+| `ScalarKernel` / `VectorKernel` / `ScalarAggregateKernel` / `HashAggregateKernel` | `Kernel` with `FunctionKind.scalar` / `.vector` / `.aggregate` / `.hash_aggregate` |
+| `Grouper`, `Table::GroupBy` | `kernels.hash_aggregate.Grouper`, `kernels.hash_aggregate.groupBy` |
 | `KernelSignature` (`InputType`, `OutputType`, type matchers) | `KernelSignature` (`arity`, `type_check`, `result_type_fn`) |
 | `FunctionOptions` | `Options` (tagged union, section 3) |
 | `ExecContext` + `MemoryPool` | `ExecContext` + `std.mem.Allocator` (section 6) |
@@ -108,6 +125,13 @@ Compute options are type-safe and tag-based.
 - `slice`
 - `join`
 - `trim`
+- `replace_substring`
+- `split_pattern`
+- `split`
+- `pad`
+- `round_temporal`
+- `week`
+- `set_lookup`
 - `custom`
 
 ### Payload types
@@ -121,10 +145,19 @@ Compute options are type-safe and tag-based.
 - `SliceOptions` (`start`, `stop`, `step`)
 - `JoinOptions` (`null_handling`: `emit_null | skip | replace`, `null_replacement`)
 - `TrimOptions` (`characters`)
+- `ReplaceSubstringOptions` (`pattern`, `replacement`, `max_replacements`)
+- `SplitPatternOptions` (`pattern`, `max_splits`, `reverse`), `SplitOptions` (`max_splits`, `reverse`)
+- `PadOptions` (`width`, `padding`, `lean_left_on_odd_padding`)
+- `RoundTemporalOptions` (`multiple`, `unit`: `CalendarUnit` nanosecond .. year, `week_starts_monday`,
+  `ceil_is_strictly_greater`, `calendar_based_origin`)
+- `WeekOptions` (`week_starts_monday`, `count_from_zero`, `first_week_is_fully_in_year`)
+- `SetLookupOptions` (`value_set`: a borrowed array or chunked array `Datum`, `null_matching_behavior`:
+  `match | skip | emit_null | inconclusive`)
 - `CustomOptions`
 
-Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`) also accept
-`.none` for the defaults.
+Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`, `week`,
+`weeks_between`, the whitespace splits and the `*_temporal` rounding functions) also accept `.none` for
+the defaults.
 
 Use `KernelSignature.options_check` to validate allowed option families for each kernel.
 
@@ -240,7 +273,9 @@ Runtime flow:
 2. call `ctx.beginAggregate(...)` to create `AggregateSession`;
 3. call `update/merge/finalize/deinit`.
 
-If lifecycle is missing, `beginAggregate` returns `error.MissingLifecycle`.
+If lifecycle is missing, `beginAggregate` returns `error.MissingLifecycle`. `beginAggregate` also
+resolves the `hash_*` functions (kind `hash_aggregate`): `update` takes (values, group ids) batches,
+`merge` adds a state over the same group ids, `finalize` returns one row per group seen so far.
 
 ---
 

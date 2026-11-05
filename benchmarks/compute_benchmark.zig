@@ -165,6 +165,82 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     try timeKernelWith(io, &ctx, .scalar, "compute_cast_int32_to_string", "cast", &.{.{ .array = a }}, to_string, cfg, emit_csv, meta);
     try timeKernel(io, &ctx, .scalar, "compute_utf8_upper", "utf8_upper", &.{.{ .array = str_a }}, cfg, emit_csv, meta);
     try timeKernel(io, &ctx, .scalar, "compute_temporal_year", "year", &.{.{ .array = ts }}, cfg, emit_csv, meta);
+
+    const dash = Options{ .replace_substring = .{ .pattern = "-", .replacement = "::" } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_replace_substring", "replace_substring", &.{.{ .array = str_a }}, dash, cfg, emit_csv, meta);
+    var words = try buildWords(allocator, cfg.rows, 10);
+    defer words.release();
+    try timeKernel(io, &ctx, .scalar, "compute_split_whitespace", "ascii_split_whitespace", &.{.{ .array = words }}, cfg, emit_csv, meta);
+    const day = Options{ .round_temporal = .{ .unit = .day } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_floor_temporal_day", "floor_temporal", &.{.{ .array = ts }}, day, cfg, emit_csv, meta);
+    // Rows and a 128-value set drawn from [0, 384): about a third of the rows match.
+    var a_mod = try buildInt32Mod(allocator, cfg.rows, 12, 384);
+    defer a_mod.release();
+    var mod_set = try buildInt32Mod(allocator, 128, 13, 384);
+    defer mod_set.release();
+    const mod_lookup = Options{ .set_lookup = .{ .value_set = .{ .array = mod_set } } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_is_in_int32", "is_in", &.{.{ .array = a_mod }}, mod_lookup, cfg, emit_csv, meta);
+    var keys = try buildInt64Mod(allocator, cfg.rows, 14, 1000);
+    defer keys.release();
+    try timeGroupedSum(io, &ctx, "compute_hash_sum_int64", keys, i64arr, cfg, emit_csv, meta);
+}
+
+/// Group `values` by `keys` (Grouper) and sum each group (hash_sum): the end-to-end group by.
+fn timeGroupedSum(io: std.Io, ctx: *ExecContext, bench_name: []const u8, keys: zarrow.ArrayRef, values: zarrow.ArrayRef, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
+    const hash = compute.kernels.hash_aggregate;
+    var checksum: u64 = 0;
+    var timer_start = std.Io.Timestamp.now(io, .awake);
+    for (0..cfg.iterations + 1) |it| {
+        // Iteration 0 is the untimed warm-up.
+        if (it == 1) timer_start = std.Io.Timestamp.now(io, .awake);
+        var grouper = try hash.Grouper.init(ctx.allocator, &.{keys.data().data_type});
+        defer grouper.deinit();
+        var ids = try grouper.consume(&.{keys});
+        defer ids.release();
+        var out = try ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = values }, .{ .array = ids } }, Options.noneValue());
+        defer out.release();
+        if (it > 0) checksum +%= fold(out);
+    }
+    const elapsed_ns: u64 = @intCast(timer_start.untilNow(io, .awake).toNanoseconds());
+    report(bench_name, cfg, elapsed_ns, checksum, emit_csv, meta);
+}
+
+/// Int32 values in `[0, modulus)`.
+fn buildInt32Mod(allocator: std.mem.Allocator, rows: usize, seed: u32, modulus: u32) !zarrow.ArrayRef {
+    var b = try zarrow.Int32Builder.init(allocator, rows);
+    defer b.deinit();
+    var x: u32 = seed;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        try b.append(@intCast((x >> 8) % modulus));
+    }
+    return b.finish();
+}
+
+/// Int64 group keys in `[0, groups)`.
+fn buildInt64Mod(allocator: std.mem.Allocator, rows: usize, seed: u32, groups: u32) !zarrow.ArrayRef {
+    var b = try zarrow.Int64Builder.init(allocator, rows);
+    defer b.deinit();
+    var x: u32 = seed;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        try b.append((x >> 8) % groups);
+    }
+    return b.finish();
+}
+
+/// Utf8 rows of three space-separated words ("w12 x3456 y7").
+fn buildWords(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    var b = try zarrow.StringBuilder.init(allocator, rows, rows * 16);
+    defer b.deinit();
+    var x: u32 = seed;
+    var buf: [32]u8 = undefined;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        const s = std.fmt.bufPrint(&buf, "w{d} x{d} y{d}", .{ x % 100, (x >> 8) % 10000, (x >> 20) % 10 }) catch unreachable;
+        try b.append(s);
+    }
+    return b.finish();
 }
 
 /// timestamp[ms] array spread over about 1870..2070, every 10th row null.

@@ -1,8 +1,11 @@
 //! Temporal component extraction (Arrow C++ "Temporal component extraction"): year, month, day,
-//! day_of_week, day_of_year, iso_year, iso_week, iso_calendar, quarter and is_leap_year on date32,
-//! date64 and timestamp; hour, minute, second, millisecond, microsecond and nanosecond on date64
-//! and timestamp. Results are int64 (is_leap_year: bool; iso_calendar: struct of int64
-//! `iso_year`, `iso_week`, `iso_day_of_week`); null handling is intersection.
+//! day_of_week, day_of_year, iso_year, iso_week, us_week, week, iso_calendar, year_month_day,
+//! quarter and is_leap_year on date32, date64 and timestamp; hour, minute, second, millisecond,
+//! microsecond and nanosecond on date64 and timestamp; subsecond on timestamp. Results are int64
+//! (is_leap_year: bool; subsecond: float64; iso_calendar: struct of int64 `iso_year`, `iso_week`,
+//! `iso_day_of_week`; year_month_day: struct of int64 `year`, `month`, `day`); null handling is
+//! intersection. week takes `WeekOptions` (Arrow defaults when `none`); us_week is week with
+//! Sunday-based weeks whose week 1 holds the year's 4th day (Arrow's `WeekOptions::USWeek()`).
 //!
 //! Dates follow the proleptic Gregorian calendar over the whole input range (days are floored, so
 //! instants before 1970 land on the right day). Timestamps without a timezone and with a UTC
@@ -22,6 +25,7 @@ const ArrayRef = core.ArrayRef;
 const DataType = core.DataType;
 const Datum = core.Datum;
 const DayOfWeekOptions = core.DayOfWeekOptions;
+const WeekOptions = core.WeekOptions;
 const ExecChunkValue = core.ExecChunkValue;
 const ExecContext = core.ExecContext;
 const FunctionRegistry = core.FunctionRegistry;
@@ -30,7 +34,7 @@ const Options = core.Options;
 const TypeTag = std.meta.Tag(DataType);
 
 /// The extraction functions, by Arrow C++ name.
-pub const Field = enum { year, month, day, day_of_week, day_of_year, hour, minute, second, millisecond, microsecond, nanosecond, iso_year, iso_week, iso_calendar, quarter, is_leap_year };
+pub const Field = enum { year, month, day, day_of_week, day_of_year, hour, minute, second, millisecond, microsecond, nanosecond, iso_year, iso_week, iso_calendar, quarter, is_leap_year, week, us_week, subsecond, year_month_day };
 
 const int64_type = DataType{ .int64 = {} };
 const bool_type = DataType{ .bool = {} };
@@ -41,10 +45,18 @@ const iso_fields = [_]datatype.Field{
 };
 /// Result type of iso_calendar.
 pub const iso_calendar_type = DataType{ .struct_ = .{ .fields = &iso_fields } };
+const ymd_fields = [_]datatype.Field{
+    .{ .name = "year", .data_type = &int64_type },
+    .{ .name = "month", .data_type = &int64_type },
+    .{ .name = "day", .data_type = &int64_type },
+};
+/// Result type of year_month_day.
+pub const year_month_day_type = DataType{ .struct_ = .{ .fields = &ymd_fields } };
+const double_type = DataType{ .double = {} };
 
 fn isTimePart(comptime f: Field) bool {
     return switch (f) {
-        .hour, .minute, .second, .millisecond, .microsecond, .nanosecond => true,
+        .hour, .minute, .second, .millisecond, .microsecond, .nanosecond, .subsecond => true,
         else => false,
     };
 }
@@ -53,19 +65,32 @@ fn outType(comptime f: Field) DataType {
     return switch (f) {
         .is_leap_year => bool_type,
         .iso_calendar => iso_calendar_type,
+        .year_month_day => year_month_day_type,
+        .subsecond => double_type,
         else => int64_type,
     };
 }
+
+/// Week numbering of us_week (Arrow `WeekOptions::USWeek()`).
+const us_week_options = WeekOptions{ .week_starts_monday = false, .count_from_zero = false, .first_week_is_fully_in_year = false };
+
+/// Options read by the extraction loop.
+const Opts = struct { dow: DayOfWeekOptions = .{}, week: WeekOptions = .{} };
 
 /// Register every extraction function for date32 (date parts only), date64 and timestamp.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     inline for (comptime std.meta.tags(Field)) |f| {
         inline for (.{ TypeTag.date32, TypeTag.date64, TypeTag.timestamp }) |tag| {
-            if (!(isTimePart(f) and tag == .date32)) try registry.registerScalarKernel(@tagName(f), .{
+            // Arrow registers subsecond for timestamps (and times), not for date64.
+            if (!(isTimePart(f) and tag == .date32) and !(f == .subsecond and tag == .date64)) try registry.registerScalarKernel(@tagName(f), .{
                 .signature = .{
                     .arity = 1,
                     .type_check = dense.argsOfType(tag, 1),
-                    .options_check = if (f == .day_of_week) dayOfWeekOptions else dense.noOptions,
+                    .options_check = switch (f) {
+                        .day_of_week => dayOfWeekOptions,
+                        .week => weekOptions,
+                        else => dense.noOptions,
+                    },
                     .result_type_fn = dense.resultTypeOf(outType(f)),
                 },
                 .exec = Extract(f).exec,
@@ -83,8 +108,13 @@ fn dayOfWeekOptions(options: Options) bool {
     };
 }
 
+/// Accept `none` (Arrow defaults) or `WeekOptions`.
+fn weekOptions(options: Options) bool {
+    return options == .none or options == .week;
+}
+
 /// Return whether `tz` names UTC (a timezone-naive timestamp is read as UTC too).
-fn isUtc(tz: []const u8) bool {
+pub fn isUtc(tz: []const u8) bool {
     for ([_][]const u8{ "UTC", "Etc/UTC", "+00:00" }) |name| if (std.mem.eql(u8, tz, name)) return true;
     return false;
 }
@@ -104,7 +134,10 @@ fn Extract(comptime f: Field) type {
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
             var arr = try dense.chunkArray(ctx.allocator, values[0]);
             defer arr.release();
-            const dow: DayOfWeekOptions = if (options == .day_of_week) options.day_of_week else .{};
+            const dow: Opts = .{
+                .dow = if (options == .day_of_week) options.day_of_week else .{},
+                .week = if (f == .us_week) us_week_options else if (options == .week) options.week else .{},
+            };
             const data = arr.data();
             return switch (data.data_type) {
                 .date32 => run(i32, 1, 0, ctx, data, len, dow),
@@ -120,7 +153,7 @@ fn Extract(comptime f: Field) type {
         }
 
         /// `per_day`: units per day; `ns_per_unit`: nanoseconds per unit (0 for date32).
-        fn run(comptime V: type, comptime per_day: i64, comptime ns_per_unit: i64, ctx: *ExecContext, data: *const ArrayData, len: usize, dow: DayOfWeekOptions) KernelError!ArrayRef {
+        fn run(comptime V: type, comptime per_day: i64, comptime ns_per_unit: i64, ctx: *ExecContext, data: *const ArrayData, len: usize, dow: Opts) KernelError!ArrayRef {
             const vals = (PrimitiveArray(V){ .data = data }).values() catch return error.InvalidInput;
             switch (f) {
                 .is_leap_year => {
@@ -133,7 +166,13 @@ fn Extract(comptime f: Field) type {
                     }
                     return out.finish() catch error.OutOfMemory;
                 },
-                .iso_calendar => {
+                .subsecond => {
+                    var out = try dense.DenseBinaryOutput(f64).initValidity(ctx.allocator, len, data, null, double_type);
+                    errdefer out.deinit();
+                    for (vals, out.values()) |v, *o| o.* = @as(f64, @floatFromInt(@mod(@mod(@as(i64, v), per_day) * ns_per_unit, 1_000_000_000))) / 1e9;
+                    return out.finish() catch error.OutOfMemory;
+                },
+                .iso_calendar, .year_month_day => {
                     var parts: [3]dense.DenseBinaryOutput(i64) = undefined;
                     var made: usize = 0;
                     defer for (parts[0..made]) |*p| p.deinit();
@@ -143,6 +182,13 @@ fn Extract(comptime f: Field) type {
                     }
                     for (vals, 0..) |v, i| {
                         const days = @divFloor(@as(i64, v), per_day);
+                        if (f == .year_month_day) {
+                            const c = civil(days);
+                            parts[0].values()[i] = c.year;
+                            parts[1].values()[i] = c.month;
+                            parts[2].values()[i] = c.day;
+                            continue;
+                        }
                         const iw = isoWeek(days);
                         parts[0].values()[i] = iw.year;
                         parts[1].values()[i] = iw.week;
@@ -166,7 +212,7 @@ fn Extract(comptime f: Field) type {
                     }
                     errdefer buffers[0].release();
                     return ArrayRef.fromOwnedInline(ctx.allocator, .{
-                        .data_type = iso_calendar_type,
+                        .data_type = outType(f),
                         .length = len,
                         .null_count = null_count,
                         .buffers = &buffers,
@@ -210,7 +256,7 @@ fn Extract(comptime f: Field) type {
             }
         }
 
-        inline fn component(comptime civ: fn (i64) Civil, comptime per_day: i64, comptime ns_per_unit: i64, v: anytype, dow: DayOfWeekOptions) i64 {
+        inline fn component(comptime civ: fn (i64) Civil, comptime per_day: i64, comptime ns_per_unit: i64, v: anytype, opts: Opts) i64 {
             const x: i64 = v;
             if (comptime isTimePart(f)) {
                 const ns = @mod(x, per_day) * ns_per_unit;
@@ -231,9 +277,10 @@ fn Extract(comptime f: Field) type {
                 .day => civ(days).day,
                 .quarter => @divTrunc(civ(days).month - 1, 3) + 1,
                 .day_of_year => dayOfYearWith(civ, days),
-                .day_of_week => @mod(@mod(days + 3, 7) + 1 + 7 - @as(i64, dow.week_start), 7) + @intFromBool(!dow.count_from_zero),
+                .day_of_week => @mod(@mod(days + 3, 7) + 1 + 7 - @as(i64, opts.dow.week_start), 7) + @intFromBool(!opts.dow.count_from_zero),
                 .iso_year => isoWeekWith(civ, days).year,
                 .iso_week => isoWeekWith(civ, days).week,
+                .week, .us_week => weekWith(civ, days, opts.week),
                 else => unreachable,
             };
         }
@@ -365,4 +412,40 @@ pub const IsoWeek = struct { year: i64, week: i64 };
 inline fn isoWeekWith(comptime civ: fn (i64) Civil, days: i64) IsoWeek {
     const thursday = days - @mod(days + 3, 7) + 3;
     return .{ .year = civ(thursday).year, .week = @divTrunc(dayOfYearWith(civ, thursday) - 1, 7) + 1 };
+}
+
+/// Return the week number of `days` after 1970-01-01 under `w` (Arrow `week`): week 1 starts on
+/// the first week start day of the year (`first_week_is_fully_in_year`) or holds the year's 4th
+/// day; days before it are week 0 (`count_from_zero`) or the last week of the previous year,
+/// and late December days in week 1 of the next year count there unless `count_from_zero`.
+pub fn week(days: i64, w: WeekOptions) i64 {
+    return weekWith(civil, days, w);
+}
+
+inline fn weekWith(comptime civ: fn (i64) Civil, days: i64, w: WeekOptions) i64 {
+    const y = civ(days +% @as(i64, if (w.count_from_zero) 0 else 3)).year;
+    var start = weekOneStart(y, w);
+    if (!w.count_from_zero and days < start) start = weekOneStart(y -% 1, w);
+    return @divFloor(days -% start, 7) + 1;
+}
+
+/// First day of week 1 of year `y` under `w`.
+pub fn weekOneStart(y: i64, w: WeekOptions) i64 {
+    const jan1 = daysFromCivil(y, 1, 1);
+    const first: i64 = if (w.week_starts_monday) 0 else 6; // Monday = 0 ... Sunday = 6
+    const wd = @mod(jan1 +% 3, 7);
+    if (w.first_week_is_fully_in_year) return jan1 +% @mod(first - wd, 7);
+    // The first occurrence of the week's 4th day, back to the week start.
+    return jan1 +% @mod(first + 3 - wd, 7) -% 3;
+}
+
+/// Return the days after 1970-01-01 of `year`-`m`-`d` (proleptic Gregorian; Howard Hinnant's
+/// `days_from_civil`, wrapping on years far outside the i64 day range).
+pub fn daysFromCivil(year: i64, m: i64, d: i64) i64 {
+    const y = year -% @intFromBool(m <= 2);
+    const era = @divFloor(y, 400);
+    const yoe = y -% era *% 400; // [0, 399]
+    const doy = @divTrunc(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + d - 1; // [0, 365]
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy; // [0, 146096]
+    return era *% 146_097 +% doe -% 719_468;
 }
