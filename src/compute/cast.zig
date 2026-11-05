@@ -33,13 +33,14 @@
 //!   dictionary of another index or value type (the values are cast first). The target's
 //!   `value_type` must outlive the result.
 //! - the null type to any type above (all rows null).
-//! Other pairs are `UnsupportedType`.
+//! - decimals with decimals, integers, floats and text (`decimal.castArray`). Other pairs: `UnsupportedType`.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const concat = @import("../concat_array_refs.zig");
+const decimal = @import("decimal.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
@@ -86,7 +87,7 @@ fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, _: usize, options: O
     return castArray(ctx, arr, options.cast.to_type.?, options.cast.safe and ctx.safeCastEnabled());
 }
 
-const Kind = enum { null, boolean, number, string, binary, temporal, dictionary, other };
+const Kind = enum { null, boolean, number, string, binary, temporal, decimal, dictionary, other };
 
 fn kindOf(dt: DataType) Kind {
     return switch (dt) {
@@ -96,6 +97,7 @@ fn kindOf(dt: DataType) Kind {
         .string, .large_string, .string_view => .string,
         .binary, .large_binary, .binary_view => .binary,
         .date32, .date64, .timestamp, .time32, .time64, .duration => .temporal,
+        .decimal32, .decimal64, .decimal128, .decimal256 => .decimal,
         .dictionary => .dictionary,
         else => .other,
     };
@@ -116,6 +118,7 @@ fn castArray(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelE
         return castArray(ctx, decoded, to, safe);
     }
     if (tk == .dictionary) return encode(ctx, arr, to, safe, false);
+    if (decimal.handlesCast(from, to)) return decimal.castArray(ctx, arr, to, safe);
     if (sameStorage(from, to)) return reinterpret(ctx, data, to);
     if ((fk == .number or fk == .boolean) and (tk == .number or tk == .boolean)) return numeric(ctx, data, to, safe);
     if ((fk == .number or fk == .boolean) and tk == .string) return toText(ctx, data, to);

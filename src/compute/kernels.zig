@@ -15,6 +15,7 @@ pub const string_transform = @import("string_transform.zig");
 pub const temporal_round = @import("temporal_round.zig");
 pub const set_lookup = @import("set_lookup.zig");
 pub const hash_aggregate = @import("hash_aggregate.zig");
+pub const decimal = @import("decimal.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -30,4 +31,5 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try temporal_round.register(registry);
     try set_lookup.register(registry);
     try hash_aggregate.register(registry);
+    try decimal.register(registry);
 }

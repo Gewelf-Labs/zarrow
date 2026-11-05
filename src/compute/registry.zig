@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const signature_mod = @import("signature.zig");
 
+const TimeUnit = @import("../datatype.zig").TimeUnit;
 const FunctionKind = core.FunctionKind;
 const DataType = core.DataType;
 const Datum = core.Datum;
@@ -68,16 +69,35 @@ pub const AggregateSession = struct {
 };
 
 const function_kind_count = std.enums.values(FunctionKind).len;
+
+/// The type of every argument after the implicit casts: one common type, or one per argument
+/// (at most 4) when only dictionaries were decoded and null types replaced.
+const Targets = struct {
+    all: ?DataType = null,
+    types: [4]DataType = undefined,
+    len: usize = 0,
+
+    fn of(self: *const Targets, i: usize) DataType {
+        return self.all orelse self.types[i];
+    }
+};
 const FunctionIndexMap = std.StringHashMap(usize);
 
 /// Implicit casts a function applies when no kernel matches the argument types (Arrow's
-/// `Function::DispatchBest`).
+/// `Function::DispatchBest`). Every mode but `none` first decodes dictionary arguments to their
+/// value type and, except `element_wise`, gives a null-type argument the type of the first
+/// other argument (all of its rows stay null), as Arrow.
 pub const ImplicitCast = enum {
     /// Argument types must match a kernel exactly.
     none,
     /// Numeric arguments of different types are cast to their common numeric type first (see
-    /// `commonNumericType`).
+    /// `commonNumericType`); decimals with floats go to float64 (`commonDecimalFloatType`).
     numeric,
+    /// `numeric`, then temporal arguments of different units or kinds to their common temporal
+    /// type (`commonTemporalType`): Arrow's comparison `DispatchBest`.
+    comparison,
+    /// `commonNumericType`, then `commonTemporalType` (Arrow's min / max_element_wise).
+    element_wise,
 };
 
 pub const Function = struct {
@@ -291,23 +311,60 @@ pub const FunctionRegistry = struct {
         options: Options,
     ) KernelError!DataType {
         const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
-            const target = self.implicitTarget(err, name, kind, args) orelse return err;
-            // The result type of the call on arguments cast to the common type.
+            const targets = self.implicitTargets(err, name, kind, args) orelse return err;
+            // The result type of the call on the cast arguments.
             var stack: [4]Datum = undefined;
             if (args.len > stack.len) return err;
-            for (stack[0..args.len]) |*a| a.* = .{ .scalar = core.Scalar.init(target, .null) };
+            for (stack[0..args.len], 0..) |*a, i| a.* = .{ .scalar = core.Scalar.init(targets.of(i), .null) };
             return self.resolveResultType(name, kind, stack[0..args.len], options);
         };
         return kernel.signature.inferResultType(args, options);
     }
 
-    /// The common numeric type to cast `args` to when resolution failed with `NoMatchingKernel`
-    /// and the function casts numeric arguments implicitly; null otherwise.
-    fn implicitTarget(self: *const FunctionRegistry, err: KernelError, name: []const u8, kind: FunctionKind, args: []const Datum) ?DataType {
+    /// The types to cast `args` to when resolution failed with `NoMatchingKernel` and the
+    /// function casts arguments implicitly (see `ImplicitCast`); null otherwise.
+    fn implicitTargets(self: *const FunctionRegistry, err: KernelError, name: []const u8, kind: FunctionKind, args: []const Datum) ?Targets {
         if (err != error.NoMatchingKernel) return null;
         const function = self.findFunction(name, kind) orelse return null;
-        if (function.implicit_cast != .numeric) return null;
-        return commonNumericType(args);
+        const mode = function.implicit_cast;
+        if (mode == .none) return null;
+        var stack: [4]Datum = undefined;
+        if (args.len > stack.len) return .{ .all = commonType(mode, args) orelse return null };
+        // Arrow's `EnsureDictionaryDecoded` and (not for element-wise min / max)
+        // `ReplaceNullWithOtherType`: the rules see a dictionary as its value type and a
+        // null-type argument as the type of the first other argument.
+        var other: ?DataType = null;
+        for (args) |a| if (a.dataType() != .null) {
+            other = decoded(a.dataType());
+            break;
+        };
+        var targets: Targets = .{ .len = args.len };
+        var changed = false;
+        for (args, stack[0..args.len], targets.types[0..args.len]) |a, *st, *t| {
+            t.* = decoded(a.dataType());
+            if (t.* == .null and mode != .element_wise) t.* = other orelse t.*;
+            changed = changed or !t.eql(a.dataType());
+            st.* = .{ .scalar = core.Scalar.init(t.*, .null) };
+        }
+        const types = if (changed) stack[0..args.len] else args;
+        if (commonType(mode, types)) |t| return .{ .all = t };
+        if (!changed) return null;
+        // No common type: the decoded types themselves (a kernel may take the mix, such as two
+        // string layouts, or the same type twice).
+        return targets;
+    }
+
+    fn decoded(dt: DataType) DataType {
+        return if (dt == .dictionary) dt.dictionary.value_type.* else dt;
+    }
+
+    fn commonType(mode: ImplicitCast, args: []const Datum) ?DataType {
+        return switch (mode) {
+            .none => null,
+            .numeric => commonNumericType(args) orelse commonDecimalFloatType(args),
+            .comparison => commonNumericType(args) orelse commonDecimalFloatType(args) orelse commonTemporalType(args),
+            .element_wise => commonNumericType(args) orelse commonTemporalType(args),
+        };
     }
 
     /// Explain why result-type inference would fail for the given call site.
@@ -336,23 +393,24 @@ pub const FunctionRegistry = struct {
         options: Options,
     ) KernelError!Datum {
         const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
-            const target = self.implicitTarget(err, name, kind, args) orelse return err;
-            return self.invokeCast(ctx, name, kind, args, options, target);
+            const targets = self.implicitTargets(err, name, kind, args) orelse return err;
+            return self.invokeCast(ctx, name, kind, args, options, targets);
         };
         _ = try kernel.signature.inferResultType(args, options);
         return kernel.exec(ctx, args, options);
     }
 
-    /// Cast every argument that is not of type `target` with the `cast` function (safe unless
+    /// Cast every argument that is not of its target type with the `cast` function (safe unless
     /// `ExecConfig.safe_cast` is false, like Arrow's implicit casts), then invoke `name`.
-    fn invokeCast(self: *const FunctionRegistry, ctx: *ExecContext, name: []const u8, kind: FunctionKind, args: []const Datum, options: Options, target: DataType) KernelError!Datum {
+    fn invokeCast(self: *const FunctionRegistry, ctx: *ExecContext, name: []const u8, kind: FunctionKind, args: []const Datum, options: Options, targets: Targets) KernelError!Datum {
         const cast_args = ctx.allocator.alloc(Datum, args.len) catch return error.OutOfMemory;
         defer ctx.allocator.free(cast_args);
         const owned = ctx.allocator.alloc(bool, args.len) catch return error.OutOfMemory;
         defer ctx.allocator.free(owned);
         @memset(owned, false);
         defer for (cast_args, owned) |*a, o| if (o) a.release();
-        for (args, cast_args, owned) |arg, *c, *o| {
+        for (args, cast_args, owned, 0..) |arg, *c, *o, i| {
+            const target = targets.of(i);
             if (arg.dataType().eql(target)) {
                 c.* = arg;
                 continue;
@@ -475,6 +533,83 @@ pub fn commonNumericType(args: []const Datum) ?DataType {
         32 => .{ .int32 = {} },
         else => .{ .int64 = {} },
     };
+}
+
+/// float64 when the arguments are numbers and decimals with at least one decimal and one float
+/// (Arrow's `CastBinaryDecimalArgs` / `CastDecimalArgs`: decimal with float is float64); null otherwise.
+pub fn commonDecimalFloatType(args: []const Datum) ?DataType {
+    var any_decimal = false;
+    var any_float = false;
+    for (args) |arg| switch (arg.dataType()) {
+        .decimal32, .decimal64, .decimal128, .decimal256 => any_decimal = true,
+        .float, .double => any_float = true,
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => {},
+        else => return null,
+    };
+    return if (any_decimal and any_float) .{ .double = {} } else null;
+}
+
+/// Arrow's `CommonTemporal` over arguments of different types: null unless every argument is
+/// date32, date64, timestamp, time32, time64 or duration and two of them differ. Timestamps
+/// (with dates) give a timestamp of the finest unit (at least millisecond with a date64) in their
+/// timezone, which must be the same for all (naive and zoned never mix); dates alone give date64
+/// when one is date64, else date32; durations alone the finest duration; times alone the finest
+/// time32 / time64. Times never mix with the other kinds. The returned type may borrow the
+/// timezone of an argument.
+pub fn commonTemporalType(args: []const Datum) ?DataType {
+    if (args.len < 2) return null;
+    var finest: TimeUnit = .second;
+    var timezone: ?[]const u8 = null;
+    var saw_timestamp = false;
+    var saw_date32 = false;
+    var saw_date64 = false;
+    var saw_duration = false;
+    var saw_time = false;
+    var differ = false;
+    for (args) |arg| {
+        const dt = arg.dataType();
+        if (!dt.eql(args[0].dataType())) differ = true;
+        switch (dt) {
+            .date32 => saw_date32 = true,
+            .date64 => {
+                saw_date64 = true;
+                finest = finer(finest, .millisecond);
+            },
+            .timestamp => |ts| {
+                if (saw_timestamp) {
+                    const same = if (timezone == null or ts.timezone == null) timezone == null and ts.timezone == null else std.mem.eql(u8, timezone.?, ts.timezone.?);
+                    if (!same) return null;
+                }
+                saw_timestamp = true;
+                timezone = ts.timezone;
+                finest = finer(finest, ts.unit);
+            },
+            .duration => |d| {
+                saw_duration = true;
+                finest = finer(finest, d.unit);
+            },
+            .time32, .time64 => |t| {
+                saw_time = true;
+                finest = finer(finest, t.unit);
+            },
+            else => return null,
+        }
+    }
+    if (!differ) return null;
+    const dated = saw_timestamp or saw_date32 or saw_date64 or saw_duration;
+    if (saw_time and dated) return null;
+    if (saw_timestamp) return .{ .timestamp = .{ .unit = finest, .timezone = timezone } };
+    if (saw_date64) return .{ .date64 = {} };
+    if (saw_date32) return .{ .date32 = {} };
+    if (saw_duration) return .{ .duration = .{ .unit = finest } };
+    return switch (finest) {
+        .second, .millisecond => .{ .time32 = .{ .unit = finest } },
+        .microsecond, .nanosecond => .{ .time64 = .{ .unit = finest } },
+    };
+}
+
+fn finer(a: TimeUnit, b: TimeUnit) TimeUnit {
+    return if (@intFromEnum(b) > @intFromEnum(a)) b else a;
 }
 
 fn initFunctionIndexMaps(allocator: std.mem.Allocator) [function_kind_count]FunctionIndexMap {

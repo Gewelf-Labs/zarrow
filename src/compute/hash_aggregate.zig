@@ -6,12 +6,21 @@
 //! followed by one column per aggregate.
 //!
 //! Functions: hash_sum, hash_mean, hash_min, hash_max, hash_min_max (int8..int64, uint8..uint64,
-//! float32/64, the output types and NaN / overflow rules of sum / mean / min / max / min_max);
-//! hash_count (valid rows) for every type with a validity bitmap; hash_count_all (rows per group;
-//! one argument, the group ids, like Arrow's nullary hash_count_all); hash_any, hash_all (bool);
-//! hash_count_distinct and hash_distinct (`list<T>`, first-seen order) for every key type. Nulls
-//! are skipped and a group with no valid value is null (Arrow's `ScalarAggregateOptions` /
-//! `CountOptions` defaults: skip_nulls, min_count 1, only_valid; the options are not exposed).
+//! float32/64, the output types and NaN / overflow rules of sum / mean / min / max / min_max;
+//! hash_sum, hash_mean, hash_min and hash_max also on decimal128 / decimal256 with the decimal
+//! rules of aggregate_basic.zig); hash_count for every type with a validity bitmap; hash_count_all
+//! (rows per group; one argument, the group ids, like Arrow's nullary hash_count_all); hash_any,
+//! hash_all (bool); hash_count_distinct and hash_distinct (`list<T>`, first-seen order) for every
+//! key type.
+//!
+//! Options, as Arrow's hash kernels (`none` gives the defaults): `ScalarAggregateOptions` for
+//! hash_sum, hash_mean, hash_min, hash_max, hash_min_max, hash_any and hash_all (a group with a
+//! null row and `skip_nulls` false, or fewer valid rows than `min_count`, is null; with
+//! `min_count` 0 an empty group sums to 0 and its float mean is NaN, min / max stay null;
+//! hash_any / hash_all without `skip_nulls` use Kleene logic) and `CountOptions` for hash_count,
+//! hash_count_distinct and hash_distinct (`only_valid` counts / lists the non-null values,
+//! `only_null` the nulls, `all` both; a null is one distinct value). `groupBy` hands each
+//! `Aggregate.options` to its function.
 //! Each kernel has an `AggregateLifecycle`: `update` takes (values, group ids) batches whose ids
 //! may grow, `merge` adds another state over the same group ids, `finalize` returns the groups
 //! seen so far. A one-shot call (`invoke`) requires every group id to be below its number of rows
@@ -26,6 +35,8 @@ const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
+const aggregate_basic = @import("aggregate_basic.zig");
+const decimal = @import("decimal.zig");
 const dense = @import("dense.zig");
 const is_null = @import("is_null.zig");
 const concat = @import("../concat_array_refs.zig");
@@ -403,23 +414,54 @@ pub const Grouper = struct {
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     inline for (dense.numeric_types) |T| {
         const tag = comptime std.meta.activeTag(dense.dataTypeOf(T));
-        try add(registry, "hash_sum", withIds(tag), Grouped(Sum(T, .sum)));
-        try add(registry, "hash_mean", withIds(tag), Grouped(Sum(T, .mean)));
-        try add(registry, "hash_min", withIds(tag), Grouped(MinMax(T, .min)));
-        try add(registry, "hash_max", withIds(tag), Grouped(MinMax(T, .max)));
-        try add(registry, "hash_min_max", withIds(tag), Grouped(MinMax(T, .min_max)));
+        try add(registry, "hash_sum", withIds(tag), aggregateOptions, Grouped(Sum(T, .sum)));
+        try add(registry, "hash_mean", withIds(tag), aggregateOptions, Grouped(Sum(T, .mean)));
+        try add(registry, "hash_min", withIds(tag), aggregateOptions, Grouped(MinMax(T, .min)));
+        try add(registry, "hash_max", withIds(tag), aggregateOptions, Grouped(MinMax(T, .max)));
+        try add(registry, "hash_min_max", withIds(tag), aggregateOptions, Grouped(MinMax(T, .min_max)));
     }
-    try add(registry, "hash_count", countArgs, Grouped(Count(.count)));
-    try add(registry, "hash_count_all", idsOnly, Grouped(Count(.count_all)));
-    try add(registry, "hash_any", withIds(.bool), Grouped(AnyAll(.any)));
-    try add(registry, "hash_all", withIds(.bool), Grouped(AnyAll(.all)));
-    try add(registry, "hash_count_distinct", distinctArgs, Distinct(.count));
-    try add(registry, "hash_distinct", distinctArgs, Distinct(.list));
+    inline for (.{ i128, i256 }) |T| {
+        const check = comptime withIds(if (T == i128) .decimal128 else .decimal256);
+        try add(registry, "hash_sum", check, aggregateOptions, Grouped(DecimalSum(T, .sum)));
+        try add(registry, "hash_mean", check, aggregateOptions, Grouped(DecimalSum(T, .mean)));
+        try add(registry, "hash_min", check, aggregateOptions, Grouped(DecimalMinMax(T, .min)));
+        try add(registry, "hash_max", check, aggregateOptions, Grouped(DecimalMinMax(T, .max)));
+    }
+    try add(registry, "hash_count", countArgs, countOptions, Grouped(Count(.count)));
+    try add(registry, "hash_count_all", idsOnly, dense.noOptions, Grouped(Count(.count_all)));
+    try add(registry, "hash_any", withIds(.bool), aggregateOptions, Grouped(AnyAll(.any)));
+    try add(registry, "hash_all", withIds(.bool), aggregateOptions, Grouped(AnyAll(.all)));
+    try add(registry, "hash_count_distinct", distinctArgs, countOptions, Distinct(.count));
+    try add(registry, "hash_distinct", distinctArgs, countOptions, Distinct(.list));
 }
 
-fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime check: TypeCheckFn, comptime A: type) KernelError!void {
+/// `none` (Arrow defaults) or `ScalarAggregateOptions`.
+fn aggregateOptions(options: Options) bool {
+    return options == .none or options == .scalar_aggregate;
+}
+
+/// `none` (only_valid) or `CountOptions`.
+fn countOptions(options: Options) bool {
+    return options == .none or options == .count;
+}
+
+fn scalarOptions(options: Options) core.ScalarAggregateOptions {
+    return if (options == .scalar_aggregate) options.scalar_aggregate else .{};
+}
+
+fn countMode(options: Options) core.CountMode {
+    return if (options == .count) options.count.mode else .only_valid;
+}
+
+/// Whether the options make a group null: a null row with `skip_nulls` false, or fewer valid
+/// rows than `min_count` (Arrow C++).
+fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
+    return (!o.skip_nulls and nulls > 0) or count < o.min_count;
+}
+
+fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime A: type) KernelError!void {
     try registry.registerKernel(name, .hash_aggregate, .{
-        .signature = .{ .arity = if (A.ids_only) 1 else 2, .type_check = check, .options_check = dense.noOptions, .result_type_fn = A.resultType },
+        .signature = .{ .arity = if (A.ids_only) 1 else 2, .type_check = check, .options_check = options_check, .result_type_fn = A.resultType },
         .exec = A.exec,
         .aggregate_lifecycle = .{ .init = A.init, .update = A.update, .merge = A.merge, .finalize = A.finalize, .deinit = A.deinit },
     });
@@ -490,6 +532,8 @@ fn Grouped(comptime Impl: type) type {
             allocator: std.mem.Allocator,
             groups: std.ArrayList(Group) = .empty,
             seen: Seen = .{},
+            /// Type of the values (null for the ids-only functions or before any update).
+            value_type: ?DataType = null,
 
             fn grow(self: *State, n: usize) KernelError!void {
                 if (n > self.groups.items.len) self.groups.appendNTimes(self.allocator, .{}, n - self.groups.items.len) catch return error.OutOfMemory;
@@ -497,20 +541,23 @@ fn Grouped(comptime Impl: type) type {
 
             pub fn piece(self: *State, values: ?ArrayRef, ids: []const u32, groups: usize) KernelError!void {
                 try self.grow(groups);
+                if (values) |v| self.value_type = v.data().data_type;
                 try Impl.update(self.groups.items, if (values) |v| v.data() else null, ids);
             }
         };
 
-        fn resultType(_: []const Datum, _: Options) KernelError!DataType {
+        fn resultType(args: []const Datum, _: Options) KernelError!DataType {
+            if (@hasDecl(Impl, "resultType")) return Impl.resultType(args);
             return Impl.out_type;
         }
 
         /// Aggregate the values of every group: one row per group id.
-        fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             var state: State = .{ .allocator = ctx.allocator };
             defer state.groups.deinit(ctx.allocator);
+            if (!ids_only and args.len > 0) state.value_type = args[0].dataType();
             try forEachPiece(ctx.allocator, args, ids_only, true, &state.seen, &state);
-            return .{ .array = try Impl.finalize(ctx, state.groups.items) };
+            return .{ .array = try Impl.finalize(ctx, state.groups.items, state.value_type, options) };
         }
 
         fn init(ctx: *ExecContext, _: Options) KernelError!*anyopaque {
@@ -531,10 +578,12 @@ fn Grouped(comptime Impl: type) type {
             for (s.groups.items[0..o.groups.items.len], o.groups.items) |*a, b| Impl.mergeGroup(a, b);
             s.seen.rows += o.seen.rows;
             s.seen.groups = @max(s.seen.groups, o.seen.groups);
+            if (s.value_type == null) s.value_type = o.value_type;
         }
 
-        fn finalize(ctx: *ExecContext, state: *anyopaque, _: Options) KernelError!Datum {
-            return .{ .array = try Impl.finalize(ctx, cast(state).groups.items) };
+        fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
+            const s = cast(state);
+            return .{ .array = try Impl.finalize(ctx, s.groups.items, s.value_type, options) };
         }
 
         fn deinit(ctx: *ExecContext, state: *anyopaque) void {
@@ -554,11 +603,13 @@ fn typedValues(comptime T: type, data: *const ArrayData) KernelError![]const T {
     return (PrimitiveArray(T){ .data = data }).values() catch error.InvalidInput;
 }
 
-/// Run `f(group, value)` for every valid row.
+/// Run `f(group, value)` for every valid row and count the null rows of every group.
 inline fn eachValid(comptime T: type, data: *const ArrayData, ids: []const u32, groups: anytype, comptime f: anytype) KernelError!void {
     const vals = try typedValues(T, data);
     if (dense.validityBits(data)) |bits| {
-        for (vals, ids, 0..) |v, id, i| if (bitmap.bitIsSet(bits, data.offset + i)) f(&groups[id], v);
+        for (vals, ids, 0..) |v, id, i| {
+            if (bitmap.bitIsSet(bits, data.offset + i)) f(&groups[id], v) else groups[id].nulls += 1;
+        }
     } else {
         for (vals, ids) |v, id| f(&groups[id], v);
     }
@@ -596,7 +647,7 @@ fn Sum(comptime T: type, comptime which: enum { sum, mean }) type {
     const Out = if (which == .mean or is_float) f64 else if (signed) i64 else u64;
     return struct {
         const ids_only = false;
-        const Group = struct { sum: Exact = 0, count: u64 = 0 };
+        const Group = struct { sum: Exact = 0, count: u64 = 0, nulls: u64 = 0 };
         const out_type = dense.dataTypeOf(Out);
 
         fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
@@ -611,17 +662,19 @@ fn Sum(comptime T: type, comptime which: enum { sum, mean }) type {
         fn mergeGroup(a: *Group, b: Group) void {
             a.sum += b.sum;
             a.count += b.count;
+            a.nulls += b.nulls;
         }
 
-        fn finalize(ctx: *ExecContext, groups: []const Group) KernelError!ArrayRef {
-            return fixedOutput(Out, ctx.allocator, out_type, groups.len, .{ ctx, groups }, struct {
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            return fixedOutput(Out, ctx.allocator, out_type, groups.len, .{ ctx, groups, scalarOptions(options) }, struct {
                 fn fill(c: anytype, out: []Out, valid: []u8) KernelError!void {
                     for (c[1], out, 0..) |g, *o, i| {
-                        if (g.count == 0) {
+                        if (nullByOptions(c[2], g.count, g.nulls)) {
                             bitmap.clearBit(valid, i);
                             o.* = 0;
                             continue;
                         }
+                        // min_count 0: an empty group sums to 0, its mean is NaN (0 / 0).
                         o.* = if (which == .mean)
                             (if (is_float) g.sum else @as(f64, @floatFromInt(g.sum))) / @as(f64, @floatFromInt(g.count))
                         else if (is_float)
@@ -644,7 +697,7 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
     const max_start: T = if (is_float) std.math.nan(T) else std.math.minInt(T);
     return struct {
         const ids_only = false;
-        const Group = struct { min: T = min_start, max: T = max_start, count: u64 = 0 };
+        const Group = struct { min: T = min_start, max: T = max_start, count: u64 = 0, nulls: u64 = 0 };
         const elem_type = dense.dataTypeOf(T);
         const fields = [_]datatype.Field{
             .{ .name = "min", .data_type = &elem_type },
@@ -667,14 +720,15 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
             a.min = @min(a.min, b.min);
             a.max = @max(a.max, b.max);
             a.count += b.count;
+            a.nulls += b.nulls;
         }
 
-        fn side(ctx: *ExecContext, groups: []const Group, comptime is_min: bool) KernelError!ArrayRef {
-            return fixedOutput(T, ctx.allocator, elem_type, groups.len, groups, struct {
-                fn fill(gs: []const Group, out: []T, valid: []u8) KernelError!void {
-                    for (gs, out, 0..) |g, *o, i| {
+        fn side(ctx: *ExecContext, groups: []const Group, opts: core.ScalarAggregateOptions, comptime is_min: bool) KernelError!ArrayRef {
+            return fixedOutput(T, ctx.allocator, elem_type, groups.len, .{ groups, opts }, struct {
+                fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
+                    for (c[0], out, 0..) |g, *o, i| {
                         o.* = if (is_min) g.min else g.max;
-                        if (g.count == 0) {
+                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
                             bitmap.clearBit(valid, i);
                             o.* = 0;
                         }
@@ -683,10 +737,11 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
             }.fill);
         }
 
-        fn finalize(ctx: *ExecContext, groups: []const Group) KernelError!ArrayRef {
-            if (which != .min_max) return side(ctx, groups, which == .min);
-            var mins = try side(ctx, groups, true);
-            var maxs = side(ctx, groups, false) catch |err| {
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            const o = scalarOptions(options);
+            if (which != .min_max) return side(ctx, groups, o, which == .min);
+            var mins = try side(ctx, groups, o, true);
+            var maxs = side(ctx, groups, o, false) catch |err| {
                 mins.release();
                 return err;
             };
@@ -710,29 +765,37 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
 fn Count(comptime which: enum { count, count_all }) type {
     return struct {
         const ids_only = which == .count_all;
-        const Group = struct { n: u64 = 0 };
+        /// Valid rows and all rows of the group.
+        const Group = struct { valid: u64 = 0, rows: u64 = 0 };
         const out_type = int64_type;
 
         fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
-            if (which == .count_all) {
-                for (ids) |id| groups[id].n += 1;
-                return;
-            }
+            for (ids) |id| groups[id].rows += 1;
+            if (which == .count_all) return;
             const d = data.?;
             if (datatype.storageDataType(d.data_type) == .null) return;
             if (dense.validityBits(d)) |bits| {
-                for (ids, 0..) |id, i| groups[id].n += @intFromBool(bitmap.bitIsSet(bits, d.offset + i));
-            } else for (ids) |id| groups[id].n += 1;
+                for (ids, 0..) |id, i| groups[id].valid += @intFromBool(bitmap.bitIsSet(bits, d.offset + i));
+            } else for (ids) |id| groups[id].valid += 1;
         }
 
         fn mergeGroup(a: *Group, b: Group) void {
-            a.n += b.n;
+            a.valid += b.valid;
+            a.rows += b.rows;
         }
 
-        fn finalize(ctx: *ExecContext, groups: []const Group) KernelError!ArrayRef {
-            return fixedOutput(i64, ctx.allocator, out_type, groups.len, groups, struct {
-                fn fill(gs: []const Group, out: []i64, _: []u8) KernelError!void {
-                    for (gs, out) |g, *o| o.* = std.math.cast(i64, g.n) orelse return error.Overflow;
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            const mode: core.CountMode = if (which == .count_all) .all else countMode(options);
+            return fixedOutput(i64, ctx.allocator, out_type, groups.len, .{ groups, mode }, struct {
+                fn fill(c: anytype, out: []i64, _: []u8) KernelError!void {
+                    for (c[0], out) |g, *o| {
+                        const n = switch (c[1]) {
+                            .only_valid => g.valid,
+                            .only_null => g.rows - g.valid,
+                            .all => g.rows,
+                        };
+                        o.* = std.math.cast(i64, n) orelse return error.Overflow;
+                    }
                 }
             }.fill);
         }
@@ -742,14 +805,17 @@ fn Count(comptime which: enum { count, count_all }) type {
 fn AnyAll(comptime which: enum { any, all }) type {
     return struct {
         const ids_only = false;
-        const Group = struct { any_true: bool = false, any_false: bool = false, count: u64 = 0 };
+        const Group = struct { any_true: bool = false, any_false: bool = false, count: u64 = 0, nulls: u64 = 0 };
         const out_type = bool_type;
 
         fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
             const d = data.?;
             const bits = dense.validityBits(d);
             for (ids, 0..) |id, i| {
-                if (bits) |b| if (!bitmap.bitIsSet(b, d.offset + i)) continue;
+                if (bits) |b| if (!bitmap.bitIsSet(b, d.offset + i)) {
+                    groups[id].nulls += 1;
+                    continue;
+                };
                 const g = &groups[id];
                 if (bitmap.bitIsSet(d.buffers[1].data, d.offset + i)) g.any_true = true else g.any_false = true;
                 g.count += 1;
@@ -760,13 +826,18 @@ fn AnyAll(comptime which: enum { any, all }) type {
             a.any_true = a.any_true or b.any_true;
             a.any_false = a.any_false or b.any_false;
             a.count += b.count;
+            a.nulls += b.nulls;
         }
 
-        fn finalize(ctx: *ExecContext, groups: []const Group) KernelError!ArrayRef {
-            return fixedOutput(bool, ctx.allocator, out_type, groups.len, groups, struct {
-                fn fill(gs: []const Group, out: []u8, valid: []u8) KernelError!void {
-                    for (gs, 0..) |g, i| {
-                        if (g.count == 0) {
+        fn finalize(ctx: *ExecContext, groups: []const Group, _: ?DataType, options: Options) KernelError!ArrayRef {
+            return fixedOutput(bool, ctx.allocator, out_type, groups.len, .{ groups, scalarOptions(options) }, struct {
+                fn fill(c: anytype, out: []u8, valid: []u8) KernelError!void {
+                    const o: core.ScalarAggregateOptions = c[1];
+                    for (c[0], 0..) |g, i| {
+                        // Kleene without skip_nulls: a null row decides unless a true (any) /
+                        // false (all) row already did.
+                        const decided = if (which == .any) g.any_true else g.any_false;
+                        if ((!o.skip_nulls and !decided and g.nulls > 0) or g.count < o.min_count) {
                             bitmap.clearBit(valid, i);
                             continue;
                         }
@@ -778,8 +849,8 @@ fn AnyAll(comptime which: enum { any, all }) type {
     };
 }
 
-/// hash_count_distinct / hash_distinct: a `Grouper` over (group id, value) pairs; pairs whose
-/// value is null are left out (Arrow's `CountOptions` default `only_valid`).
+/// hash_count_distinct / hash_distinct: a `Grouper` over (group id, value) pairs; `CountOptions`
+/// picks the pairs whose value is valid (`only_valid`, the default), null (`only_null`) or both.
 fn Distinct(comptime which: enum { count, list }) type {
     return struct {
         const ids_only = false;
@@ -820,11 +891,11 @@ fn Distinct(comptime which: enum { count, list }) type {
             });
         }
 
-        fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             var state: State = .{ .allocator = ctx.allocator };
             defer state.deinit();
             try forEachPiece(ctx.allocator, args, false, true, &state.seen, &state);
-            return .{ .array = try finish(ctx, &state, args[0].dataType()) };
+            return .{ .array = try finish(ctx, &state, args[0].dataType(), countMode(options)) };
         }
 
         fn init(ctx: *ExecContext, _: Options) KernelError!*anyopaque {
@@ -858,9 +929,9 @@ fn Distinct(comptime which: enum { count, list }) type {
             ids.release();
         }
 
-        fn finalize(ctx: *ExecContext, state: *anyopaque, _: Options) KernelError!Datum {
+        fn finalize(ctx: *ExecContext, state: *anyopaque, options: Options) KernelError!Datum {
             const s = cast(state);
-            return .{ .array = try finish(ctx, s, s.value_type orelse .{ .null = {} }) };
+            return .{ .array = try finish(ctx, s, s.value_type orelse .{ .null = {} }, countMode(options)) };
         }
 
         fn deinit(ctx: *ExecContext, state: *anyopaque) void {
@@ -873,8 +944,17 @@ fn Distinct(comptime which: enum { count, list }) type {
             return @ptrCast(@alignCast(state));
         }
 
-        /// Count (or list) the non-null distinct values of every group.
-        fn finish(ctx: *ExecContext, s: *State, value_type: DataType) KernelError!ArrayRef {
+        /// Whether a distinct pair with this value validity is kept under `mode`.
+        inline fn kept(mode: core.CountMode, is_null_value: bool) bool {
+            return switch (mode) {
+                .only_valid => !is_null_value,
+                .only_null => is_null_value,
+                .all => true,
+            };
+        }
+
+        /// Count (or list) the distinct values of every group that `mode` keeps.
+        fn finish(ctx: *ExecContext, s: *State, value_type: DataType, mode: core.CountMode) KernelError!ArrayRef {
             const allocator = ctx.allocator;
             const n = s.seen.groups;
             const counts = allocator.alloc(usize, n + 1) catch return error.OutOfMemory;
@@ -888,7 +968,7 @@ fn Distinct(comptime which: enum { count, list }) type {
             if (s.pairs) |*p| keys = try p.uniques();
             const group_of: []const u32 = if (keys.len > 0) try typedValues(u32, keys[0].data()) else &.{};
             for (group_of, 0..) |g, i| {
-                if (!keys[1].data().isNull(i)) counts[g + 1] += 1;
+                if (kept(mode, keys[1].data().isNull(i))) counts[g + 1] += 1;
             }
             if (which == .count) {
                 return fixedOutput(i64, allocator, int64_type, n, counts[1..], struct {
@@ -907,7 +987,7 @@ fn Distinct(comptime which: enum { count, list }) type {
             const fill = allocator.dupe(usize, counts[0..n]) catch return error.OutOfMemory;
             defer allocator.free(fill);
             for (group_of, 0..) |g, i| {
-                if (keys[1].data().isNull(i)) continue;
+                if (!kept(mode, keys[1].data().isNull(i))) continue;
                 order[fill[g]] = i;
                 fill[g] += 1;
             }
@@ -928,6 +1008,109 @@ fn Distinct(comptime which: enum { count, list }) type {
                 .buffers = &buffers,
                 .children = &children,
             }) catch error.OutOfMemory;
+        }
+    };
+}
+
+/// hash_sum / hash_mean of decimal128 / decimal256: exact sums (`aggregate_basic` rules).
+fn DecimalSum(comptime T: type, comptime which: enum { sum, mean }) type {
+    const Exact = if (T == i128) i256 else i512;
+    const max_p: u8 = if (T == i128) 38 else 76;
+    return struct {
+        const ids_only = false;
+        const Group = struct { sum: Exact = 0, count: u64 = 0, nulls: u64 = 0 };
+
+        fn outType(dt: DataType) KernelError!DataType {
+            const p = try decimal.checkedParams(dt);
+            if (which == .mean) return dt;
+            const out: decimal.Params = .{ .precision = max_p, .scale = p.scale };
+            return if (T == i128) .{ .decimal128 = out } else .{ .decimal256 = out };
+        }
+
+        pub fn resultType(args: []const Datum) KernelError!DataType {
+            if (args.len != 2) return error.InvalidArity;
+            return outType(args[0].dataType());
+        }
+
+        fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
+            _ = try decimal.checkedParams(data.?.data_type);
+            try eachValid(T, data.?, ids, groups, struct {
+                inline fn f(g: *Group, v: T) void {
+                    g.sum += v;
+                    g.count += 1;
+                }
+            }.f);
+        }
+
+        fn mergeGroup(a: *Group, b: Group) void {
+            a.sum += b.sum;
+            a.count += b.count;
+            a.nulls += b.nulls;
+        }
+
+        fn finalize(ctx: *ExecContext, groups: []const Group, value_type: ?DataType, options: Options) KernelError!ArrayRef {
+            const out_type = try outType(value_type orelse return error.InvalidInput);
+            return fixedOutput(T, ctx.allocator, out_type, groups.len, .{ ctx, groups, scalarOptions(options) }, struct {
+                fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
+                    for (c[1], out, 0..) |g, *o, i| {
+                        o.* = 0;
+                        if (nullByOptions(c[2], g.count, g.nulls) or (which == .mean and g.count == 0)) {
+                            bitmap.clearBit(valid, i);
+                            continue;
+                        }
+                        o.* = if (which == .mean)
+                            @intCast(aggregate_basic.roundedMean(Exact, g.sum, g.count))
+                        else
+                            try aggregate_basic.decimalSumValue(T, Exact, c[0], g.sum);
+                    }
+                }
+            }.fill);
+        }
+    };
+}
+
+/// hash_min / hash_max of decimal128 / decimal256.
+fn DecimalMinMax(comptime T: type, comptime which: enum { min, max }) type {
+    const start: T = if (which == .min) std.math.maxInt(T) else std.math.minInt(T);
+    return struct {
+        const ids_only = false;
+        const Group = struct { v: T = start, count: u64 = 0, nulls: u64 = 0 };
+
+        pub fn resultType(args: []const Datum) KernelError!DataType {
+            if (args.len != 2) return error.InvalidArity;
+            _ = try decimal.checkedParams(args[0].dataType());
+            return args[0].dataType();
+        }
+
+        fn update(groups: []Group, data: ?*const ArrayData, ids: []const u32) KernelError!void {
+            _ = try decimal.checkedParams(data.?.data_type);
+            try eachValid(T, data.?, ids, groups, struct {
+                inline fn f(g: *Group, v: T) void {
+                    g.v = if (which == .min) @min(g.v, v) else @max(g.v, v);
+                    g.count += 1;
+                }
+            }.f);
+        }
+
+        fn mergeGroup(a: *Group, b: Group) void {
+            a.v = if (which == .min) @min(a.v, b.v) else @max(a.v, b.v);
+            a.count += b.count;
+            a.nulls += b.nulls;
+        }
+
+        fn finalize(ctx: *ExecContext, groups: []const Group, value_type: ?DataType, options: Options) KernelError!ArrayRef {
+            const out_type = value_type orelse return error.InvalidInput;
+            return fixedOutput(T, ctx.allocator, out_type, groups.len, .{ groups, scalarOptions(options) }, struct {
+                fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
+                    for (c[0], out, 0..) |g, *o, i| {
+                        o.* = g.v;
+                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
+                            bitmap.clearBit(valid, i);
+                            o.* = 0;
+                        }
+                    }
+                }
+            }.fill);
         }
     };
 }

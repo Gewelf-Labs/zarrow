@@ -4,6 +4,8 @@ test {
     _ = @import("test_iterators.zig");
     _ = @import("test_options.zig");
     _ = @import("dense.zig");
+    _ = @import("decimal.zig");
+    _ = @import("test_decimal.zig");
     _ = @import("test_arithmetic.zig");
     _ = @import("test_comparison.zig");
     _ = @import("test_logical.zig");

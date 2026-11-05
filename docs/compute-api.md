@@ -35,18 +35,19 @@ defer sum.release();
 
 | Family | File | Functions |
 |---|---|---|
-| Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` and their `_checked` variants (int8..int64, uint8..uint64, float32/64) |
-| Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string and binary layouts, fixed_size_binary, temporal, decimal); `min_element_wise`, `max_element_wise` (numeric, temporal, string and binary layouts; `ElementWiseAggregateOptions`) |
+| Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` and their `_checked` variants, `sign` (int8..int64, uint8..uint64, float32/64) |
+| Decimals | `decimal.zig` | the decimal kernels of `add`, `subtract`, `multiply`, `divide` (+ `_checked`; decimal32..decimal256, also with an integer), `negate`, `abs` (+ `_checked`) and `sign` (decimal128 / decimal256); the decimal casts behind `cast`; the decimal helpers of the comparison and aggregate families |
+| Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string and binary layouts, fixed_size_binary, temporal, decimal; mixed byte layouts and mixed decimals compared in place); `min_element_wise`, `max_element_wise` (numeric, temporal, decimal, fixed_size_binary, string and binary layouts; `ElementWiseAggregateOptions`) |
 | Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene`, `and_not_kleene` |
-| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`), `count` (`CountOptions`), `count_all` (one argument or none) |
+| Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`; sum, mean, min, max also on decimal128 / decimal256), `count` (`CountOptions`), `count_all` (one argument or none) |
 | Categorizations | `is_null.zig` | `is_null` (`NullOptions`), `is_valid`, `true_unless_null`, `is_nan`, `is_finite`, `is_inf` |
-| Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp / time32 / time64 / duration units, timestamp to time of day, same-width integers and temporal types, dictionary decode and encode (every index width), the null type |
+| Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp / time32 / time64 / duration units, timestamp to time of day, same-width integers and temporal types, dictionary decode and encode (every index width), the null type; decimals to and from decimals, integers, floats and text (`decimal.zig`) |
 | Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `ascii_swapcase`, `ascii_capitalize`, `ascii_title`, `ascii_reverse` (ASCII letters), `utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title` (Unicode simple case mappings), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `utf8_trim`, `utf8_ltrim`, `utf8_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alnum`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_lower`, `ascii_is_printable`, `ascii_is_space`, `ascii_is_title`, `ascii_is_upper`, `utf8_is_alnum`, `utf8_is_alpha`, `utf8_is_decimal`, `utf8_is_digit`, `utf8_is_lower`, `utf8_is_numeric`, `utf8_is_printable`, `utf8_is_space`, `utf8_is_title`, `utf8_is_upper` (string, large_string, string_view) |
 | String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `utf8_zero_fill`, `utf8_replace_slice`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding, zero fill, replace_slice and whitespace splits on the string layouts), `binary_slice`, `binary_reverse`, `binary_replace_slice` (binary layouts), `binary_join` (`list<T>` / `large_list<T>` with a `T` separator) |
 | Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `us_year`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp, time32, time64); `subsecond` (timestamp, time32, time64) |
 | Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between` (date32, date64, timestamp); `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between`, `day_time_interval_between`, `month_day_nano_interval_between` and the rounding functions (also time32, time64) |
 | Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, string and binary layouts) |
-| Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy`; kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_count`, `hash_count_all`, `hash_any`, `hash_all`, `hash_count_distinct`, `hash_distinct` (values plus uint32 group ids, one row per group) |
+| Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy` (per-aggregate options); kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_any`, `hash_all` (`ScalarAggregateOptions`; the first four also on decimal128 / decimal256), `hash_count`, `hash_count_distinct`, `hash_distinct` (`CountOptions`), `hash_count_all` (values plus uint32 group ids, one row per group) |
 
 Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
 scalars give a scalar); aggregates take one array, chunked array or scalar and return a scalar; grouped
@@ -65,19 +66,44 @@ defer batch.deinit(); // columns: k (one row per group, first-seen order), total
 ### Implicit casts
 
 Arrow C++ functions pick a kernel with `DispatchBest`, which may cast arguments first. Here a function
-registered with `ImplicitCast.numeric` (`FunctionRegistry.setImplicitCast`) does the numeric part of it:
-when no kernel matches and every argument is int8..int64, uint8..uint64, float32 or float64, the arguments
-are cast with the `cast` function to their common type (`commonNumericType`, Arrow's `CommonNumeric`) and
-the call is resolved again. The rule: any float64 gives float64, else any float32 gives float32 (even for
-int64, as Arrow); integers of one signedness give the widest; signed with unsigned gives the signed type
-wider than every unsigned one (int8 + uint8 is int16, int32 + uint32 is int64, uint64 + int64 is int64).
-The cast is safe unless `ExecConfig.safe_cast` is false, so a value the common type cannot hold (2^60 to
-float64, 2^63 as int64) is `InvalidCast`, as in Arrow. `add`, `subtract`, `multiply`, `divide` (and
-`_checked`), the six comparisons and `min_element_wise` / `max_element_wise` cast this way;
-`resolveResultType` reports the type of the cast call. Other mismatches stay `NoMatchingKernel` (Arrow
-also unifies string / binary layouts, timestamp units and decimal scales; call `cast` for those). Exact
-semantics, including the differences from Arrow C++, are in
+registered with an `ImplicitCast` mode (`FunctionRegistry.setImplicitCast`) does the same when no kernel
+matches: dictionary arguments are decoded to their value type and (not for `min_element_wise` /
+`max_element_wise`) a null-type argument takes the type of the first other argument; then the arguments
+are cast with the `cast` function to a common type and the call is resolved again. The common type:
+
+- numbers (`commonNumericType`, Arrow's `CommonNumeric`): any float64 gives float64, else any float32 gives
+  float32 (even for int64, as Arrow); integers of one signedness give the widest; signed with unsigned
+  gives the signed type wider than every unsigned one (int8 + uint8 is int16, int32 + uint32 is int64,
+  uint64 + int64 is int64);
+- a decimal with a float: float64 for every argument (`commonDecimalFloatType`, as Arrow);
+- temporal types of different units or kinds (`commonTemporalType`, Arrow's `CommonTemporal`; comparisons
+  and min / max_element_wise only): a timestamp of the finest unit in the shared timezone (with dates;
+  naive and zoned never mix), date64 over date32, the finest duration or time.
+
+When only dictionaries were decoded or null types replaced, each argument keeps its own decoded type (so a
+dictionary of strings compares with a string_view through the mixed-layout kernel). The cast is safe
+unless `ExecConfig.safe_cast` is false, so a value the common type cannot hold (2^60 to float64, 2^63 as
+int64, a timestamp past the finer unit) is `InvalidCast`, as in Arrow. `add`, `subtract`, `multiply`,
+`divide` (and `_checked`) use `.numeric`, the six comparisons `.comparison`, `min_element_wise` /
+`max_element_wise` `.element_wise`; `resolveResultType` reports the type of the cast call.
+
+Some mixed types need no cast because a kernel takes them directly: decimals of different widths,
+precisions and scales and a decimal with an integer (arithmetic with Arrow's result types; comparisons by
+exact value), and two different string / binary / fixed_size_binary layouts in the comparisons (bytes
+compared in place). Exact semantics, including the differences from Arrow C++, are in
 [compute-support-matrix.md](compute-support-matrix.md).
+
+### Decimals
+
+Decimal values are the unscaled integers of their storage (i32, i64, i128, i256), read whole through the
+typed accessors after `validateLayout`; every kernel first checks that the precision is within the width
+(1..9, 18, 38, 76; `InvalidInput` otherwise, a bad cast target is `InvalidOptions`). Arithmetic computes in
+i128 (decimal128 results) or i256 (decimal256 results) with Arrow C++'s result precision and scale; the
+unchecked functions wrap like Arrow C++, the `_checked` ones also bound every valid row by the result
+precision. Sums are exact (256 / 512 bits) until finalize, which applies `ExecConfig.overflow_mode`. Casts
+follow Arrow C++ bit for bit where pyarrow 26 can express the case (text, floats, rescaling); the two
+deliberate differences (every overflowing safe scale-up is rejected; float to decimal128 at scales of 32
+and more is rounded exactly) are listed in the support matrix.
 
 ### Unicode
 

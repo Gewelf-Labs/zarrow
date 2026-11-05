@@ -302,10 +302,13 @@ fn kernelRegistry() *const zarrow.compute.FunctionRegistry {
 /// differences (dates, timestamps, times), comparisons of temporal, decimal and fixed-size
 /// binary arrays, binary_join of list<string-like>, cast (numbers, strings, binaries, dates,
 /// timestamps, times, durations, dictionaries), is_null and count (any type), is_in and a group
-/// by (Grouper, hash_count_distinct, hash_sum) on every key type, on a decoded array that passed
-/// validateFull and on a slice of it: the call must succeed (or fail with an expected error such as
-/// InvalidCast) and an array output must validate with the input length (one row per group for a
-/// grouped aggregate).
+/// by (Grouper, hash_count_distinct, hash_sum) on every key type, decimal arithmetic, casts,
+/// aggregates and grouped aggregates with options, and comparisons across layouts (a string /
+/// binary array against itself in another layout, a timestamp against a finer unit, a decimal
+/// against itself at another scale: every valid row must compare equal), on a decoded array that
+/// passed validateFull and on a slice of it: the call must succeed (or fail with an expected error
+/// such as InvalidCast) and an array output must validate with the input length (one row per
+/// group for a grouped aggregate).
 fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
     var ctx = zarrow.compute.ExecContext.initWithConfig(gpa, kernelRegistry(), .{ .overflow_mode = .wrapping });
     for ([_]ArrayRef{ arr, sliced }) |a| {
@@ -347,6 +350,9 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
             },
             .string, .large_string, .string_view => {
                 expectKernel(&ctx, "less", .scalar, &binary, len, false);
+                // Mixed layouts compare bytes in place: the same values must compare equal.
+                expectSameAfterCast(&ctx, a, if (a.data().data_type == .string_view) .{ .large_string = {} } else .{ .string_view = {} }, true);
+                expectSameAfterCast(&ctx, a, .{ .binary = {} }, true);
                 // validateFull passed, so the values are UTF-8: the utf8 kernels must succeed.
                 expectCall(&ctx, "utf8_upper", .scalar, &.{d}, .none, len, &.{});
                 inline for (.{ "utf8_lower", "utf8_swapcase", "utf8_title", "utf8_capitalize", "ascii_title", "utf8_is_lower", "utf8_is_title", "utf8_is_alnum", "utf8_is_printable", "ascii_is_upper", "utf8_is_numeric" }) |name| {
@@ -369,8 +375,13 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{ error.InvalidCast, error.Overflow });
                 expectCall(&ctx, "binary_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = 1, .stop = -1, .replacement = "\xff" } }, len, &.{});
                 expectKernel(&ctx, "greater", .scalar, &binary, len, false);
+                expectSameAfterCast(&ctx, a, if (a.data().data_type == .binary_view) .{ .binary = {} } else .{ .binary_view = {} }, true);
             },
-            .fixed_size_binary, .decimal32, .decimal64, .decimal128, .decimal256, .duration => expectKernel(&ctx, "less_equal", .scalar, &binary, len, false),
+            .fixed_size_binary, .duration => {
+                expectKernel(&ctx, "less_equal", .scalar, &binary, len, false);
+                expectCall(&ctx, "max_element_wise", .scalar, &binary, .none, len, &.{});
+            },
+            .decimal32, .decimal64, .decimal128, .decimal256 => exerciseDecimal(&ctx, a),
             .time32, .time64 => |t| if ((a.data().data_type == .time32) == (t.unit == .second or t.unit == .millisecond)) {
                 expectKernel(&ctx, "hour", .scalar, &.{d}, len, false);
                 expectKernel(&ctx, "subsecond", .scalar, &.{d}, len, false);
@@ -404,12 +415,20 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &tz_ok);
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .timestamp = .{ .unit = .nanosecond, .timezone = null } }, true), len, &.{error.InvalidCast});
                 if (a.data().data_type == .timestamp) expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .time64 = .{ .unit = .microsecond } }, false), len, &tz_ok);
+                // Against itself in a finer unit (the common unit): equal unless the cast overflows.
+                switch (a.data().data_type) {
+                    .timestamp => |ts| if (ts.unit != .nanosecond) expectSameAfterCast(&ctx, a, .{ .timestamp = .{ .unit = .nanosecond, .timezone = ts.timezone } }, false),
+                    .date32 => expectSameAfterCast(&ctx, a, .{ .date64 = {} }, false),
+                    else => {},
+                }
             },
             .dictionary => |dict| {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(dict.value_type.*, true), len, &.{error.UnsupportedType});
                 // Re-encoded with 16-bit indices: more distinct values than fit is InvalidCast.
                 const re: DataType = .{ .dictionary = .{ .index_type = .{ .bit_width = 16, .signed = true }, .value_type = dict.value_type } };
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(re, true), len, &.{ error.UnsupportedType, error.InvalidCast });
+                // Comparisons decode dictionaries first (Arrow's DispatchBest).
+                expectCall(&ctx, "equal", .scalar, &binary, .none, len, &.{ error.NoMatchingKernel, error.UnsupportedType });
             },
             else => {},
         }
@@ -449,6 +468,107 @@ fn exerciseGroupBy(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
     switch (a.data().data_type) {
         .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => expectCall(ctx, "hash_sum", .hash_aggregate, &args, .none, groups, &.{}),
         else => {},
+    }
+}
+
+/// Decimal kernels on a decoded decimal array (any stored value, precision from the schema):
+/// arithmetic with itself and an integer, negate / abs / sign, comparisons at another scale, casts
+/// (a text round trip must give the values back), aggregates and grouped aggregates.
+fn exerciseDecimal(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    const dt = a.data().data_type;
+    const binary = [_]zarrow.compute.Datum{ d, d };
+    const p = switch (dt) {
+        .decimal32, .decimal64, .decimal128, .decimal256 => |x| x,
+        else => unreachable,
+    };
+    expectKernel(ctx, "less_equal", .scalar, &binary, len, false);
+    // A result precision past the width is Overflow, a negative scale NotImplemented, a zero
+    // divisor DivideByZero; the checked variants also report values past the precision.
+    const arith_ok = [_]anyerror{ error.Overflow, error.NotImplemented, error.DivideByZero };
+    inline for (.{ "add", "subtract", "multiply", "divide", "add_checked", "subtract_checked", "multiply_checked", "divide_checked" }) |name| {
+        expectCall(ctx, name, .scalar, &binary, .none, len, &arith_ok);
+    }
+    const three: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .int16 = {} }, .{ .i16 = 3 }) };
+    expectCall(ctx, "multiply", .scalar, &.{ d, three }, .none, len, &arith_ok);
+    expectCall(ctx, "less", .scalar, &.{ three, d }, .none, len, &.{});
+    const half: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .double = {} }, .{ .f64 = 0.5 }) };
+    expectCall(ctx, "add", .scalar, &.{ d, half }, .none, len, &.{});
+    if (dt == .decimal128 or dt == .decimal256) {
+        inline for (.{ "negate", "abs", "sign" }) |name| expectCall(ctx, name, .scalar, &.{d}, .none, len, &.{});
+        inline for (.{ "negate_checked", "abs_checked" }) |name| expectCall(ctx, name, .scalar, &.{d}, .none, len, &.{error.Overflow});
+        inline for (.{ "sum", "mean", "min", "max" }) |name| {
+            expectCall(ctx, name, .aggregate, &.{d}, .none, null, &.{});
+            expectCall(ctx, name, .aggregate, &.{d}, .{ .scalar_aggregate = .{ .skip_nulls = false, .min_count = 0 } }, null, &.{});
+        }
+        expectCall(ctx, "max_element_wise", .scalar, &binary, .none, len, &.{});
+        exerciseGroupedDecimal(ctx, a);
+    }
+    // The same values at a scale one larger (a wider type when the precision is full): equal
+    // unless the stored values exceed what the wider scale holds.
+    const wider: DataType = .{ .decimal256 = .{ .precision = @min(76, p.precision + 1), .scale = p.scale +| 1 } };
+    expectSameAfterCast(ctx, a, wider, false);
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .double = {} }, true), len, &.{});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .float = {} }, true), len, &.{});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .int64 = {} }, false), len, &.{});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .int8 = {} }, true), len, &.{error.InvalidCast});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .decimal128 = .{ .precision = 38, .scale = p.scale -| 1 } }, true), len, &.{error.InvalidCast});
+    expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .decimal32 = .{ .precision = 9, .scale = p.scale } }, false), len, &.{});
+    // Text round trip (unsafe back: no precision check): the stored values come back, unless
+    // the text has an exponent past the width's largest precision (InvalidCast).
+    var text = ctx.invoke("cast", .scalar, &.{d}, cast(.{ .large_string = {} }, true)) catch |e| std.debug.panic("fuzz-invariant: decimal to text failed: {s}", .{@errorName(e)});
+    defer text.release();
+    var back = ctx.invoke("cast", .scalar, &.{text}, cast(dt, false)) catch |e| {
+        if (e == error.InvalidCast and p.scale < 0) return;
+        std.debug.panic("fuzz-invariant: decimal text round trip failed: {s}", .{@errorName(e)});
+    };
+    defer back.release();
+    expectAllEqual(ctx, d, back);
+}
+
+/// hash_sum / hash_mean / hash_min / hash_max (with options) of decimal values in 3 groups.
+fn exerciseGroupedDecimal(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const len = a.data().length;
+    var b = zarrow.UInt32Builder.init(ctx.allocator, len) catch return;
+    defer b.deinit();
+    for (0..len) |i| b.append(@intCast(i % 3)) catch return;
+    var ids = b.finish() catch return;
+    defer ids.release();
+    const groups: usize = @min(len, 3);
+    const args = [_]zarrow.compute.Datum{ .{ .array = a }, .{ .array = ids } };
+    inline for (.{ "hash_sum", "hash_mean", "hash_min", "hash_max" }) |name| {
+        expectCall(ctx, name, .hash_aggregate, &args, .none, groups, &.{});
+        expectCall(ctx, name, .hash_aggregate, &args, .{ .scalar_aggregate = .{ .skip_nulls = false, .min_count = 2 } }, groups, &.{});
+    }
+    expectCall(ctx, "hash_count", .hash_aggregate, &args, .{ .count = .{ .mode = .only_null } }, groups, &.{});
+}
+
+/// `a` against itself cast to `to` (unsafe when `safe` is false: InvalidCast is then not
+/// expected; a safe cast may fail with InvalidCast / Overflow): `equal` must hold on every valid
+/// row, and `less` must succeed.
+fn expectSameAfterCast(ctx: *zarrow.compute.ExecContext, a: ArrayRef, to: DataType, safe: bool) void {
+    var other = ctx.invoke("cast", .scalar, &.{.{ .array = a }}, cast(to, true)) catch |e| {
+        if (!safe and (e == error.InvalidCast or e == error.Overflow)) return;
+        if (safe and e == error.InvalidCast) return;
+        std.debug.panic("fuzz-invariant: cast of a valid {s} array to {s} failed: {s}", .{ @tagName(a.data().data_type.id()), @tagName(to.id()), @errorName(e) });
+    };
+    defer other.release();
+    expectAllEqual(ctx, .{ .array = a }, other);
+    expectCall(ctx, "less", .scalar, &.{ .{ .array = a }, other }, .none, a.data().length, &.{});
+}
+
+/// `equal(x, y)` must be true on every valid row.
+fn expectAllEqual(ctx: *zarrow.compute.ExecContext, x: zarrow.compute.Datum, y: zarrow.compute.Datum) void {
+    var eq = ctx.invoke("equal", .scalar, &.{ x, y }, .none) catch |e| std.debug.panic("fuzz-invariant: equal across {s} / {s} failed: {s}", .{ @tagName(x.dataType().id()), @tagName(y.dataType().id()), @errorName(e) });
+    defer eq.release();
+    const data = eq.array.data();
+    for (0..data.length) |i| {
+        if (data.isNull(i)) continue;
+        const bit = data.offset + i;
+        if ((data.buffers[1].data[bit / 8] >> @intCast(bit % 8)) & 1 == 0)
+            std.debug.panic("fuzz-invariant: row {d} of a {s} array differs from itself as {s}", .{ i, @tagName(x.dataType().id()), @tagName(y.dataType().id()) });
     }
 }
 

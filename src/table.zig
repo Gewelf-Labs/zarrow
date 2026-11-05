@@ -223,3 +223,42 @@ test "table slice keeps schema and rows" {
     try std.testing.expectEqual(@as(usize, 2), sliced.numRows());
     try std.testing.expectEqual(@as(usize, 1), sliced.numColumns());
 }
+
+test "table select projects columns by name in the given order and rejects an unknown name" {
+    const allocator = std.testing.allocator;
+    const int_type = @import("datatype.zig").DataType{ .int32 = {} };
+    const schema_fields = [_]Field{
+        .{ .name = "a", .data_type = &int_type, .nullable = true },
+        .{ .name = "b", .data_type = &int_type, .nullable = false },
+    };
+    const schema_ref = try SchemaRef.fromBorrowed(allocator, .{ .fields = schema_fields[0..] });
+
+    var columns: [2]ChunkedArray = undefined;
+    for (&columns, [_]i32{ 1, 3 }) |*c, first| {
+        var b = try @import("array/array.zig").Int32Builder.init(allocator, 2);
+        defer b.deinit();
+        try b.append(first);
+        try b.append(first + 1);
+        var arr = try b.finish();
+        defer arr.release();
+        c.* = try ChunkedArray.fromSingle(allocator, arr);
+    }
+    defer for (&columns) |*c| c.release();
+    var table = try Table.init(allocator, schema_ref, &columns);
+    defer table.deinit();
+
+    var projected = try table.select(&.{ "b", "a", "b" });
+    defer projected.deinit();
+    try std.testing.expectEqual(@as(usize, 3), projected.numColumns());
+    try std.testing.expectEqual(@as(usize, 2), projected.numRows());
+    try std.testing.expectEqualStrings("b", projected.schema().fields[0].name);
+    try std.testing.expectEqualStrings("a", projected.schema().fields[1].name);
+    try std.testing.expect(!projected.schema().fields[0].nullable);
+    const first_b = projected.column(0).chunks()[0];
+    try std.testing.expectEqual(@as(i32, 3), (try (@import("array/array.zig").Int32Array{ .data = first_b.data() }).values())[0]);
+    try std.testing.expectError(error.UnknownField, table.select(&.{ "a", "missing" }));
+
+    var none = try table.select(&.{});
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.numColumns());
+}

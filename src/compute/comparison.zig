@@ -4,19 +4,36 @@
 //! types. The output is a bool array (scalar for scalar inputs); null handling is intersection.
 //! Strings and binaries compare by bytes; floats follow IEEE 754 (NaN is unequal to everything,
 //! `not_equal` is true for it); `false < true`; temporal values and decimals compare their stored
-//! integers. Numeric operands of different types are cast to their common type first
-//! (`registry.commonNumericType`, Arrow's implicit casts); other operands must have equal types
-//! (same unit, timezone, width, precision and scale; Arrow also casts those).
+//! integers. Operands of different types are unified as in Arrow's comparison `DispatchBest`:
+//! - numbers are cast to their common numeric type (`registry.commonNumericType`);
+//! - two string / binary layouts (string, large_string, string_view, binary, large_binary,
+//!   binary_view, fixed_size_binary) compare their bytes directly, with no cast (Arrow casts the
+//!   offset layouts to a common one and has no kernel for a view mixed with another layout; two
+//!   fixed_size_binary of different widths stay `NoMatchingKernel`, as Arrow);
+//! - decimals of any widths, precisions and scales, and a decimal with an integer, compare by
+//!   exact value (the operand of the smaller scale is scaled up in 256-bit arithmetic; a product
+//!   past that range is beyond every value of the other side). Arrow rescales to a common decimal
+//!   type and rejects a common precision past 38 / 76 and negative scales; here both compare;
+//! - a decimal with a float casts both to float64 (`registry.commonDecimalFloatType`);
+//! - temporal operands of different types are cast to `registry.commonTemporalType` (Arrow's
+//!   `CommonTemporal`: a timestamp of the finer unit, date64 over date32, the finer time or
+//!   duration; a value that overflows the finer unit is `InvalidCast`, unsafe wraps).
+//!   Timestamps of the same unit compare their instants whatever their timezones, but a naive
+//!   timestamp never compares with a zoned one (`NoMatchingKernel`; Arrow: Invalid), and
+//!   timestamps of different units in different timezones have no common type (as Arrow).
 //!
 //! min_element_wise / max_element_wise (`ElementWiseAggregateOptions.skip_nulls`, default true)
-//! take one or more operands of one numeric, temporal, string or binary type (numeric ones
-//! promoted like above) and return the smallest / largest of each row: with `skip_nulls` the
-//! null operands are left out (null only when all are), otherwise a null operand makes the row
-//! null. A NaN is left out unless every value of the row is NaN; -0.0 is smaller than 0.0.
+//! take one or more operands of one numeric, temporal, decimal, fixed_size_binary, string or
+//! binary type (numbers promoted and temporal types unified like above, as Arrow; decimals and
+//! fixed_size_binary must have equal types and string layouts are not mixed, as Arrow) and return
+//! the smallest / largest of each row: with `skip_nulls` the null operands are left out (null only
+//! when all are), otherwise a null operand makes the row null. A NaN is left out unless every
+//! value of the row is NaN; -0.0 is smaller than 0.0.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
+const decimal = @import("decimal.zig");
 const dense = @import("dense.zig");
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
 const OwnedBuffer = @import("../buffer.zig").OwnedBuffer;
@@ -62,7 +79,9 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             try registry.registerScalarKernel(@tagName(op), kernel(pt[0], Numeric(pt[1], op).chunk));
         }
         try registry.registerScalarKernel(@tagName(op), kernel(.fixed_size_binary, FixedBinary(op).chunk));
-        try registry.setImplicitCast(@tagName(op), .scalar, .numeric);
+        try registry.registerScalarKernel(@tagName(op), mixedKernel(mixedBytes, MixedBytes(op).chunk));
+        try registry.registerScalarKernel(@tagName(op), mixedKernel(mixedDecimals, MixedDecimals(op).chunk));
+        try registry.setImplicitCast(@tagName(op), .scalar, .comparison);
     }
     inline for (comptime std.meta.tags(Extreme)) |which| {
         inline for (dense.numeric_types) |T| {
@@ -70,20 +89,65 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         }
         inline for (temporal_types) |pt| try registry.registerScalarKernel(@tagName(which), extremeKernel(pt[0], which));
         inline for (string_tags ++ binary_tags) |tag| try registry.registerScalarKernel(@tagName(which), extremeKernel(tag, which));
-        try registry.setImplicitCast(@tagName(which), .scalar, .numeric);
+        inline for (decimal_types) |pt| try registry.registerScalarKernel(@tagName(which), extremeKernel(pt[0], which));
+        try registry.registerScalarKernel(@tagName(which), extremeKernel(.fixed_size_binary, which));
+        try registry.setImplicitCast(@tagName(which), .scalar, .element_wise);
     }
 }
 
-/// `count` arguments (at least one when `variadic`) of type `tag`, all equal (same unit,
-/// timezone, width, precision and scale).
+/// `count` arguments (at least one when `variadic`) of type `tag`, all equal (same unit, width,
+/// precision and scale; timestamps may differ in timezone when all have one or none has one).
 fn sameTypes(comptime tag: TypeTag, comptime count: usize, comptime variadic: bool) core.TypeCheckFn {
     return &struct {
         fn check(args: []const Datum) bool {
             if (if (variadic) args.len < count else args.len != count) return false;
-            for (args) |arg| if (std.meta.activeTag(arg.dataType()) != tag or !arg.dataType().eql(args[0].dataType())) return false;
+            for (args) |arg| if (std.meta.activeTag(arg.dataType()) != tag or !sameType(arg.dataType(), args[0].dataType())) return false;
             return true;
         }
     }.check;
+}
+
+fn sameType(a: DataType, b: DataType) bool {
+    if (a == .timestamp and b == .timestamp) {
+        return a.timestamp.unit == b.timestamp.unit and (a.timestamp.timezone == null) == (b.timestamp.timezone == null);
+    }
+    return a.eql(b);
+}
+
+fn isBytes(dt: DataType) bool {
+    return switch (dt) {
+        .string, .large_string, .string_view, .binary, .large_binary, .binary_view, .fixed_size_binary => true,
+        else => false,
+    };
+}
+
+/// Two string / binary layouts of different types (two fixed_size_binary never: Arrow does not
+/// compare different widths).
+fn mixedBytes(args: []const Datum) bool {
+    if (args.len != 2) return false;
+    const a = args[0].dataType();
+    const b = args[1].dataType();
+    return isBytes(a) and isBytes(b) and !a.eql(b) and !(a == .fixed_size_binary and b == .fixed_size_binary);
+}
+
+/// Two integer or decimal operands of different types, at least one a decimal.
+fn mixedDecimals(args: []const Datum) bool {
+    if (args.len != 2) return false;
+    const a = args[0].dataType();
+    const b = args[1].dataType();
+    if (a.eql(b) or !(decimal.isDecimal(a) or decimal.isDecimal(b))) return false;
+    return (decimal.isDecimal(a) or decimal.isInteger(a)) and (decimal.isDecimal(b) or decimal.isInteger(b));
+}
+
+fn mixedKernel(comptime check: core.TypeCheckFn, comptime chunk: dense.ChunkFn) Kernel {
+    return .{
+        .signature = .{ .arity = 2, .type_check = check, .options_check = dense.noOptions, .result_type_fn = dense.resultTypeOf(bool_type) },
+        .exec = struct {
+            fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+                return dense.execElementwise(ctx, args, bool_type, true, chunk);
+            }
+        }.exec,
+    };
 }
 
 fn kernel(comptime tag: TypeTag, comptime chunk: dense.ChunkFn) Kernel {
@@ -206,7 +270,14 @@ fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
         const y = std.mem.readInt(u64, b[i..][0..8], .big);
         if (x != y) return std.math.order(x, y);
     }
-    while (i < n) : (i += 1) if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    if (i < n) {
+        if (n >= 8) {
+            // The last 8 bytes overlap the equal prefix, so their words order like the tail.
+            const x = std.mem.readInt(u64, a[n - 8 ..][0..8], .big);
+            const y = std.mem.readInt(u64, b[n - 8 ..][0..8], .big);
+            if (x != y) return std.math.order(x, y);
+        } else while (i < n) : (i += 1) if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    }
     return std.math.order(a.len, b.len);
 }
 
@@ -240,6 +311,115 @@ fn FixedBinary(comptime op: Op) type {
             errdefer out.deinit();
             packBits(out.values(), len, .{ try FixedBytes.init(values[0]), try FixedBytes.init(values[1]) }, Strings(op).pred);
             return out.finish() catch error.OutOfMemory;
+        }
+    };
+}
+
+/// Rows of any string / binary operand, fixed_size_binary included.
+const AnyBytes = union(enum) {
+    scalar: dense.ScalarBytes,
+    offsets32: dense.OffsetBytes(i32),
+    offsets64: dense.OffsetBytes(i64),
+    views: dense.ViewBytes,
+    fixed: FixedBytes,
+
+    fn init(v: ExecChunkValue) KernelError!AnyBytes {
+        if (datatype.storageDataType(v.dataType()) == .fixed_size_binary) return .{ .fixed = try FixedBytes.init(v) };
+        return switch (try dense.StringOperand.init(v)) {
+            inline else => |r, tag| @unionInit(AnyBytes, @tagName(tag), r),
+        };
+    }
+};
+
+/// Comparisons of two different string / binary layouts: the bytes, with no cast.
+fn MixedBytes(comptime op: Op) type {
+    return struct {
+        fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {
+            var out = try boolOutput(ctx, values, len);
+            errdefer out.deinit();
+            switch (try AnyBytes.init(values[0])) {
+                inline else => |x| switch (try AnyBytes.init(values[1])) {
+                    inline else => |y| run(x, y, out.values(), len),
+                },
+            }
+            return out.finish() catch error.OutOfMemory;
+        }
+
+        /// The operands as plain parameters (their fields stay in registers across rows).
+        fn run(x: anytype, y: anytype, bits: []u8, len: usize) void {
+            var i: usize = 0;
+            while (i + 8 <= len) : (i += 8) {
+                var byte: u8 = 0;
+                inline for (0..8) |k| byte |= @as(u8, @intFromBool(holds(orderBytes(x.get(i + k), y.get(i + k))))) << k;
+                bits[i / 8] = byte;
+            }
+            if (i < len) {
+                var byte: u8 = 0;
+                for (i..len) |j| byte |= @as(u8, @intFromBool(holds(orderBytes(x.get(j), y.get(j))))) << @as(u3, @intCast(j - i));
+                bits[i / 8] = byte;
+            }
+        }
+
+        inline fn holds(o: std.math.Order) bool {
+            return switch (op) {
+                .equal => o == .eq,
+                .not_equal => o != .eq,
+                .less => o == .lt,
+                .less_equal => o != .gt,
+                .greater => o == .gt,
+                .greater_equal => o != .lt,
+            };
+        }
+    };
+}
+
+/// Comparisons of two integer / decimal operands of different types by exact value.
+fn MixedDecimals(comptime op: Op) type {
+    return struct {
+        fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {
+            for (values) |v| if (decimal.isDecimal(v.dataType())) {
+                _ = try decimal.checkedParams(v.dataType());
+            };
+            var out = try boolOutput(ctx, values, len);
+            errdefer out.deinit();
+            const a = try decimal.widen(i256, ctx.allocator, values[0]);
+            defer a.deinit(ctx.allocator);
+            const b = try decimal.widen(i256, ctx.allocator, values[1]);
+            defer b.deinit(ctx.allocator);
+            const sa = decimal.scaleOf(values[0].dataType());
+            const sb = decimal.scaleOf(values[1].dataType());
+            // The operand of the smaller scale is scaled up by k digits.
+            const k: u32 = @intCast(@min(@abs(sa - sb), 1000));
+            switch (a.op) {
+                inline else => |x| switch (b.op) {
+                    inline else => |y| if (sa >= sb)
+                        packBits(out.values(), len, .{ y, x, k }, predSwapped)
+                    else
+                        packBits(out.values(), len, .{ x, y, k }, pred),
+                },
+            }
+            return out.finish() catch error.OutOfMemory;
+        }
+
+        /// Left operand scaled: `c[0][i] * 10^k` against `c[1][i]`.
+        inline fn pred(c: anytype, i: usize) bool {
+            return holds(decimal.orderScaled(dense.at(c[0], i), c[2], dense.at(c[1], i)));
+        }
+
+        /// Right operand scaled (passed first): the left `c[1][i]` against `c[0][i] * 10^k`.
+        inline fn predSwapped(c: anytype, i: usize) bool {
+            return holds(decimal.orderScaled(dense.at(c[0], i), c[2], dense.at(c[1], i)).invert());
+        }
+
+        inline fn holds(o: std.math.Order) bool {
+            return switch (op) {
+                .equal => o == .eq,
+                .not_equal => o != .eq,
+                .less => o == .lt,
+                .less_equal => o != .gt,
+                .greater => o == .gt,
+                .greater_equal => o != .lt,
+            };
         }
     };
 }
@@ -361,6 +541,11 @@ fn ElementWise(comptime which: Extreme) type {
                 .uint64 => fixedChunk(u64, ctx, values, len, skip, out_type),
                 .float => fixedChunk(f32, ctx, values, len, skip, out_type),
                 .double => fixedChunk(f64, ctx, values, len, skip, out_type),
+                .decimal32 => fixedChunk(i32, ctx, values, len, skip, out_type),
+                .decimal64 => fixedChunk(i64, ctx, values, len, skip, out_type),
+                .decimal128 => fixedChunk(i128, ctx, values, len, skip, out_type),
+                .decimal256 => fixedChunk(i256, ctx, values, len, skip, out_type),
+                .fixed_size_binary => fixedBytesChunk(ctx, values, len, skip, out_type),
                 else => error.UnsupportedType,
             };
         }
@@ -402,6 +587,32 @@ fn ElementWise(comptime which: Extreme) type {
                 }
             }
             return out.finish() catch error.OutOfMemory;
+        }
+
+        fn fixedBytesChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, skip: bool, out_type: DataType) KernelError!ArrayRef {
+            const width: usize = std.math.cast(usize, out_type.fixed_size_binary.byte_width) orelse return error.InvalidInput;
+            const ops = ctx.allocator.alloc(?FixedBytes, values.len) catch return error.OutOfMemory;
+            defer ctx.allocator.free(ops);
+            for (values, ops) |v, *op| op.* = if (v == .scalar and v.scalar.isNull()) null else try FixedBytes.init(v);
+            const bytes = std.math.mul(usize, len, width) catch return error.Overflow;
+            var validity = try extremeValidity(ctx.allocator, values, len, skip);
+            var vals = OwnedBuffer.init(ctx.allocator, bytes) catch {
+                if (validity) |*b| b.deinit();
+                return error.OutOfMemory;
+            };
+            for (0..len) |i| {
+                if (validity) |b| if (!bitmap.bitIsSet(b.data, i)) continue;
+                var best: ?[]const u8 = null;
+                for (values, ops) |v, maybe| {
+                    const op = maybe orelse continue;
+                    if (!validAt(v, i)) continue;
+                    const row = op.get(i);
+                    const better: std.math.Order = if (which == .min_element_wise) .lt else .gt;
+                    if (best == null or orderBytes(row, best.?) == better) best = row;
+                }
+                if (best) |row| @memcpy(vals.data[i * width ..][0..width], row);
+            }
+            return dense.finishFixed(ctx.allocator, out_type, len, &vals, validity);
         }
 
         fn bytesChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, skip: bool, out_type: DataType) KernelError!ArrayRef {

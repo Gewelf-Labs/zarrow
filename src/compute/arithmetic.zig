@@ -9,6 +9,9 @@
 //! report overflow. Operands of different numeric types are first cast to their common type
 //! (Arrow's implicit casts, `registry.commonNumericType`: int32 + int64 is int64, int + float32 is
 //! float32, uint32 + int32 is int64; a value the cast cannot represent is `InvalidCast`).
+//!
+//! sign: -1, 0 or 1 as int8 for integers (Arrow C++), as the input type for floats (NaN stays
+//! NaN, both zeros give 0.0). Decimal kernels live in decimal.zig.
 const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
@@ -40,6 +43,38 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             try registry.setImplicitCast(@tagName(op) ++ "_checked", .scalar, .numeric);
         }
     }
+    inline for (dense.numeric_types) |T| try registry.registerScalarKernel("sign", signKernel(T));
+}
+
+fn signKernel(comptime T: type) Kernel {
+    const Out = if (@typeInfo(T) == .float) T else i8;
+    return .{
+        .signature = .{
+            .arity = 1,
+            .type_check = dense.argsOfType(std.meta.activeTag(dense.dataTypeOf(T)), 1),
+            .options_check = dense.noOptions,
+            .result_type_fn = dense.resultTypeOf(dense.dataTypeOf(Out)),
+        },
+        .exec = struct {
+            fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+                return dense.execElementwise(ctx, args, dense.dataTypeOf(Out), true, chunk);
+            }
+
+            fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {
+                var out = try dense.DenseBinaryOutput(Out).initValidity(ctx.allocator, len, dense.arrayData(values[0]), null, dense.dataTypeOf(Out));
+                errdefer out.deinit();
+                switch (try dense.operand(T, values[0])) {
+                    inline else => |a| for (out.values(), 0..) |*d, i| {
+                        const x = dense.at(a, i);
+                        d.* = if (Out == i8)
+                            @as(i8, @intFromBool(x > 0)) - @intFromBool(x < 0)
+                        else if (std.math.isNan(x)) x else if (x > 0) 1 else if (x < 0) -1 else 0;
+                    },
+                }
+                return out.finish() catch error.OutOfMemory;
+            }
+        }.exec,
+    };
 }
 
 fn kernel(comptime T: type, comptime op: Op, comptime checked: bool) Kernel {

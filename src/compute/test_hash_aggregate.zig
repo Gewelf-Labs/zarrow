@@ -435,3 +435,162 @@ test "hash aggregate errors: group ids, key types, lengths, overflow and malform
     try std.testing.expectError(error.InvalidInput, ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = malformed }, .{ .array = ids } }, none));
     try std.testing.expectError(error.InvalidInput, g.consume(&.{malformed}));
 }
+
+fn aggOpts(skip_nulls: bool, min_count: u32) common.Options {
+    return .{ .scalar_aggregate = .{ .skip_nulls = skip_nulls, .min_count = min_count } };
+}
+
+fn countOpts(mode: common.core.CountMode) common.Options {
+    return .{ .count = .{ .mode = mode } };
+}
+
+test "hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26 group_by results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // k = [1, 1, 2, 2, 3], v = [1, null, 3, 4, null], b = [true, null, false, true, null].
+    var k = try common.makeArray(i64, allocator, &.{ 1, 1, 2, 2, 3 });
+    defer k.release();
+    var v = try common.makeArray(i32, allocator, &.{ 1, null, 3, 4, null });
+    defer v.release();
+    var b = try common.makeArray(bool, allocator, &.{ true, null, false, true, null });
+    defer b.release();
+    var batch = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = k }}, &.{
+        .{ .function = "hash_sum", .input = v, .name = "sum_keep", .options = aggOpts(false, 1) },
+        .{ .function = "hash_sum", .input = v, .name = "sum_mc2", .options = aggOpts(true, 2) },
+        .{ .function = "hash_sum", .input = v, .name = "sum_mc0", .options = aggOpts(true, 0) },
+        .{ .function = "hash_mean", .input = v, .name = "mean_mc0", .options = aggOpts(true, 0) },
+        .{ .function = "hash_min", .input = v, .name = "min_keep", .options = aggOpts(false, 1) },
+        .{ .function = "hash_min", .input = v, .name = "min_mc0", .options = aggOpts(true, 0) },
+        .{ .function = "hash_max", .input = v, .name = "max_mc2", .options = aggOpts(true, 2) },
+        .{ .function = "hash_min_max", .input = v, .name = "mm_keep", .options = aggOpts(false, 1) },
+        .{ .function = "hash_count", .input = v, .name = "count_null", .options = countOpts(.only_null) },
+        .{ .function = "hash_count", .input = v, .name = "count_all", .options = countOpts(.all) },
+        .{ .function = "hash_count", .input = v, .name = "count_valid", .options = countOpts(.only_valid) },
+        .{ .function = "hash_any", .input = b, .name = "any_keep", .options = aggOpts(false, 1) },
+        .{ .function = "hash_all", .input = b, .name = "all_keep", .options = aggOpts(false, 1) },
+        .{ .function = "hash_any", .input = b, .name = "any_mc0", .options = aggOpts(true, 0) },
+        .{ .function = "hash_all", .input = b, .name = "all_mc2", .options = aggOpts(true, 2) },
+        .{ .function = "hash_count_distinct", .input = v, .name = "cd_all", .options = countOpts(.all) },
+        .{ .function = "hash_count_distinct", .input = v, .name = "cd_null", .options = countOpts(.only_null) },
+        .{ .function = "hash_distinct", .input = v, .name = "d_all", .options = countOpts(.all) },
+        .{ .function = "hash_distinct", .input = v, .name = "d_null", .options = countOpts(.only_null) },
+    });
+    defer batch.deinit();
+    for (batch.columns) |c| try c.data().validateFull();
+    try expectColumn(i64, &batch, "k", &.{ 1, 2, 3 });
+    try expectColumn(i64, &batch, "sum_keep", &.{ null, 7, null });
+    try expectColumn(i64, &batch, "sum_mc2", &.{ null, 7, null });
+    try expectColumn(i64, &batch, "sum_mc0", &.{ 1, 7, 0 });
+    try expectColumn(f64, &batch, "mean_mc0", &.{ 1.0, 3.5, std.math.nan(f64) });
+    try expectColumn(i32, &batch, "min_keep", &.{ null, 3, null });
+    try expectColumn(i32, &batch, "min_mc0", &.{ 1, 3, null });
+    try expectColumn(i32, &batch, "max_mc2", &.{ null, 4, null });
+    const mm = batch.columnByName("mm_keep").?.data();
+    try std.testing.expectEqual(@as(?usize, 0), mm.null_count);
+    for (mm.children, [2][]const ?i32{ &.{ null, 3, null }, &.{ null, 4, null } }) |child, want| {
+        const got = try common.collect(i32, allocator, .{ .array = child });
+        defer allocator.free(got);
+        try common.expectRows(i32, want, got);
+    }
+    try expectColumn(i64, &batch, "count_null", &.{ 1, 0, 1 });
+    try expectColumn(i64, &batch, "count_all", &.{ 2, 2, 1 });
+    try expectColumn(i64, &batch, "count_valid", &.{ 1, 2, 0 });
+    try expectColumn(bool, &batch, "any_keep", &.{ true, true, null });
+    try expectColumn(bool, &batch, "all_keep", &.{ null, false, null });
+    try expectColumn(bool, &batch, "any_mc0", &.{ true, true, false });
+    try expectColumn(bool, &batch, "all_mc2", &.{ null, false, null });
+    try expectColumn(i64, &batch, "cd_all", &.{ 2, 2, 1 });
+    try expectColumn(i64, &batch, "cd_null", &.{ 1, 0, 1 });
+    // hash_distinct with all: [[1, null], [3, 4], [null]]; with only_null: [[null], [], [null]].
+    const d_all = batch.columnByName("d_all").?.data();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 4, 5 }, (try d_all.buffers[1].typedSlice(i32))[0..4]);
+    const all_items = try common.collect(i32, allocator, .{ .array = d_all.children[0] });
+    defer allocator.free(all_items);
+    try common.expectRows(i32, &.{ 1, null, 3, 4, null }, all_items);
+    const d_null = batch.columnByName("d_null").?.data();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 1, 2 }, (try d_null.buffers[1].typedSlice(i32))[0..4]);
+
+    // The same options through a lifecycle with batches and a merge.
+    var ids = try groupIds(&.{k});
+    defer ids.release();
+    var s1 = try ctx.beginAggregate("hash_sum", &.{ .{ .array = v }, .{ .array = ids } }, aggOpts(false, 0));
+    defer s1.deinit();
+    var s2 = try ctx.beginAggregate("hash_sum", &.{ .{ .array = v }, .{ .array = ids } }, aggOpts(false, 0));
+    defer s2.deinit();
+    var v_head = try v.slice(0, 2);
+    defer v_head.release();
+    var ids_head = try ids.slice(0, 2);
+    defer ids_head.release();
+    var v_tail = try v.slice(2, 3);
+    defer v_tail.release();
+    var ids_tail = try ids.slice(2, 3);
+    defer ids_tail.release();
+    try s1.update(&.{ .{ .array = v_head }, .{ .array = ids_head } });
+    try s2.update(&.{ .{ .array = v_tail }, .{ .array = ids_tail } });
+    try s1.merge(&s2);
+    var merged = try s1.finalize();
+    defer merged.release();
+    const sums = try common.collect(i64, allocator, merged);
+    defer allocator.free(sums);
+    try common.expectRows(i64, &.{ null, 7, null }, sums);
+
+    // Options are validated: wrong option kinds are InvalidOptions; hash_count_all takes none.
+    try std.testing.expectError(error.InvalidOptions, ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = v }, .{ .array = ids } }, countOpts(.all)));
+    try std.testing.expectError(error.InvalidOptions, ctx.invoke("hash_count", .hash_aggregate, &.{ .{ .array = v }, .{ .array = ids } }, aggOpts(true, 1)));
+    try std.testing.expectError(error.InvalidOptions, ctx.invoke("hash_count_all", .hash_aggregate, &.{.{ .array = ids }}, countOpts(.all)));
+}
+
+test "hash_sum, hash_mean, hash_min and hash_max on decimals (pyarrow 26 group_by results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // k = [1, 1, 2], v = decimal128(10, 2) [1.50, 2.25, null]: sum decimal128(38, 2) [3.75, null],
+    // mean decimal128(10, 2) [1.88, null] (half away from zero), min [1.50, null], max [2.25, null].
+    const dec = DataType{ .decimal128 = .{ .precision = 10, .scale = 2 } };
+    var k = try common.makeArray(i64, allocator, &.{ 1, 1, 2 });
+    defer k.release();
+    var v = try common.makeTyped(i128, dec, allocator, &.{ 150, 225, null });
+    defer v.release();
+    var batch = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = k }}, &.{
+        .{ .function = "hash_sum", .input = v, .name = "sum" },
+        .{ .function = "hash_mean", .input = v, .name = "mean" },
+        .{ .function = "hash_min", .input = v, .name = "min" },
+        .{ .function = "hash_max", .input = v, .name = "max" },
+        .{ .function = "hash_sum", .input = v, .name = "sum_mc0", .options = aggOpts(true, 0) },
+    });
+    defer batch.deinit();
+    for (batch.columns) |c| try c.data().validateFull();
+    try std.testing.expect(batch.columnByName("sum").?.data().data_type.eql(.{ .decimal128 = .{ .precision = 38, .scale = 2 } }));
+    try std.testing.expect(batch.columnByName("mean").?.data().data_type.eql(dec));
+    inline for (.{ .{ "sum", [2]?i128{ 375, null } }, .{ "mean", [2]?i128{ 188, null } }, .{ "min", [2]?i128{ 150, null } }, .{ "max", [2]?i128{ 225, null } }, .{ "sum_mc0", [2]?i128{ 375, 0 } } }) |c| {
+        const data = batch.columnByName(c[0]).?.data();
+        const vals = try (common.array_mod.PrimitiveArray(i128){ .data = data }).values();
+        for (c[1], 0..) |want, i| {
+            if (want) |w| try std.testing.expectEqual(w, vals[i]) else try std.testing.expect(data.isNull(i));
+        }
+    }
+    // decimal256 and the result type of the kernel on its own.
+    var w = try common.makeTyped(i256, .{ .decimal256 = .{ .precision = 50, .scale = 1 } }, allocator, &.{ 1 << 160, 5, -5 });
+    defer w.release();
+    var ids = try groupIds(&.{k});
+    defer ids.release();
+    try std.testing.expect((try registry.resolveResultType("hash_sum", .hash_aggregate, &.{ .{ .array = w }, .{ .array = ids } }, none)).eql(.{ .decimal256 = .{ .precision = 76, .scale = 1 } }));
+    var sums = try ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = w }, .{ .array = ids } }, none);
+    defer sums.release();
+    const sv = try (common.array_mod.PrimitiveArray(i256){ .data = sums.array.data() }).values();
+    try std.testing.expectEqual(@as(i256, (1 << 160) + 5), sv[0]);
+    try std.testing.expectEqual(@as(i256, -5), sv[1]);
+    // A sum past precision 38 is Overflow when checked.
+    const nines: i128 = 99999999999999999999999999999999999999;
+    var over = try common.makeTyped(i128, .{ .decimal128 = .{ .precision = 38, .scale = 0 } }, allocator, &.{ nines, nines, 1 });
+    defer over.release();
+    try std.testing.expectError(error.Overflow, ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = over }, .{ .array = ids } }, none));
+    var small = try common.makeTyped(i32, .{ .decimal32 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 1, 2, 3 });
+    defer small.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invoke("hash_sum", .hash_aggregate, &.{ .{ .array = small }, .{ .array = ids } }, none));
+}

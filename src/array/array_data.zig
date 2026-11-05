@@ -288,28 +288,28 @@ pub const ArrayData = struct {
         const view_count = view_bytes.len / 16;
         if (view_count < total_len) return error.BufferTooSmall;
 
+        // One straight pass, the view of every row read once (this runs before every kernel on
+        // a view input): an inline row (length <= 12) has zero bytes after its data; an
+        // out-of-line row names an existing data buffer, its bytes fit in that buffer (offset +
+        // length without overflow) and its 4-byte prefix equals their first 4.
         var i: usize = start_index;
         while (i < total_len) : (i += 1) {
-            const start = i * 16;
-            const view = view_bytes[start .. start + 16];
-            const len_u32 = readU32Le(view[0..4]);
-            const len = std.math.cast(usize, len_u32) orelse return error.InvalidOffsets;
-
+            const view = view_bytes[i * 16 ..][0..16];
+            const len: usize = readU32Le(view[0..4]);
             if (len <= 12) {
-                const pad_start = 4 + len;
-                for (view[pad_start..16]) |b| {
-                    if (b != 0) return error.InvalidOffsets;
-                }
+                const pad = if (len == 12) 0 else std.mem.readInt(u128, view, .little) >> @intCast(32 + len * 8);
+                if (pad != 0) return error.InvalidOffsets;
                 continue;
             }
 
-            const buffer_index = std.math.cast(usize, readU32Le(view[8..12])) orelse return error.InvalidOffsets;
+            const buffer_index: usize = readU32Le(view[8..12]);
             if (buffer_index >= variadic.len) return error.InvalidOffsets;
+            const data = variadic[buffer_index].data;
 
-            const byte_offset = std.math.cast(usize, readU32Le(view[12..16])) orelse return error.InvalidOffsets;
-            const end = std.math.add(usize, byte_offset, len) catch return error.InvalidOffsets;
-            if (end > variadic[buffer_index].len()) return error.InvalidOffsets;
-            if (!std.mem.eql(u8, view[4..8], variadic[buffer_index].data[byte_offset .. byte_offset + 4])) {
+            const byte_offset: usize = readU32Le(view[12..16]);
+            if (byte_offset > data.len or len > data.len - byte_offset) return error.InvalidOffsets;
+            // len > 12, so the 4 prefix bytes lie inside the checked range.
+            if (readU32Le(view[4..8]) != readU32Le(data[byte_offset..][0..4])) {
                 return error.InvalidOffsets;
             }
         }
@@ -558,6 +558,22 @@ pub const ArrayData = struct {
         // fixed_size_list carrying three buffers passed here and the take behind a dictionary
         // cast rejected it (fuzz/corpus/array-layout/regress-fsl-3buf.bin).
         if (maxBufferCount(dt)) |max| if (self.buffers.len > max) return error.InvalidBufferCount;
+
+        // Arrow bounds a decimal's precision by its width. Fuzz finding: a decimal256 of
+        // precision 0 passed here and the decimal kernels rejected it
+        // (fuzz/corpus/array-layout/regress-decimal-precision0.bin).
+        switch (dt) {
+            .decimal32, .decimal64, .decimal128, .decimal256 => |d| {
+                const max_precision: u8 = switch (dt) {
+                    .decimal32 => 9,
+                    .decimal64 => 18,
+                    .decimal128 => 38,
+                    else => 76,
+                };
+                if (d.precision < 1 or d.precision > max_precision) return error.InvalidOffsetBuffer;
+            },
+            else => {},
+        }
 
         const total_len = std.math.add(usize, self.offset, self.length) catch return error.InvalidOffsets;
         const has_top_level_validity = hasTopLevelValidityBitmap(dt);
@@ -984,6 +1000,27 @@ test "array data validateLayout rejects null type invalid null count" {
     };
 
     try std.testing.expectError(error.InvalidNullCount, data.validateLayout());
+}
+
+test "array data validateLayout bounds a decimal precision by its width" {
+    // fuzz/corpus/array-layout/regress-decimal-precision0.bin: decimal256 with precision 0.
+    var values: [2 * 32]u8 align(buffer.ALIGNMENT) = @splat(0);
+    const bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(values[0..]) };
+    const Case = struct { dt: DataType, ok: bool };
+    const cases = [_]Case{
+        .{ .dt = .{ .decimal256 = .{ .precision = 0, .scale = 0 } }, .ok = false },
+        .{ .dt = .{ .decimal256 = .{ .precision = 76, .scale = 3 } }, .ok = true },
+        .{ .dt = .{ .decimal256 = .{ .precision = 77, .scale = 0 } }, .ok = false },
+        .{ .dt = .{ .decimal128 = .{ .precision = 38, .scale = -2 } }, .ok = true },
+        .{ .dt = .{ .decimal128 = .{ .precision = 39, .scale = 0 } }, .ok = false },
+        .{ .dt = .{ .decimal64 = .{ .precision = 19, .scale = 0 } }, .ok = false },
+        .{ .dt = .{ .decimal32 = .{ .precision = 9, .scale = 9 } }, .ok = true },
+        .{ .dt = .{ .decimal32 = .{ .precision = 10, .scale = 0 } }, .ok = false },
+    };
+    for (cases) |c| {
+        const data = ArrayData{ .data_type = c.dt, .length = 2, .null_count = 0, .buffers = &bufs };
+        if (c.ok) try data.validateLayout() else try std.testing.expectError(error.InvalidOffsetBuffer, data.validateLayout());
+    }
 }
 
 test "array data validateLayout rejects surplus buffers on layouts with a fixed buffer count" {

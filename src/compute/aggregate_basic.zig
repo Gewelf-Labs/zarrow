@@ -23,11 +23,19 @@
 //!   argument, or 0 when called with no argument (Arrow's nullary calling convention: no batch, no
 //!   rows). Both int64, never null.
 //! - any / all: bool input; with no valid row (and `min_count` 0) any is false and all is true.
+//! - decimal128 / decimal256 (as Arrow; decimal32 / decimal64 have no aggregate kernels there):
+//!   sum gives the widest precision of the width (38 / 76) at the input scale, exact in 256 / 512
+//!   bits until finalize, which applies `overflow_mode` (`checked`: `Overflow` past the precision,
+//!   `wrapping`: the low 128 / 256 bits as Arrow C++, `saturating`: clamp to the precision); mean
+//!   gives the input type, rounded half away from zero (null with no valid row whatever
+//!   `min_count`, as Arrow); min / max give the input type. Decimal min_max is not registered (its
+//!   struct type would have to borrow the input's precision and scale).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const buffer = @import("../buffer.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
+const decimal = @import("decimal.zig");
 const dense = @import("dense.zig");
 const is_null = @import("is_null.zig");
 const primitive_array = @import("../array/primitive_array.zig");
@@ -59,6 +67,13 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     try add(registry, "count_all", 0, noArgs, dense.noOptions, Count(.count_all));
     try add(registry, "any", 1, dense.argsOfType(.bool, 1), scalarAggregateOptions, AnyAll(.any));
     try add(registry, "all", 1, dense.argsOfType(.bool, 1), scalarAggregateOptions, AnyAll(.all));
+    inline for (.{ i128, i256 }) |T| {
+        const check = comptime dense.argsOfType(if (T == i128) .decimal128 else .decimal256, 1);
+        try add(registry, "sum", 1, check, scalarAggregateOptions, DecimalSum(T, .sum));
+        try add(registry, "mean", 1, check, scalarAggregateOptions, DecimalSum(T, .mean));
+        try add(registry, "min", 1, check, scalarAggregateOptions, DecimalMinMax(T, .min));
+        try add(registry, "max", 1, check, scalarAggregateOptions, DecimalMinMax(T, .max));
+    }
 }
 
 fn noArgs(args: []const Datum) bool {
@@ -88,7 +103,7 @@ fn nullByOptions(o: core.ScalarAggregateOptions, count: u64, nulls: u64) bool {
 fn add(registry: *FunctionRegistry, comptime name: []const u8, comptime arity: usize, comptime check: TypeCheckFn, comptime options_check: core.OptionsCheckFn, comptime Impl: type) KernelError!void {
     const A = Aggregate(Impl);
     try registry.registerAggregateKernel(name, .{
-        .signature = .{ .arity = arity, .type_check = check, .options_check = options_check, .result_type_fn = dense.resultTypeOf(Impl.out_type) },
+        .signature = .{ .arity = arity, .type_check = check, .options_check = options_check, .result_type_fn = if (@hasDecl(Impl, "resultType")) Impl.resultType else dense.resultTypeOf(Impl.out_type) },
         .exec = A.exec,
         .aggregate_lifecycle = .{ .init = A.init, .update = A.update, .merge = A.merge, .finalize = A.finalize, .deinit = A.deinit },
     });
@@ -116,6 +131,8 @@ fn Aggregate(comptime Impl: type) type {
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len > 1) return error.InvalidArity;
             var state: State = .{};
+            // Decimal states keep their input type (the result type depends on it).
+            if (@hasField(State, "dt") and args.len == 1) state.dt = args[0].dataType();
             if (args.len == 1) try consume(&state, args[0]);
             return Impl.finalize(ctx, &state, options);
         }
@@ -438,6 +455,169 @@ fn AnyAll(comptime which: enum { any, all }) type {
             const decided = if (which == .any) state.any_true else state.any_false;
             if ((!o.skip_nulls and !decided and state.nulls > 0) or state.count < o.min_count) return nullScalar(out_type);
             return .{ .scalar = Scalar.init(out_type, .{ .bool = result }) };
+        }
+    };
+}
+
+// ------------------------------------------------------------------------------ decimals
+
+/// The decimal type with the tag of the storage `T` (decimal128 / decimal256) and `p`.
+fn decimalType(comptime T: type, p: decimal.Params) DataType {
+    return if (T == i128) .{ .decimal128 = p } else .{ .decimal256 = p };
+}
+
+fn decimalScalar(comptime T: type, dt: DataType, v: T) Scalar {
+    return Scalar.init(dt, @unionInit(core.ScalarValue, if (T == i128) "decimal128" else "decimal256", v));
+}
+
+/// `sum / count` rounded half away from zero (Arrow's decimal mean).
+pub fn roundedMean(comptime Exact: type, sum: Exact, count: u64) Exact {
+    const n: Exact = @intCast(count);
+    const q = @divTrunc(sum, n);
+    const r = @rem(sum, n);
+    if (2 * @abs(r) >= @abs(n)) return if (sum < 0) q - 1 else q + 1;
+    return q;
+}
+
+/// The exact sum of a decimal group as the result storage `T` per `ExecConfig.overflow_mode`:
+/// `checked` rejects a sum past `10^max_p`, `wrapping` keeps the low bits (Arrow C++),
+/// `saturating` clamps to the precision.
+pub fn decimalSumValue(comptime T: type, comptime Exact: type, ctx: *ExecContext, sum: Exact) KernelError!T {
+    const max_p: u8 = if (T == i128) 38 else 76;
+    const limit: Exact = @intCast(decimal.pow10(i256, max_p));
+    return switch (ctx.overflowMode()) {
+        .checked => if (@abs(sum) < @abs(limit)) @intCast(sum) else error.Overflow,
+        .wrapping => @truncate(sum),
+        .saturating => @intCast(std.math.clamp(sum, -limit + 1, limit - 1)),
+    };
+}
+
+fn DecimalSum(comptime T: type, comptime which: enum { sum, mean }) type {
+    // Exact: 2^64 rows of |v| < 2^(bits - 1) need 64 more bits.
+    const Exact = if (T == i128) i256 else i512;
+    const max_p: u8 = if (T == i128) 38 else 76;
+    return struct {
+        const State = struct { sum: Exact = 0, count: u64 = 0, nulls: u64 = 0, dt: DataType = .{ .null = {} } };
+
+        fn outType(dt: DataType) KernelError!DataType {
+            const p = try decimal.checkedParams(dt);
+            return if (which == .mean) dt else decimalType(T, .{ .precision = max_p, .scale = p.scale });
+        }
+
+        pub fn resultType(args: []const Datum, _: Options) KernelError!DataType {
+            if (args.len != 1) return error.InvalidArity;
+            return outType(args[0].dataType());
+        }
+
+        fn update(state: *State, data: *const ArrayData) KernelError!void {
+            _ = try decimal.checkedParams(data.data_type);
+            state.dt = data.data_type;
+            const vals = try values(T, data);
+            var sum: Exact = 0;
+            var count: u64 = 0;
+            if (dense.validityBits(data)) |bits| {
+                for (vals, 0..) |v, i| if (bitmap.bitIsSet(bits, data.offset + i)) {
+                    sum += v;
+                    count += 1;
+                };
+            } else {
+                for (vals) |v| sum += v;
+                count = vals.len;
+            }
+            state.sum += sum;
+            state.count += count;
+            state.nulls += data.length - count;
+        }
+
+        fn updateScalar(state: *State, s: Scalar) KernelError!void {
+            _ = try decimal.checkedParams(s.data_type);
+            state.dt = s.data_type;
+            if (s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
+            state.sum += try decimal.scalarInt(T, s);
+            state.count += 1;
+        }
+
+        fn merge(state: *State, other: *const State) void {
+            state.sum += other.sum;
+            state.count += other.count;
+            state.nulls += other.nulls;
+            if (state.dt == .null) state.dt = other.dt;
+        }
+
+        fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            // A lifecycle finalized before any update has no input type.
+            if (state.dt == .null) return nullScalar(.{ .null = {} });
+            const out_type = try outType(state.dt);
+            if (nullByOptions(aggregateOptions(options), state.count, state.nulls)) return nullScalar(out_type);
+            if (which == .mean) {
+                if (state.count == 0) return nullScalar(out_type);
+                return .{ .scalar = decimalScalar(T, out_type, @intCast(roundedMean(Exact, state.sum, state.count))) };
+            }
+            return .{ .scalar = decimalScalar(T, out_type, try decimalSumValue(T, Exact, ctx, state.sum)) };
+        }
+    };
+}
+
+fn DecimalMinMax(comptime T: type, comptime which: enum { min, max }) type {
+    const start: T = if (which == .min) std.math.maxInt(T) else std.math.minInt(T);
+    return struct {
+        const State = struct { v: T = start, count: u64 = 0, nulls: u64 = 0, dt: DataType = .{ .null = {} } };
+
+        pub fn resultType(args: []const Datum, _: Options) KernelError!DataType {
+            if (args.len != 1) return error.InvalidArity;
+            _ = try decimal.checkedParams(args[0].dataType());
+            return args[0].dataType();
+        }
+
+        inline fn pick(a: T, b: T) T {
+            return if (which == .min) @min(a, b) else @max(a, b);
+        }
+
+        fn update(state: *State, data: *const ArrayData) KernelError!void {
+            _ = try decimal.checkedParams(data.data_type);
+            state.dt = data.data_type;
+            const vals = try values(T, data);
+            var best = state.v;
+            var count: u64 = 0;
+            if (dense.validityBits(data)) |bits| {
+                for (vals, 0..) |v, i| if (bitmap.bitIsSet(bits, data.offset + i)) {
+                    best = pick(best, v);
+                    count += 1;
+                };
+            } else {
+                for (vals) |v| best = pick(best, v);
+                count = vals.len;
+            }
+            state.v = best;
+            state.count += count;
+            state.nulls += data.length - count;
+        }
+
+        fn updateScalar(state: *State, s: Scalar) KernelError!void {
+            _ = try decimal.checkedParams(s.data_type);
+            state.dt = s.data_type;
+            if (s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
+            state.v = pick(state.v, try decimal.scalarInt(T, s));
+            state.count += 1;
+        }
+
+        fn merge(state: *State, other: *const State) void {
+            state.v = pick(state.v, other.v);
+            state.count += other.count;
+            state.nulls += other.nulls;
+            if (state.dt == .null) state.dt = other.dt;
+        }
+
+        fn finalize(_: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            if (state.dt == .null) return nullScalar(.{ .null = {} });
+            if (state.count == 0 or nullByOptions(aggregateOptions(options), state.count, state.nulls)) return nullScalar(state.dt);
+            return .{ .scalar = decimalScalar(T, state.dt, state.v) };
         }
     };
 }

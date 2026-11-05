@@ -421,8 +421,13 @@ fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
             return s;
         },
         .struct_, .list => return Scalar.initNested(data.data_type, arr),
-        inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months, .interval_day_time, .interval_month_day_nano => |_, tag| {
-            const T = if (tag == .date32 or tag == .time32 or tag == .interval_months) i32 else if (tag == .interval_month_day_nano) i128 else i64;
+        inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months, .interval_day_time, .interval_month_day_nano, .decimal32, .decimal64, .decimal128, .decimal256 => |_, tag| {
+            const T = switch (tag) {
+                .date32, .time32, .interval_months, .decimal32 => i32,
+                .interval_month_day_nano, .decimal128 => i128,
+                .decimal256 => i256,
+                else => i64,
+            };
             const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
             return Scalar.init(data.data_type, @unionInit(ScalarValue, @tagName(tag), values[0]));
         },
@@ -438,7 +443,8 @@ fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
 }
 
 /// Return the array of an exec chunk value: the array itself (retained), or a one-row array
-/// holding a scalar of a primitive, bool, temporal or string / binary type. The caller releases it.
+/// holding a scalar of a primitive, bool, temporal, decimal or string / binary type. The caller
+/// releases it.
 pub fn chunkArray(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!ArrayRef {
     const s = switch (v) {
         .array => |arr| return arr.retain(),
@@ -484,12 +490,16 @@ pub fn chunkArray(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!A
         .time32 => .time32,
         .time64 => .time64,
         .duration => .duration,
+        .decimal32 => .decimal32,
+        .decimal64 => .decimal64,
+        .decimal128 => .decimal128,
+        .decimal256 => .decimal256,
         else => return error.UnsupportedType,
     };
     if (std.meta.activeTag(s.value) != expected) return error.InvalidInput;
     var values_buf = OwnedBuffer.init(allocator, width) catch return error.OutOfMemory;
     switch (s.value) {
-        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .date32, .date64, .timestamp, .time32, .time64, .duration => |x| @memcpy(values_buf.data[0..width], std.mem.asBytes(&x)),
+        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .date32, .date64, .timestamp, .time32, .time64, .duration, .decimal32, .decimal64, .decimal128, .decimal256 => |x| @memcpy(values_buf.data[0..width], std.mem.asBytes(&x)),
         else => unreachable,
     }
     return finishFixed(allocator, s.data_type, 1, &values_buf, null);
@@ -521,7 +531,7 @@ pub const StringOperand = union(enum) {
                 const op: OffsetBytes(O) = .{ .offsets = all[data.offset..][0 .. data.length + 1], .data = data.buffers[2].data };
                 return if (O == i32) .{ .offsets32 = op } else .{ .offsets64 = op };
             },
-            .string_view, .binary_view => return .{ .views = .{ .views = data.buffers[1].data[data.offset * 16 ..][0 .. data.length * 16], .data = data } },
+            .string_view, .binary_view => return .{ .views = ViewBytes.init(data) },
             else => return error.UnsupportedType,
         }
     }
@@ -546,14 +556,29 @@ pub fn OffsetBytes(comptime O: type) type {
 
 pub const ViewBytes = struct {
     views: []const u8,
-    data: *const ArrayData,
+    /// The variadic data buffers (`validateLayout` checked every out-of-line view against them),
+    /// or one empty buffer when there is none.
+    buffers: []const SharedBuffer,
+    /// Start of the only data buffer (null with several): one load less per out-of-line row.
+    single: ?[*]const u8,
+
+    fn init(data: *const ArrayData) ViewBytes {
+        const buffers = data.buffers[2..];
+        return .{
+            .views = data.buffers[1].data[data.offset * 16 ..][0 .. data.length * 16],
+            .buffers = buffers,
+            .single = if (buffers.len == 1) buffers[0].data.ptr else null,
+        };
+    }
+
     pub inline fn get(self: ViewBytes, i: usize) []const u8 {
         const view = self.views[i * 16 ..][0..16];
         const len = std.mem.readInt(u32, view[0..4], .little);
         if (len <= 12) return view[4..][0..len];
-        const buf = std.mem.readInt(u32, view[8..12], .little);
         const off = std.mem.readInt(u32, view[12..16], .little);
-        return self.data.buffers[2 + buf].data[off..][0..len];
+        if (self.single) |base| return base[off..][0..len];
+        const buf = std.mem.readInt(u32, view[8..12], .little);
+        return self.buffers[buf].data[off..][0..len];
     }
 };
 

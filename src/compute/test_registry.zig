@@ -516,7 +516,7 @@ test "registerAll registers every kernel family function name with its kind" {
         "and",            "or",             "xor",       "and_not",          "invert",           "and_kleene",
         "or_kleene",      "is_null",        "is_valid",  "true_unless_null", "cast",             "is_in",
         "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
-        "and_not_kleene",
+        "and_not_kleene", "sign",
     } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names;
     const aggregate_names = [_][]const u8{ "sum", "mean", "min", "max", "min_max", "count", "count_all", "any", "all" };
     const hash_names = [_][]const u8{ "hash_sum", "hash_mean", "hash_min", "hash_max", "hash_min_max", "hash_count", "hash_count_all", "hash_any", "hash_all", "hash_count_distinct", "hash_distinct" };
@@ -532,18 +532,22 @@ test "registerAll registers every kernel family function name with its kind" {
     }
     try std.testing.expectEqual(scalar_names.len + aggregate_names.len + hash_names.len, registry.functionCount());
 
-    // One kernel per input type: 10 numeric types; negate_checked has no unsigned kernels;
-    // comparisons add bool, the string and binary layouts, six temporal types, four decimal
-    // types and fixed_size_binary; min / max_element_wise numbers, temporal, strings, binaries.
-    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("add", .scalar));
-    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("negate_checked", .scalar));
-    try std.testing.expectEqual(@as(usize, 28), registry.kernelCount("less", .scalar));
-    try std.testing.expectEqual(@as(usize, 22), registry.kernelCount("min_element_wise", .scalar));
+    // One kernel per input type: 10 numeric types and one for every decimal / integer pair;
+    // negate_checked has no unsigned kernels and adds decimal128 / decimal256; comparisons add
+    // bool, the string and binary layouts, six temporal types, four decimal types,
+    // fixed_size_binary, mixed byte layouts and mixed decimals; min / max_element_wise numbers,
+    // temporal, strings, binaries, decimals and fixed_size_binary.
+    try std.testing.expectEqual(@as(usize, 11), registry.kernelCount("add", .scalar));
+    try std.testing.expectEqual(@as(usize, 8), registry.kernelCount("negate_checked", .scalar));
+    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sign", .scalar));
+    try std.testing.expectEqual(@as(usize, 30), registry.kernelCount("less", .scalar));
+    try std.testing.expectEqual(@as(usize, 27), registry.kernelCount("min_element_wise", .scalar));
     try std.testing.expectEqual(@as(usize, 15), registry.kernelCount("is_nan", .scalar));
     try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("count_all", .aggregate));
     // Implicit numeric casts: binary arithmetic and the comparisons, not negate / abs.
     try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("add_checked", .scalar).?.implicit_cast);
-    try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("greater", .scalar).?.implicit_cast);
+    try std.testing.expectEqual(common.core.ImplicitCast.comparison, registry.findFunction("greater", .scalar).?.implicit_cast);
+    try std.testing.expectEqual(common.core.ImplicitCast.element_wise, registry.findFunction("max_element_wise", .scalar).?.implicit_cast);
     try std.testing.expectEqual(common.core.ImplicitCast.none, registry.findFunction("negate", .scalar).?.implicit_cast);
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("min_max", .aggregate));
@@ -562,7 +566,8 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("binary_slice", .scalar));
     try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
-    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("hash_sum", .hash_aggregate));
+    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("hash_sum", .hash_aggregate));
+    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sum", .aggregate));
     // Kinds are separate namespaces: no scalar "sum".
     try std.testing.expect(!registry.containsFunction("sum", .scalar));
 }
