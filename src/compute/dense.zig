@@ -298,6 +298,7 @@ pub fn execElementwiseWith(
             .array => |arr| .{ .array = arr },
             .scalar => |s| .{ .scalar = s },
             .chunked => unreachable,
+            .record_batch, .table => return error.InvalidInput,
         };
         var out = try runChunk(ctx, values, len, options, out_type, null_scalars_propagate, chunk_fn);
         if (!all_scalar) return .{ .array = out };
@@ -362,7 +363,15 @@ pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) K
             return boolArray(allocator, len, values_buf, validity);
         },
         .struct_, .list, .large_list, .fixed_size_list, .null => return (try core.datumBuildNullLikeWithAllocator(allocator, out_type, len)).array,
-        .dictionary, .extension => return error.UnsupportedType,
+        .extension => return error.UnsupportedType,
+        // Null indices over an empty dictionary of the value type.
+        .dictionary => |d| {
+            var dict = try nullArray(allocator, d.value_type.*, 0);
+            defer dict.release();
+            var indices = try nullArray(allocator, indexType(d), len);
+            defer indices.release();
+            return withDictionary(allocator, indices, out_type, dict);
+        },
         else => {
             const width = (out_type.bitWidth() orelse return error.UnsupportedType) / 8;
             var validity = try zeroBits(allocator, len);
@@ -375,13 +384,15 @@ pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) K
     }
 }
 
-/// Storage of the type of a struct array built by `structArray`: the field list and a copy of
-/// every child type, shared by the array and its slices through the owner hooks (refcounted).
+/// Storage of the type of a struct array built by `structArray`: the field list, a copy of
+/// every child type and of the field names, shared by the array and its slices through the owner
+/// hooks (refcounted).
 const StructTypeOwner = struct {
     allocator: std.mem.Allocator,
     refs: std.atomic.Value(u32),
     types: []DataType,
     fields: []datatype.Field,
+    names: []u8 = &.{},
 
     fn retain(ctx: ?*anyopaque) void {
         const self: *StructTypeOwner = @ptrCast(@alignCast(ctx.?));
@@ -393,6 +404,7 @@ const StructTypeOwner = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.allocator.free(self.types);
         self.allocator.free(self.fields);
+        self.allocator.free(self.names);
         self.allocator.destroy(self);
     }
 };
@@ -407,10 +419,10 @@ pub fn structTypeAlloc(allocator: std.mem.Allocator, names: []const []const u8, 
 }
 
 /// A struct array of `len` rows over `children` (taken over, also on error) whose type is
-/// stored with the array (field `i` is named `names[i]`, static strings, and has the type of
+/// stored with the array (field `i` is named `names[i]`, copied, and has the type of
 /// `children[i]`): the array and its slices keep the type alive, so a kernel can return a
-/// struct over a type known only at run time (decimal min_max, value_counts). `validity`
-/// (taken over) may be null.
+/// struct over a type known only at run time (decimal min_max, value_counts, pivot_wider).
+/// `validity` (taken over) may be null.
 pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
     std.debug.assert(names.len == children.len);
     var v = validity;
@@ -425,9 +437,15 @@ pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, chil
     defer StructTypeOwner.release(owner);
     owner.types = allocator.alloc(DataType, children.len) catch return error.OutOfMemory;
     owner.fields = allocator.alloc(datatype.Field, children.len) catch return error.OutOfMemory;
+    var name_bytes: usize = 0;
+    for (names) |n| name_bytes += n.len;
+    owner.names = allocator.alloc(u8, name_bytes) catch return error.OutOfMemory;
+    var name_at: usize = 0;
     for (owner.types, owner.fields, children, names) |*t, *f, c, n| {
         t.* = c.data().data_type;
-        f.* = .{ .name = n, .data_type = t };
+        @memcpy(owner.names[name_at..][0..n.len], n);
+        f.* = .{ .name = owner.names[name_at..][0..n.len], .data_type = t };
+        name_at += n.len;
     }
     const kids = allocator.dupe(ArrayRef, children) catch return error.OutOfMemory;
     errdefer allocator.free(kids);
@@ -453,6 +471,39 @@ pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, chil
 }
 
 /// Return a zeroed packed-bit buffer for `len` rows (an all-null validity bitmap).
+/// The integer type of a dictionary's indices.
+pub fn indexType(d: datatype.DictionaryType) DataType {
+    return switch (d.index_type.bit_width) {
+        8 => if (d.index_type.signed) .{ .int8 = {} } else .{ .uint8 = {} },
+        16 => if (d.index_type.signed) .{ .int16 = {} } else .{ .uint16 = {} },
+        32 => if (d.index_type.signed) .{ .int32 = {} } else .{ .uint32 = {} },
+        else => if (d.index_type.signed) .{ .int64 = {} } else .{ .uint64 = {} },
+    };
+}
+
+/// The rows of `indices` (an array of the index type of `dict_type`, sharing its buffers) as a
+/// dictionary array of `dict_type` over `dict` (retained; the result's value type points at it).
+pub fn withDictionary(allocator: std.mem.Allocator, indices: ArrayRef, dict_type: DataType, dict: ArrayRef) KernelError!ArrayRef {
+    const src = indices.data();
+    if (src.buffers.len < 2) return error.InvalidInput;
+    var out_type = dict_type;
+    out_type.dictionary.value_type = &dict.data().data_type;
+    var buffers = [2]SharedBuffer{ src.buffers[0].retain(), src.buffers[1].retain() };
+    var d = dict.retain();
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = out_type,
+        .length = src.length,
+        .offset = src.offset,
+        .null_count = src.null_count,
+        .buffers = &buffers,
+        .dictionary = d,
+    }) catch {
+        for (&buffers) |*b| b.release();
+        d.release();
+        return error.OutOfMemory;
+    };
+}
+
 fn zeroBits(allocator: std.mem.Allocator, len: usize) KernelError!OwnedBuffer {
     return OwnedBuffer.init(allocator, bitmap.byteLength(len)) catch error.OutOfMemory;
 }

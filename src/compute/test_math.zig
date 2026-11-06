@@ -67,6 +67,7 @@ fn invokeRows(comptime T: type, ctx: *ExecContext, name: []const u8, args: []con
         .array => |arr| try arr.data().validateFull(),
         .chunked => |c| for (c.chunks()) |part| try part.data().validateFull(),
         .scalar => {},
+        .record_batch, .table => return error.InvalidInput,
     }
     try std.testing.expect(std.meta.activeTag(out.dataType()) == std.meta.activeTag(common.dense.dataTypeOf(T)));
     return common.collect(T, std.testing.allocator, out);

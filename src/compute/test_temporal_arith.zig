@@ -29,6 +29,7 @@ fn expectTyped(comptime T: type, ctx: *ExecContext, name: []const u8, args: []co
         .array => |arr| try arr.data().validateFull(),
         .chunked => |c| for (c.chunks()) |part| try part.data().validateFull(),
         .scalar => {},
+        .record_batch, .table => return error.InvalidInput,
     }
     const rows = try collectAs(T, out);
     defer std.testing.allocator.free(rows);

@@ -230,5 +230,25 @@
   "compute_stddev_float64": {
     "min_rows_per_sec": 5000.0,
     "max_ns_per_row": 2000000.0
+  },
+  "compute_take_record_batch": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_unique_dictionary": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_partition_nth_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_select_k_int32": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_tdigest_float64": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
   }
 }

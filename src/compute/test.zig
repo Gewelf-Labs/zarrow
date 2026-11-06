@@ -25,4 +25,8 @@ test {
     _ = @import("test_selection.zig");
     _ = @import("test_aggregate_stats.zig");
     _ = @import("test_sort.zig");
+    _ = @import("test_tabular.zig");
+    _ = @import("test_dictionary.zig");
+    _ = @import("test_tdigest.zig");
+    _ = @import("test_pivot.zig");
 }

@@ -10,6 +10,8 @@ pub const datumLargeListValueAt = accessors.datumLargeListValueAt;
 pub const datumFixedSizeListValueAt = accessors.datumFixedSizeListValueAt;
 pub const datumStructField = accessors.datumStructField;
 pub const datumSliceEmpty = accessors.datumSliceEmpty;
+pub const datumSlice = accessors.datumSlice;
+pub const datumSelectColumns = accessors.datumSelectColumns;
 
 pub const datumBuildNullLike = builders.datumBuildNullLike;
 pub const datumBuildNullLikeWithAllocator = builders.datumBuildNullLikeWithAllocator;

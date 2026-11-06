@@ -36,6 +36,7 @@ fn collectLists(allocator: std.mem.Allocator, datum: Datum) ![]?[]?[]const u8 {
         .array => |*a| a[0..1],
         .chunked => |c| c.chunks(),
         .scalar => |*s| (&s.payload.?)[0..1],
+        .record_batch, .table => return error.InvalidInput,
     };
     var out: std.ArrayList(?[]?[]const u8) = .empty;
     errdefer freeLists(allocator, out.items);

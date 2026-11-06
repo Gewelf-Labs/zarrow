@@ -42,6 +42,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             .signature = .{ .arity = 1, .type_check = keyArg, .options_check = lookupOptions, .result_type_fn = dense.resultTypeOf(if (op == .is_in) bool_type else int32_type) },
             .exec = Lookup(op).exec,
         });
+        try registry.setImplicitCast(@tagName(op), .scalar, .decode);
     }
 }
 
@@ -73,7 +74,7 @@ const Set = struct {
         const parts: []const ArrayRef = switch (value_set) {
             .array => |*a| a[0..1],
             .chunked => |c| c.chunks(),
-            .scalar => return error.InvalidOptions,
+            .scalar, .record_batch, .table => return error.InvalidOptions,
         };
         var row: usize = 0;
         var ids: std.ArrayList(u32) = .empty;

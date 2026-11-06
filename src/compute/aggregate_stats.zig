@@ -62,6 +62,10 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         const check = comptime dense.argsOfType(std.meta.activeTag(dense.dataTypeOf(T)), 1);
         try basic.add(registry, "product", 1, check, basic.scalarAggregateOptions, Product(T));
     }
+    inline for (.{ i128, i256 }) |T| {
+        const check = comptime dense.argsOfType(if (T == i128) .decimal128 else .decimal256, 1);
+        try basic.add(registry, "product", 1, check, basic.scalarAggregateOptions, ProductDecimal(T));
+    }
     inline for (dense.numeric_types ++ [_]type{ i128, i256 }) |T| {
         const tag = comptime if (T == i128) .decimal128 else if (T == i256) .decimal256 else std.meta.activeTag(dense.dataTypeOf(T));
         const check = comptime dense.argsOfType(tag, 1);
@@ -678,6 +682,7 @@ fn partsOf(allocator: std.mem.Allocator, datum: Datum) KernelError![]ArrayRef {
             };
             return one;
         },
+        .record_batch, .table => return error.InvalidInput,
     };
     const out = allocator.alloc(ArrayRef, src.len) catch return error.OutOfMemory;
     for (out, src) |*o, s| o.* = s.retain();
@@ -929,5 +934,180 @@ fn pointIndex(len: usize, q: f64, interp: core.QuantileInterpolation) usize {
         .lower => lower,
         .higher => if (fraction > 0) lower + 1 else lower,
         else => if (fraction < 0.5) lower else if (fraction > 0.5) lower + 1 else lower + (lower & 1),
+    };
+}
+
+// ------------------------------------------------------------------------------ decimal product
+
+/// The scale arithmetic of one decimal type for `DecimalProduct`.
+pub fn DecimalScale(comptime T: type) type {
+    const W = if (T == i128) i256 else i512;
+    return struct {
+        /// 10^scale, wide and at the storage width.
+        div: W,
+        narrow_div: T,
+        /// 10^precision - 1, the largest value the type holds.
+        limit: W,
+        params: decimal.Params,
+
+        /// `InvalidInput` for a precision past the type's; `NotImplemented` for a scale outside
+        /// [0, the precision max] (Arrow's decimal product is undefined there: it scales 1 by it).
+        pub fn of(dt: DataType) KernelError!@This() {
+            const p = try decimal.checkedParams(dt);
+            if (p.scale < 0 or p.scale > decimal.maxPrecision(dt)) return error.NotImplemented;
+            var div: W = 1;
+            for (0..@intCast(p.scale)) |_| div *= 10;
+            var limit: W = 1;
+            for (0..p.precision) |_| limit *= 10;
+            return .{ .div = div, .narrow_div = @intCast(div), .limit = limit - 1, .params = p };
+        }
+    };
+}
+
+/// Divide by `d` (10^scale), rounding half away from zero (Arrow `ReduceScaleBy(_, true)`).
+fn rescale(comptime I: type, v: I, d: I) I {
+    if (d == 1) return v;
+    const q = @divTrunc(v, d);
+    const r = @rem(v, d);
+    if (@abs(r) >= @abs(@divTrunc(d, 2))) return if (v < 0) q - 1 else q + 1;
+    return q;
+}
+
+/// A running decimal product as Arrow C++ computes it (`MultiplyTraits` for decimals): every
+/// step multiplies and rescales to the input scale, rounding half away from zero; the empty
+/// product is 1. `exact` follows the true steps while they fit the precision (`overflow` once
+/// one does not); `arrow` repeats Arrow's arithmetic, which wraps at the storage width (the
+/// `wrapping` result).
+pub fn DecimalProduct(comptime T: type) type {
+    const W = if (T == i128) i256 else i512;
+    const Scale = DecimalScale(T);
+    return struct {
+        exact: T = 0,
+        arrow: T = 0,
+        started: bool = false,
+        zero: bool = false,
+        neg: bool = false,
+        overflow: bool = false,
+
+        const Self = @This();
+
+        fn step(self: *Self, ve: T, va: T, s: *const Scale) void {
+            if (!self.overflow) {
+                const w = rescale(W, @as(W, self.exact) * ve, s.div);
+                if (w > s.limit or w < -s.limit) self.overflow = true else self.exact = @intCast(w);
+            }
+            const a = if (self.started) self.arrow else s.narrow_div;
+            self.arrow = rescale(T, a *% va, s.narrow_div);
+        }
+
+        /// Multiply by one value.
+        pub fn mul(self: *Self, v: T, s: *const Scale) void {
+            if (v == 0) self.zero = true;
+            if (v < 0) self.neg = !self.neg;
+            if (!self.started) {
+                // 1 * v rescaled is v (Arrow's own steps may wrap: `arrow` repeats them).
+                self.arrow = rescale(T, s.narrow_div *% v, s.narrow_div);
+                self.exact = v;
+                self.started = true;
+                return;
+            }
+            self.step(v, v, s);
+        }
+
+        /// Multiply by another product (Arrow merges states with one more step).
+        pub fn merge(self: *Self, other: Self, s: *const Scale) void {
+            if (!other.started) {
+                if (self.started) self.arrow = rescale(T, self.arrow *% s.narrow_div, s.narrow_div);
+                return;
+            }
+            self.zero = self.zero or other.zero;
+            if (other.neg) self.neg = !self.neg;
+            if (!self.started) {
+                self.exact = other.exact;
+                self.arrow = rescale(T, s.narrow_div *% other.arrow, s.narrow_div);
+                self.overflow = other.overflow;
+                self.started = true;
+                return;
+            }
+            self.overflow = self.overflow or other.overflow;
+            self.step(other.exact, other.arrow, s);
+        }
+
+        /// The product under `mode`: past the precision `checked` is `Overflow`, `wrapping`
+        /// gives Arrow's value, `saturating` the largest value of the product's sign.
+        pub fn result(self: *const Self, overflow_mode: core.OverflowMode, s: *const Scale) KernelError!T {
+            if (!self.started) return s.narrow_div;
+            if (self.zero) return 0;
+            if (overflow_mode == .wrapping) return self.arrow;
+            if (!self.overflow) return self.exact;
+            if (overflow_mode == .checked) return error.Overflow;
+            const lim: T = @intCast(s.limit);
+            return if (self.neg) -lim else lim;
+        }
+    };
+}
+
+/// product of decimal128 / decimal256 (`ScalarAggregateOptions`): the input type, each chunk a
+/// product of its own merged into the state's (Arrow's executor), overflow per `overflow_mode`.
+fn ProductDecimal(comptime T: type) type {
+    const Acc = DecimalProduct(T);
+    const Scale = DecimalScale(T);
+    return struct {
+        pub const State = struct {
+            dt: DataType = .{ .null = {} },
+            acc: Acc = .{},
+            count: u64 = 0,
+            nulls: u64 = 0,
+        };
+
+        pub fn resultType(args: []const Datum, _: Options) KernelError!DataType {
+            if (args.len != 1) return error.InvalidArity;
+            return args[0].dataType();
+        }
+
+        pub fn update(state: *State, data: *const ArrayData) KernelError!void {
+            state.dt = data.data_type;
+            const s = try Scale.of(data.data_type);
+            if (data.length == 0) return;
+            const vals = try basic.values(T, data);
+            const bits = dense.validityBits(data);
+            var chunk: Acc = .{};
+            var count: u64 = 0;
+            for (vals, 0..) |v, i| {
+                if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + i)) continue;
+                chunk.mul(v, &s);
+                count += 1;
+            }
+            state.count += count;
+            state.nulls += data.length - count;
+            state.acc.merge(chunk, &s);
+        }
+
+        pub fn updateScalar(state: *State, sc: Scalar) KernelError!void {
+            state.dt = sc.data_type;
+            const s = try Scale.of(sc.data_type);
+            var chunk: Acc = .{};
+            if (sc.isNull()) state.nulls += 1 else {
+                chunk.mul(try decimal.scalarInt(T, sc), &s);
+                state.count += 1;
+            }
+            state.acc.merge(chunk, &s);
+        }
+
+        pub fn merge(state: *State, other: *const State) KernelError!void {
+            if (state.dt == .null) state.dt = other.dt;
+            state.count += other.count;
+            state.nulls += other.nulls;
+            if (other.dt == .null) return;
+            const s = try Scale.of(state.dt);
+            state.acc.merge(other.acc, &s);
+        }
+
+        pub fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            if (basic.nullByOptions(basic.aggregateOptions(options), state.count, state.nulls)) return nullScalar(state.dt);
+            const s = try Scale.of(state.dt);
+            const v = try state.acc.result(ctx.overflowMode(), &s);
+            return .{ .scalar = Scalar.init(state.dt, if (T == i128) .{ .decimal128 = v } else .{ .decimal256 = v }) };
+        }
     };
 }

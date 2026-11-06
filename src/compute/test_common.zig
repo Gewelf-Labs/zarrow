@@ -120,6 +120,7 @@ pub fn countLenAggregateKernel(ctx: *ExecContext, args: []const Datum, options: 
         .array => |arr| arr.data().length,
         .chunked => |chunks| chunks.len(),
         .scalar => return error.InvalidInput,
+        .record_batch, .table => return error.InvalidInput,
     };
 
     return Datum.fromScalar(Scalar.init(.{ .int64 = {} }, .{ .i64 = @intCast(count) }));
@@ -333,6 +334,7 @@ pub fn collectInt32ValuesFromDatum(allocator: std.mem.Allocator, datum: Datum) !
             out[0] = if (s.isNull()) null else s.value.i32;
             break :blk out;
         },
+        .record_batch, .table => return error.InvalidInput,
     };
 }
 
@@ -502,6 +504,7 @@ pub fn collect(comptime T: type, allocator: std.mem.Allocator, datum: Datum) ![]
             out[0] = if (s.isNull()) null else if (comptime T == i128) s.value.interval_month_day_nano else try dense.scalarAs(T, s);
             return out;
         },
+        .record_batch, .table => return error.InvalidInput,
     }
 }
 
@@ -531,6 +534,7 @@ pub fn expectInvoke(comptime T: type, ctx: *ExecContext, kind: core.FunctionKind
         .array => |arr| try arr.data().validateFull(),
         .chunked => |chunked| for (chunked.chunks()) |c| try c.data().validateFull(),
         .scalar => {},
+        .record_batch, .table => return error.InvalidInput,
     }
     const rows = try collect(T, allocator, out);
     defer allocator.free(rows);
@@ -610,6 +614,7 @@ pub fn collectStrings(allocator: std.mem.Allocator, datum: Datum) ![]?[]const u8
         },
         .array => |arr| return collectStringParts(allocator, &.{arr}),
         .chunked => |chunked| return collectStringParts(allocator, chunked.chunks()),
+        .record_batch, .table => return error.InvalidInput,
     }
 }
 
@@ -658,8 +663,17 @@ pub fn expectInvokeWith(comptime T: type, ctx: *ExecContext, name: []const u8, a
         .array => |arr| try arr.data().validateFull(),
         .chunked => |chunked| for (chunked.chunks()) |c| try c.data().validateFull(),
         .scalar => {},
+        .record_batch, .table => return error.InvalidInput,
     }
     const rows = try collect(T, allocator, out);
     defer allocator.free(rows);
     try expectRows(T, expected, rows);
+}
+
+/// Dictionary array over `dict` (retained) with `indices` (null: a null row) of `index_type`.
+pub fn makeDictionary(allocator: std.mem.Allocator, dict: ArrayRef, index_type: datatype.IntType, indices: []const ?i64) !ArrayRef {
+    var db = try array_mod.DictionaryBuilder.init(allocator, index_type, &dict.data().data_type, indices.len);
+    defer db.deinit();
+    for (indices) |v| if (v) |x| try db.appendIndex(x) else try db.appendNull();
+    return db.finish(dict);
 }

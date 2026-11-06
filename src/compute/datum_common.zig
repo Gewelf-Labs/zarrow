@@ -33,6 +33,8 @@ pub fn inferDatumAllocator(datum: Datum) ?std.mem.Allocator {
         .array => |arr| arr.node.allocator,
         .chunked => |chunks| chunks.node.allocator,
         .scalar => |s| if (s.payload) |payload| payload.node.allocator else null,
+        .record_batch => |b| b.node.allocator,
+        .table => |t| t.node.allocator,
     };
 }
 
@@ -41,4 +43,31 @@ pub fn inferDatumsAllocator(datums: []const Datum) std.mem.Allocator {
         if (inferDatumAllocator(datum)) |allocator| return allocator;
     }
     return std.heap.page_allocator;
+}
+
+/// A record batch datum owning `batch` (deinitialized on error).
+pub fn ownBatch(allocator: std.mem.Allocator, batch: core.RecordBatch) KernelError!Datum {
+    var b = batch;
+    const shared = core.SharedRecordBatch.create(allocator, b) catch |err| {
+        b.deinit();
+        return err;
+    };
+    return .{ .record_batch = shared };
+}
+
+/// A table datum owning `table` (deinitialized on error).
+pub fn ownTable(allocator: std.mem.Allocator, table: core.Table) KernelError!Datum {
+    var t = table;
+    const shared = core.SharedTable.create(allocator, t) catch |err| {
+        t.deinit();
+        return err;
+    };
+    return .{ .table = shared };
+}
+
+pub fn mapTabularError(err: anyerror) KernelError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
 }

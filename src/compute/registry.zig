@@ -92,6 +92,9 @@ const FunctionIndexMap = std.StringHashMap(usize);
 pub const ImplicitCast = enum {
     /// Argument types must match a kernel exactly.
     none,
+    /// Dictionary arguments are decoded to their value type, nothing else (Arrow's is_in /
+    /// index_in on a dictionary: the decoded values are looked up).
+    decode,
     /// Numeric arguments of different types are cast to their common numeric type first (see
     /// `commonNumericType`); decimals with floats go to float64 (`commonDecimalFloatType`).
     numeric,
@@ -257,6 +260,9 @@ pub const FunctionRegistry = struct {
         }
         if (best_kernel) |kernel| return kernel;
         if (!saw_matching_arity) return error.InvalidArity;
+        // A record batch or table argument to a function without a tabular kernel (Arrow:
+        // "Unsupported types" / non-array input); no implicit cast applies.
+        if (!saw_matching_type) for (args) |a| if (a.isTabular()) return error.NotImplemented;
         if (saw_matching_type) return error.InvalidOptions;
         return error.NoMatchingKernel;
     }
@@ -407,7 +413,7 @@ pub const FunctionRegistry = struct {
 
     fn commonType(mode: ImplicitCast, args: []const Datum) ?DataType {
         return switch (mode) {
-            .none => null,
+            .none, .decode => null,
             .numeric => commonNumericType(args) orelse commonDecimalFloatType(args),
             .comparison => commonNumericType(args) orelse commonDecimalFloatType(args) orelse commonTemporalType(args),
             .element_wise => commonNumericType(args) orelse commonTemporalType(args),

@@ -274,3 +274,184 @@ test "sort errors: options, types, scalars, lengths and malformed input" {
         try std.testing.expectError(error.InvalidInput, ctx.invokeVector(name, &.{.{ .array = malformed }}, none));
     }
 }
+
+fn indicesOf(ctx: *ExecContext, name: []const u8, args: []const Datum, options: Options) ![]u64 {
+    var out = try ctx.invokeVector(name, args, options);
+    defer out.release();
+    try out.array.data().validateFull();
+    return std.testing.allocator.dupe(u64, try (common.array_mod.PrimitiveArray(u64){ .data = out.array.data() }).values());
+}
+
+/// select_k_unstable must give the first k rows of the stable sort (ties broken by row, as the
+/// sort), partition_nth_indices a permutation whose pivot row is the one of the sort and whose
+/// rows before the pivot are the first rows of the sort.
+fn expectSelections(ctx: *ExecContext, args: []const Datum, keys: []const common.core.SortKey) !void {
+    const allocator = std.testing.allocator;
+    const sorted = try indicesOf(ctx, "sort_indices", args, .{ .sort = .{ .sort_keys = keys } });
+    defer allocator.free(sorted);
+    const n = sorted.len;
+    for ([_]usize{ 0, 1, 7, n / 2, n, n + 3 }) |k| {
+        const top = try indicesOf(ctx, "select_k_unstable", args, .{ .select_k = .{ .k = k, .sort_keys = keys } });
+        defer allocator.free(top);
+        try std.testing.expectEqualSlices(u64, sorted[0..@min(k, n)], top);
+    }
+    if (args.len != 1 or keys[0].order != .ascending) return;
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    for ([_]usize{ 0, 1, n / 3, n / 2 + 1, n -| 1, n }) |pivot| {
+        if (pivot > n) continue;
+        const part = try indicesOf(ctx, "partition_nth_indices", args, .{ .partition_nth = .{ .pivot = pivot, .null_placement = keys[0].null_placement } });
+        defer allocator.free(part);
+        try expectPermutation(part, n);
+        if (pivot < n) try std.testing.expectEqual(sorted[pivot], part[pivot]);
+        @memset(seen, false);
+        for (sorted[0..pivot]) |r| seen[r] = true;
+        for (part[0..pivot]) |r| try std.testing.expect(seen[r]);
+    }
+}
+
+test "partition_nth_indices and select_k_unstable oracle: selections agree with the stable sort for radix and comparison columns, both orders and null placements" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var prng = std.Random.DefaultPrng.init(0x5E1EC7);
+    const rng = prng.random();
+    var arrays: [6]ArrayRef = undefined;
+    arrays[0] = try common.randomArray(i32, allocator, rng, 600, 3, 12, .{ .small = true });
+    arrays[1] = try common.randomArray(f64, allocator, rng, 500, 5, 10, .{});
+    arrays[2] = try common.randomArray(u8, allocator, rng, 300, 0, 20, .{});
+    arrays[3] = try common.randomArray(i64, allocator, rng, 200, 1, 0, .{ .small = true });
+    arrays[4] = try common.randomArray(bool, allocator, rng, 100, 2, 25, .{});
+    arrays[5] = try common.randomStrings(.string, allocator, rng, 300, 4, 10);
+    defer for (&arrays) |*a| a.release();
+    for (arrays) |a| {
+        var chunked = try common.chunkedAt(allocator, a, &.{ 1, a.data().length / 2 });
+        defer chunked.release();
+        for ([_]Datum{ .{ .array = a }, .{ .chunked = chunked } }) |arg| {
+            for ([_]common.core.SortOrder{ .ascending, .descending }) |order| {
+                for ([_]common.core.SortNullPlacement{ .at_end, .at_start }) |placement| {
+                    try expectSelections(&ctx, &.{arg}, &.{.{ .order = order, .null_placement = placement }});
+                }
+            }
+        }
+    }
+    // Two keys go through the comparison heap.
+    const two = [_]common.core.SortKey{ .{ .order = .descending, .null_placement = .at_start }, .{} };
+    try expectSelections(&ctx, &.{ .{ .array = arrays[2] }, .{ .array = arrays[5] } }, &two);
+    // Small inputs and the empty input.
+    var empty = try common.makeArray(i32, allocator, &.{});
+    defer empty.release();
+    try expectSelections(&ctx, &.{.{ .array = empty }}, &.{.{}});
+    var one = try common.makeArray(f32, allocator, &.{std.math.nan(f32)});
+    defer one.release();
+    try expectSelections(&ctx, &.{.{ .array = one }}, &.{.{ .null_placement = .at_start }});
+}
+
+fn expectFloats(ctx: *ExecContext, name: []const u8, args: []const Datum, options: Options, expected: []const f64) !void {
+    var out = try ctx.invokeVector(name, args, options);
+    defer out.release();
+    try out.array.data().validateFull();
+    try std.testing.expect(out.array.data().data_type == .double);
+    const got = try common.collect(f64, std.testing.allocator, out);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |e, g| try std.testing.expectApproxEqAbs(e, g.?, 1e-12);
+}
+
+fn expectPositions(ctx: *ExecContext, args: []const Datum, options: Options, expected: []const ?u64) !void {
+    var out = try ctx.invokeVector("search_sorted", args, options);
+    defer out.release();
+    try out.array.data().validateFull();
+    const got = try common.collect(u64, std.testing.allocator, out);
+    defer std.testing.allocator.free(got);
+    try common.expectRows(u64, expected, got);
+}
+
+test "rank_quantile, rank_normal and search_sorted hand-written values (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var a = try common.makeArray(f64, allocator, &.{ 3, null, 1, 1, nan, 2 });
+    defer a.release();
+    const d: Datum = .{ .array = a };
+    const desc_start: Options = .{ .rank_quantile = .{ .order = .descending, .null_placement = .at_start } };
+    try expectFloats(&ctx, "rank_quantile", &.{d}, none, &.{ 0.5833333333333334, 0.9166666666666666, 0.16666666666666666, 0.16666666666666666, 0.75, 0.4166666666666667 });
+    try expectFloats(&ctx, "rank_quantile", &.{d}, desc_start, &.{ 0.4166666666666667, 0.08333333333333333, 0.8333333333333334, 0.8333333333333334, 0.25, 0.5833333333333334 });
+    try expectFloats(&ctx, "rank_normal", &.{d}, none, &.{ 0.21042839424792484, 1.382994127100638, -0.9674215661017014, -0.9674215661017014, 0.6744897501960817, -0.2104283942479247 });
+    try expectFloats(&ctx, "rank_normal", &.{d}, desc_start, &.{ -0.2104283942479247, -1.3829941271006387, 0.9674215661017014, 0.9674215661017014, -0.6744897501960817, 0.21042839424792484 });
+    var chunked = try common.chunkedAt(allocator, a, &.{ 1, 4 });
+    defer chunked.release();
+    try expectFloats(&ctx, "rank_quantile", &.{.{ .chunked = chunked }}, none, &.{ 0.5833333333333334, 0.9166666666666666, 0.16666666666666666, 0.16666666666666666, 0.75, 0.4166666666666667 });
+    var s = try common.makeStrings(.string, allocator, &.{ "b", "a", null, "a", "c", "d", "e" });
+    defer s.release();
+    try expectFloats(&ctx, "rank_normal", &.{.{ .array = s }}, none, &.{ -0.3661063568005697, -1.0675705238781417, 1.4652337926855223, -1.0675705238781417, 0.0, 0.3661063568005697, 0.7916386077433746 });
+    var five = try common.makeArray(i64, allocator, &.{5});
+    defer five.release();
+    try expectFloats(&ctx, "rank_normal", &.{.{ .array = five }}, none, &.{0.0});
+    var empty = try common.makeArray(i64, allocator, &.{});
+    defer empty.release();
+    try expectFloats(&ctx, "rank_quantile", &.{.{ .array = empty }}, none, &.{});
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("rank_normal", &.{d}, .{ .rank = .{} }));
+
+    // search_sorted: positions among the non-null values (nulls at the start or the end).
+    const left: Options = .none;
+    const right: Options = .{ .search_sorted = .{ .side = .right } };
+    var v = try common.makeArray(i64, allocator, &.{ 1, 2, 2, 3, null, null });
+    defer v.release();
+    var needles = try common.makeArray(i64, allocator, &.{ 2, 0, 4, null, 3 });
+    defer needles.release();
+    const vn = [_]Datum{ .{ .array = v }, .{ .array = needles } };
+    try expectPositions(&ctx, &vn, left, &.{ 1, 0, 4, null, 3 });
+    try expectPositions(&ctx, &vn, right, &.{ 3, 0, 4, null, 4 });
+    var lead = try common.makeArray(i64, allocator, &.{ null, null, 1, 2, 2 });
+    defer lead.release();
+    var two_zero = try common.makeArray(i64, allocator, &.{ 2, 0 });
+    defer two_zero.release();
+    try expectPositions(&ctx, &.{ .{ .array = lead }, .{ .array = two_zero } }, right, &.{ 5, 2 });
+    var found = try ctx.invokeVector("search_sorted", &.{ .{ .array = v }, .{ .scalar = common.scalarOf(i64, 2) } }, left);
+    defer found.release();
+    try std.testing.expectEqual(@as(u64, 1), found.scalar.value.u64);
+    var missing = try ctx.invokeVector("search_sorted", &.{ .{ .array = v }, .{ .scalar = common.scalarOf(i64, null) } }, left);
+    defer missing.release();
+    try std.testing.expect(missing.scalar.isNull());
+    var f = try common.makeArray(f64, allocator, &.{ -0.0, 0.0, 1.0, nan, nan });
+    defer f.release();
+    var fneedles = try common.makeArray(f64, allocator, &.{ 0.0, -0.0, nan });
+    defer fneedles.release();
+    try expectPositions(&ctx, &.{ .{ .array = f }, .{ .array = fneedles } }, left, &.{ 0, 0, 3 });
+    try expectPositions(&ctx, &.{ .{ .array = f }, .{ .array = fneedles } }, right, &.{ 2, 2, 5 });
+    var strs = try common.makeStrings(.string, allocator, &.{ "a", "b", "b", "c" });
+    defer strs.release();
+    var sneedles = try common.makeStrings(.string, allocator, &.{ "b", "bb", null, "" });
+    defer sneedles.release();
+    try expectPositions(&ctx, &.{ .{ .array = strs }, .{ .array = sneedles } }, left, &.{ 1, 3, null, 0 });
+    try expectPositions(&ctx, &.{ .{ .array = strs }, .{ .array = sneedles } }, right, &.{ 3, 3, null, 0 });
+    var c = try common.makeArray(i64, allocator, &.{ 1, 2, 2, 3 });
+    defer c.release();
+    var cv = try common.chunkedAt(allocator, c, &.{2});
+    defer cv.release();
+    var cneedle_arr = try common.makeArray(i64, allocator, &.{ 2, 3, 9 });
+    defer cneedle_arr.release();
+    var cn = try common.chunkedAt(allocator, cneedle_arr, &.{1});
+    defer cn.release();
+    try expectPositions(&ctx, &.{ .{ .chunked = cv }, .{ .chunked = cn } }, right, &.{ 3, 4, 4 });
+    var bools = try common.makeArray(bool, allocator, &.{ false, true, true });
+    defer bools.release();
+    var bneedles = try common.makeArray(bool, allocator, &.{ true, false });
+    defer bneedles.release();
+    try expectPositions(&ctx, &.{ .{ .array = bools }, .{ .array = bneedles } }, left, &.{ 1, 0 });
+    var all_null = try common.makeArray(i64, allocator, &.{ null, null });
+    defer all_null.release();
+    try expectPositions(&ctx, &.{ .{ .array = all_null }, .{ .array = two_zero } }, left, &.{ 0, 0 });
+    try expectPositions(&ctx, &.{ .{ .array = empty }, .{ .array = two_zero } }, left, &.{ 0, 0 });
+    // Types must match (Arrow: "matching logical types"); nulls inside the values are rejected
+    // (Arrow leaves the position unspecified).
+    var i32s = try common.makeArray(i32, allocator, &.{ 1, 2 });
+    defer i32s.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("search_sorted", &.{ .{ .array = i32s }, .{ .array = two_zero } }, left));
+    var mid_null = try common.makeArray(i64, allocator, &.{ 1, null, 2 });
+    defer mid_null.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("search_sorted", &.{ .{ .array = mid_null }, .{ .array = two_zero } }, left));
+}

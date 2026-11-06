@@ -23,6 +23,8 @@ pub const associative = @import("associative.zig");
 pub const selection = @import("selection.zig");
 pub const aggregate_stats = @import("aggregate_stats.zig");
 pub const sort = @import("sort.zig");
+pub const tdigest = @import("tdigest.zig");
+pub const pivot = @import("pivot.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -46,4 +48,6 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try selection.register(registry);
     try aggregate_stats.register(registry);
     try sort.register(registry);
+    try tdigest.register(registry);
+    try pivot.register(registry);
 }
