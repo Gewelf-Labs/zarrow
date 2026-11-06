@@ -432,3 +432,337 @@ test "aggregate ScalarAggregateOptions and CountOptions: skip_nulls, min_count, 
     try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("count", &wn, aggOptions(true, 1)));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("count_all", &wn, .{ .count = .{} }));
 }
+
+// ------------------------------------------------------------------------------ ordered types
+
+/// Bytes of a string / binary / fixed_size_binary scalar (null: a null scalar).
+fn scalarBytes(s: Scalar) ?[]const u8 {
+    return switch (s.value) {
+        .string, .binary => |b| b,
+        else => null,
+    };
+}
+
+/// min, max and min_max of `arg` as bytes; every result passes validateFull.
+fn expectBytesMinMax(ctx: *ExecContext, arg: Datum, options: common.Options, lo: ?[]const u8, hi: ?[]const u8) !void {
+    for ([_][]const u8{ "min", "max" }, [_]?[]const u8{ lo, hi }) |name, want| {
+        var out = try ctx.invokeAggregate(name, &.{arg}, options);
+        defer out.release();
+        try std.testing.expect(out.scalar.data_type.eql(arg.dataType()));
+        try common.expectStrings(&.{want}, &.{scalarBytes(out.scalar)});
+    }
+    var mm = try ctx.invokeAggregate("min_max", &.{arg}, options);
+    defer mm.release();
+    const payload = mm.scalar.payload.?.data();
+    try payload.validateFull();
+    try std.testing.expect(payload.children[0].data().data_type.eql(arg.dataType()));
+    try common.expectStrings(&.{ lo, hi }, &.{ try rowBytes(payload.children[0].data()), try rowBytes(payload.children[1].data()) });
+}
+
+/// Bytes of row 0 of a string / binary / fixed_size_binary array (null for a null row).
+fn rowBytes(data: *const common.array_mod.ArrayData) !?[]const u8 {
+    if (data.data_type != .fixed_size_binary) return common.bytesAt(data, 0);
+    if (data.isNull(0)) return null;
+    const w: usize = @intCast(data.data_type.fixed_size_binary.byte_width);
+    return data.buffers[1].data[data.offset * w ..][0..w];
+}
+
+fn fixedBinary(allocator: std.mem.Allocator, width: usize, values: []const ?[]const u8) !ArrayRef {
+    var b = try common.array_mod.FixedSizeBinaryBuilder.init(allocator, width, values.len);
+    defer b.deinit();
+    for (values) |v| if (v) |x| try b.append(x) else try b.appendNull();
+    return b.finish();
+}
+
+test "min, max and min_max on bool, temporal, decimal32 / decimal64, string / binary layouts, fixed_size_binary and null (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var b = try common.makeArray(bool, allocator, &.{ true, null, false });
+    defer b.release();
+    try expectScalar(bool, &ctx, "min", .{ .array = b }, false);
+    try expectScalar(bool, &ctx, "max", .{ .array = b }, true);
+    var bmm = try aggregate(&ctx, "min_max", .{ .array = b });
+    defer bmm.release();
+    try std.testing.expect(bmm.payload.?.data().children[1].data().data_type == .bool);
+    var trues = try b.slice(0, 2);
+    defer trues.release();
+    try expectScalar(bool, &ctx, "min", .{ .array = trues }, true);
+
+    // Temporal types and decimal32 / decimal64 by value; the result keeps the input type.
+    const ts = common.DataType{ .timestamp = .{ .unit = .second, .timezone = null } };
+    var d32 = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 3, null, 1 });
+    defer d32.release();
+    var t64 = try common.makeTyped(i64, ts, allocator, &.{ 3, null, -1 });
+    defer t64.release();
+    var tm32 = try common.makeTyped(i32, .{ .time32 = .{ .unit = .second } }, allocator, &.{ 3, null, 1 });
+    defer tm32.release();
+    var dur = try common.makeTyped(i64, .{ .duration = .{ .unit = .millisecond } }, allocator, &.{ -3, null, 1 });
+    defer dur.release();
+    var dec32 = try common.makeTyped(i32, .{ .decimal32 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 150, null, -225 });
+    defer dec32.release();
+    var dec64 = try common.makeTyped(i64, .{ .decimal64 = .{ .precision = 12, .scale = 2 } }, allocator, &.{ 150, null, -225 });
+    defer dec64.release();
+    for ([_]ArrayRef{ d32, t64, tm32, dur, dec32, dec64 }, [_][2]i64{ .{ 1, 3 }, .{ -1, 3 }, .{ 1, 3 }, .{ -3, 1 }, .{ -225, 150 }, .{ -225, 150 } }) |arr, want| {
+        for ([_][]const u8{ "min", "max" }, want) |name, w| {
+            var s = try aggregate(&ctx, name, .{ .array = arr });
+            defer s.release();
+            try std.testing.expect(s.data_type.eql(arr.data().data_type));
+            const got: i64 = switch (s.value) {
+                inline .date32, .time32, .decimal32 => |x| x,
+                inline .timestamp, .duration, .decimal64 => |x| x,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(w, got);
+        }
+        var mm = try aggregate(&ctx, "min_max", .{ .array = arr });
+        defer mm.release();
+        try std.testing.expect(mm.data_type.struct_.fields[0].data_type.eql(arr.data().data_type));
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rt = try registry.resolveResultTypeAlloc(arena.allocator(), "min_max", .aggregate, &.{.{ .array = arr }}, none);
+        try std.testing.expect(rt.eql(mm.data_type));
+    }
+
+    // Every string and binary layout by bytes (0xff sorts last).
+    const rows = [_]?[]const u8{ "b", null, "a", "ab" };
+    inline for (.{ .string, .large_string, .string_view }) |tag| {
+        var s = try common.makeStrings(tag, allocator, &rows);
+        defer s.release();
+        try expectBytesMinMax(&ctx, .{ .array = s }, none, "a", "b");
+    }
+    const bins = [_]?[]const u8{ "b", null, "\xff", "ab" };
+    inline for (.{ .binary, .large_binary, .binary_view }) |tag| {
+        var s = try common.makeStrings(tag, allocator, &bins);
+        defer s.release();
+        try expectBytesMinMax(&ctx, .{ .array = s }, none, "ab", "\xff");
+    }
+    var fsb = try fixedBinary(allocator, 2, &.{ "bb", null, "\xff\x00", "ab" });
+    defer fsb.release();
+    try expectBytesMinMax(&ctx, .{ .array = fsb }, none, "ab", "\xff\x00");
+
+    // Sliced, chunked (one chunk all null), scalar, options, empty and all-null inputs.
+    var long = try common.makeStrings(.string, allocator, &.{ "zz", "m", null, "c", "x", null, "d", "a" });
+    defer long.release();
+    var mid = try long.slice(1, 6);
+    defer mid.release();
+    try expectBytesMinMax(&ctx, .{ .array = mid }, none, "c", "x");
+    var chunked = try common.chunkedAt(allocator, long, &.{ 2, 3, 5, 6 });
+    defer chunked.release();
+    try expectBytesMinMax(&ctx, .{ .chunked = chunked }, none, "a", "zz");
+    const one: Datum = .{ .scalar = Scalar.init(.{ .string = {} }, .{ .string = "q" }) };
+    try expectBytesMinMax(&ctx, one, none, "q", "q");
+    try expectBytesMinMax(&ctx, .{ .array = mid }, .{ .scalar_aggregate = .{ .skip_nulls = false } }, null, null);
+    try expectBytesMinMax(&ctx, .{ .array = mid }, .{ .scalar_aggregate = .{ .min_count = 5 } }, null, null);
+    try expectBytesMinMax(&ctx, .{ .array = mid }, .{ .scalar_aggregate = .{ .min_count = 0 } }, "c", "x");
+    var empty = try long.slice(0, 0);
+    defer empty.release();
+    try expectBytesMinMax(&ctx, .{ .array = empty }, .{ .scalar_aggregate = .{ .min_count = 0 } }, null, null);
+    var nulls = try long.slice(5, 1);
+    defer nulls.release();
+    try expectBytesMinMax(&ctx, .{ .array = nulls }, none, null, null);
+
+    // Two sessions fed alternate chunks, then merged, equal the whole input.
+    for ([_][]const u8{ "min", "max" }, [_][]const u8{ "a", "zz" }) |name, want| {
+        var left = try ctx.beginAggregate(name, &.{.{ .array = long }}, none);
+        defer left.deinit();
+        var right = try ctx.beginAggregate(name, &.{.{ .array = long }}, none);
+        defer right.deinit();
+        for (chunked.chunks(), 0..) |chunk, k| try (if (k % 2 == 0) &left else &right).update(&.{.{ .array = chunk }});
+        try left.merge(&right);
+        var merged = try left.finalize();
+        defer merged.release();
+        try common.expectStrings(&.{want}, &.{scalarBytes(merged.scalar)});
+    }
+
+    // The null type: null, and min_max of two nulls (struct<min: null, max: null>).
+    var nul = try common.core.datumBuildNullLikeWithAllocator(allocator, .{ .null = {} }, 3);
+    defer nul.release();
+    var nm = try aggregate(&ctx, "min", nul);
+    defer nm.release();
+    try std.testing.expect(nm.isNull() and nm.data_type == .null);
+    var nmm = try aggregate(&ctx, "min_max", nul);
+    defer nmm.release();
+    try std.testing.expect(nmm.payload.?.data().children[0].data().data_type == .null);
+
+    // Intervals have no order (pyarrow 26: no kernel).
+    var iv = try common.makeTyped(i32, .{ .interval_months = .{ .unit = .months } }, allocator, &.{1});
+    defer iv.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeAggregate("min", &.{.{ .array = iv }}, none));
+}
+
+fn hashOf(ctx: *ExecContext, name: []const u8, values: Datum, ids: Datum, options: common.Options) !ArrayRef {
+    var out = try ctx.invoke(name, .hash_aggregate, &.{ values, ids }, options);
+    errdefer out.release();
+    try out.array.data().validateFull();
+    return out.array;
+}
+
+test "hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var v = try common.makeStrings(.large_string, allocator, &.{ "b", "a", null, "c", null, "zz", "e" });
+    defer v.release();
+    var ids = try common.makeArray(u32, allocator, &.{ 0, 0, 1, 1, 2, 0, 3 });
+    defer ids.release();
+    var lo = try hashOf(&ctx, "hash_min", .{ .array = v }, .{ .array = ids }, none);
+    defer lo.release();
+    const lo_rows = try common.collectStrings(allocator, .{ .array = lo });
+    defer allocator.free(lo_rows);
+    try common.expectStrings(&.{ "a", "c", null, "e" }, lo_rows);
+    var mm = try hashOf(&ctx, "hash_min_max", .{ .array = v }, .{ .array = ids }, none);
+    defer mm.release();
+    try std.testing.expect(mm.data().data_type.struct_.fields[1].data_type.* == .large_string);
+    const hi_rows = try common.collectStrings(allocator, .{ .array = mm.data().children[1] });
+    defer allocator.free(hi_rows);
+    try common.expectStrings(&.{ "zz", "c", null, "e" }, hi_rows);
+    // skip_nulls = false: a group with a null row is null.
+    var strict = try hashOf(&ctx, "hash_max", .{ .array = v }, .{ .array = ids }, .{ .scalar_aggregate = .{ .skip_nulls = false } });
+    defer strict.release();
+    const strict_rows = try common.collectStrings(allocator, .{ .array = strict });
+    defer allocator.free(strict_rows);
+    try common.expectStrings(&.{ "zz", null, null, "e" }, strict_rows);
+
+    // Chunked values and ids with different boundaries equal the array result, and so do two
+    // lifecycle sessions merged.
+    var cv = try common.chunkedAt(allocator, v, &.{ 1, 4 });
+    defer cv.release();
+    var ci = try common.chunkedAt(allocator, ids, &.{ 2, 3, 6 });
+    defer ci.release();
+    var from_chunks = try hashOf(&ctx, "hash_min", .{ .chunked = cv }, .{ .chunked = ci }, none);
+    defer from_chunks.release();
+    const chunk_rows = try common.collectStrings(allocator, .{ .array = from_chunks });
+    defer allocator.free(chunk_rows);
+    try common.expectStrings(lo_rows, chunk_rows);
+    var s1 = try ctx.beginAggregate("hash_min_max", &.{ .{ .array = v }, .{ .array = ids } }, none);
+    defer s1.deinit();
+    var s2 = try ctx.beginAggregate("hash_min_max", &.{ .{ .array = v }, .{ .array = ids } }, none);
+    defer s2.deinit();
+    var v1 = try v.slice(0, 4);
+    defer v1.release();
+    var v2 = try v.slice(4, 3);
+    defer v2.release();
+    var id1 = try ids.slice(0, 4);
+    defer id1.release();
+    var id2 = try ids.slice(4, 3);
+    defer id2.release();
+    try s1.update(&.{ .{ .array = v1 }, .{ .array = id1 } });
+    try s2.update(&.{ .{ .array = v2 }, .{ .array = id2 } });
+    try s1.merge(&s2);
+    var merged = try s1.finalize();
+    defer merged.release();
+    try merged.array.data().validateFull();
+    const merged_hi = try common.collectStrings(allocator, .{ .array = merged.array.data().children[1] });
+    defer allocator.free(merged_hi);
+    try common.expectStrings(hi_rows, merged_hi);
+
+    // bool, date32 and fixed_size_binary.
+    var bools = try common.makeArray(bool, allocator, &.{ true, false, null, true, null, true, false });
+    defer bools.release();
+    var bmin = try hashOf(&ctx, "hash_min", .{ .array = bools }, .{ .array = ids }, none);
+    defer bmin.release();
+    const bvals = try common.collect(bool, allocator, .{ .array = bmin });
+    defer allocator.free(bvals);
+    try common.expectRows(bool, &.{ false, true, null, false }, bvals);
+    var dates = try common.makeTyped(i32, .{ .date32 = {} }, allocator, &.{ 5, 2, null, 7, null, 9, -1 });
+    defer dates.release();
+    var dmax = try hashOf(&ctx, "hash_max", .{ .array = dates }, .{ .array = ids }, none);
+    defer dmax.release();
+    try std.testing.expect(dmax.data().data_type == .date32);
+    const dvals = try common.collect(i32, allocator, .{ .array = dmax });
+    defer allocator.free(dvals);
+    try common.expectRows(i32, &.{ 9, 7, null, -1 }, dvals);
+    var fsb = try fixedBinary(allocator, 1, &.{ "b", "a", null, "c", null, "\xff", "e" });
+    defer fsb.release();
+    var fmax = try hashOf(&ctx, "hash_max", .{ .array = fsb }, .{ .array = ids }, none);
+    defer fmax.release();
+    try std.testing.expectEqualStrings("\xff", fmax.data().buffers[1].data[0..1]);
+    // The null type: every group null (pyarrow 26: struct<min: null, max: null>).
+    var nul = try common.core.datumBuildNullLikeWithAllocator(allocator, .{ .null = {} }, 7);
+    defer nul.release();
+    var nmm = try hashOf(&ctx, "hash_min_max", nul, .{ .array = ids }, none);
+    defer nmm.release();
+    try std.testing.expect(nmm.data().children[0].data().data_type == .null and nmm.data().length == 4);
+}
+
+test "min and max of byte rows match std.mem.order on random rows sharing prefixes, with nulls and every layout" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var prng = std.Random.DefaultPrng.init(0x18);
+    const rng = prng.random();
+    const alphabet = [_]u8{ 0, 1, 'a', 'b', 0x7f, 0xfe, 0xff };
+    var storage: [64][24]u8 = undefined;
+    var rows: [64]?[]const u8 = undefined;
+    for (0..40) |_| {
+        const prefix_len = rng.uintLessThan(usize, 12);
+        const shared = rng.uintLessThan(u8, 3);
+        for (&rows, &storage) |*r, *buf| {
+            if (rng.uintLessThan(u8, 10) == 0) {
+                r.* = null;
+                continue;
+            }
+            const len = prefix_len + rng.uintLessThan(usize, 12);
+            for (buf[0..len], 0..) |*c, k| c.* = if (k < prefix_len) alphabet[shared] else alphabet[rng.uintLessThan(usize, alphabet.len)];
+            r.* = buf[0..len];
+        }
+        var want_lo: ?[]const u8 = null;
+        var want_hi: ?[]const u8 = null;
+        for (rows) |r| if (r) |x| {
+            if (want_lo == null or std.mem.order(u8, x, want_lo.?) == .lt) want_lo = x;
+            if (want_hi == null or std.mem.order(u8, x, want_hi.?) == .gt) want_hi = x;
+        };
+        inline for (.{ .binary, .large_binary, .binary_view }) |tag| {
+            var arr = try common.makeStrings(tag, allocator, &rows);
+            defer arr.release();
+            try expectBytesMinMax(&ctx, .{ .array = arr }, none, want_lo, want_hi);
+        }
+    }
+}
+
+test "min and max of byte rows across scan blocks: 3000 rows, extremes in later blocks, nulls, sliced" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var prng = std.Random.DefaultPrng.init(0x1818);
+    const rng = prng.random();
+    const n = 3000;
+    const storage = try allocator.alloc([20]u8, n);
+    defer allocator.free(storage);
+    const rows = try allocator.alloc(?[]const u8, n);
+    defer allocator.free(rows);
+    for (0..6) |round| {
+        for (rows, storage, 0..) |*r, *buf, i| {
+            if (rng.uintLessThan(u8, 8) == 0) {
+                r.* = null;
+                continue;
+            }
+            // "row-XXXXXXXX" with a shared prefix; later rows reach further in odd rounds.
+            const hi_digit: u8 = if (round % 2 == 1 and i > 2000) '9' else '0' + rng.uintLessThan(u8, 9);
+            const len = 9 + rng.uintLessThan(usize, 11);
+            @memcpy(buf[0..4], "row-");
+            buf[4] = hi_digit;
+            for (buf[5..len]) |*c| c.* = 'a' + rng.uintLessThan(u8, 3);
+            r.* = buf[0..len];
+        }
+        const off = round * 7;
+        var want_lo: ?[]const u8 = null;
+        var want_hi: ?[]const u8 = null;
+        for (rows[off..]) |r| if (r) |x| {
+            if (want_lo == null or std.mem.order(u8, x, want_lo.?) == .lt) want_lo = x;
+            if (want_hi == null or std.mem.order(u8, x, want_hi.?) == .gt) want_hi = x;
+        };
+        var arr = try common.makeStrings(.string, allocator, rows);
+        defer arr.release();
+        var sliced = try arr.slice(off, n - off);
+        defer sliced.release();
+        try expectBytesMinMax(&ctx, .{ .array = sliced }, none, want_lo, want_hi);
+    }
+}

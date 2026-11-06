@@ -700,3 +700,42 @@ test "decimal product and hash_product: input type, Arrow rounding per step and 
     defer three_keys.release();
     try std.testing.expectError(error.Overflow, hash.groupBy(&ctx, &.{.{ .name = "g", .array = three_keys }}, &.{.{ .name = "p", .function = "hash_product", .input = big }}));
 }
+
+test "variance, stddev, skew and kurtosis and their hash_ forms on decimal32 / decimal64 (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var d32 = try common.makeTyped(i32, .{ .decimal32 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 150, null, -225 });
+    defer d32.release();
+    var d64 = try common.makeTyped(i64, .{ .decimal64 = .{ .precision = 12, .scale = 2 } }, allocator, &.{ 150, null, -225 });
+    defer d64.release();
+    var ids = try common.makeArray(u32, allocator, &.{ 0, 0, 1 });
+    defer ids.release();
+    for ([_]ArrayRef{ d32, d64 }) |d| {
+        try expectF64(&ctx, "variance", .{ .array = d }, none, 3.515625);
+        try expectF64(&ctx, "stddev", .{ .array = d }, none, 1.875);
+        try expectF64(&ctx, "skew", .{ .array = d }, none, 0.0);
+        try expectF64(&ctx, "kurtosis", .{ .array = d }, none, -2.0);
+        try expectF64(&ctx, "variance", .{ .array = d }, variance(1, true, 0), 7.03125);
+        try expectF64(&ctx, "variance", .{ .array = d }, variance(0, false, 0), null);
+        // Sliced and chunked inputs, a scalar.
+        var tail = try d.slice(1, 2);
+        defer tail.release();
+        try expectF64(&ctx, "variance", .{ .array = tail }, none, 0.0);
+        var chunked = try common.chunkedAt(allocator, d, &.{1});
+        defer chunked.release();
+        try expectF64(&ctx, "stddev", .{ .chunked = chunked }, none, 1.875);
+        var hv = try hashCall(&ctx, "hash_variance", d, ids, none);
+        defer hv.release();
+        const rows = try common.collect(f64, allocator, .{ .array = hv });
+        defer allocator.free(rows);
+        try expectNear(0.0, rows[0].?);
+        try expectNear(0.0, rows[1].?);
+        var hk = try hashCall(&ctx, "hash_stddev", d, ids, variance(1, true, 0));
+        defer hk.release();
+        try std.testing.expect(hk.data().isNull(0) and hk.data().isNull(1));
+    }
+    const s: Datum = .{ .scalar = Scalar.init(.{ .decimal32 = .{ .precision = 5, .scale = 2 } }, .{ .decimal32 = 150 }) };
+    try expectF64(&ctx, "variance", s, none, 0.0);
+}

@@ -255,6 +255,28 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var dict_rows = try dict_builder.finish(dict);
     defer dict_rows.release();
     try timeKernel(io, &ctx, .vector, "compute_unique_dictionary", "unique", &.{.{ .array = dict_rows }}, cfg, emit_csv, meta);
+    // min_max over the string rows; cumulative_sum (skip_nulls) and pairwise_diff over int64 with
+    // 10% nulls; replace_with_mask of int32 rows under a bool mask with 10% nulls.
+    try timeKernel(io, &ctx, .aggregate, "compute_min_max_string", "min_max", &.{.{ .array = str_a }}, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .vector, "compute_cumulative_sum_int64", "cumulative_sum", &.{.{ .array = i64arr }}, .{ .cumulative = .{ .skip_nulls = true } }, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .vector, "compute_pairwise_diff_int64", "pairwise_diff", &.{.{ .array = i64arr }}, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .vector, "compute_replace_with_mask_int32", "replace_with_mask", &.{ .{ .array = a }, .{ .array = bool_a }, .{ .array = b } }, cfg, emit_csv, meta);
+    // list<int32> of four values per row over the int32 rows to list<int64>: ns per child row.
+    const item32 = zarrow.Field{ .name = "item", .data_type = &i32_type };
+    const i64_type = zarrow.DataType{ .int64 = {} };
+    var list_builder = try zarrow.ListBuilder.init(allocator, cfg.rows / 4, item32);
+    defer list_builder.deinit();
+    for (0..cfg.rows / 4) |_| try list_builder.appendLen(4);
+    var child = try a.slice(0, (cfg.rows / 4) * 4);
+    defer child.release();
+    var lists = try list_builder.finish(child);
+    defer lists.release();
+    const to_list64 = Options{ .cast = .{ .to_type = .{ .list = .{ .value_field = .{ .name = "item", .data_type = &i64_type } } } } };
+    try timeKernelWith(io, &ctx, .scalar, "compute_cast_list_int32_to_int64", "cast", &.{.{ .array = lists }}, to_list64, .{ .rows = (cfg.rows / 4) * 4, .iterations = cfg.iterations }, emit_csv, meta);
+    // indices_nonzero over int32 rows that are 0 or 1 at random.
+    var zero_one = try buildInt32Mod(allocator, cfg.rows, 20, 2);
+    defer zero_one.release();
+    try timeKernel(io, &ctx, .vector, "compute_indices_nonzero", "indices_nonzero", &.{.{ .array = zero_one }}, cfg, emit_csv, meta);
     // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
     try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
 }

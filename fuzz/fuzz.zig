@@ -591,6 +591,107 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
         }
         if (zarrow.compute.kernels.hash_aggregate.isGroupKeyType(a.data().data_type)) exerciseGroupBy(&ctx, a);
         exerciseRound16(&ctx, a);
+        exerciseRound18(&ctx, a);
+    }
+}
+
+/// Round 18 kernels on any decoded array: min / max / min_max and hash_min_max of the ordered
+/// non-numeric types, scatter and inverse_permutation of the reversed rows (their outputs must be
+/// valid, the inverse a permutation), replace_with_mask (a mask of every third row, the array as
+/// its own replacements), cumulative_sum / cumulative_max / pairwise_diff / winsorize / indices_nonzero
+/// on numbers, float16 casts and promotion, and nested casts (list layouts among themselves, a
+/// struct to its fields reversed, a map to a list of its entries): each succeeds or fails with a
+/// listed error, and every array output validates with the expected length.
+fn exerciseRound18(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const gpa = std.heap.page_allocator;
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    const dt = a.data().data_type;
+    if (zarrow.compute.kernels.aggregate_basic.isOrderedType(dt)) {
+        // UnsupportedType: min_max of an empty fixed_size_binary wider than 16 MiB.
+        expectCall(ctx, "min_max", .aggregate, &.{d}, .none, null, &.{error.UnsupportedType});
+        expectCall(ctx, "max", .aggregate, &.{d}, .{ .scalar_aggregate = .{ .skip_nulls = false } }, null, &.{});
+        var ids_b = zarrow.UInt32Builder.init(gpa, len) catch return;
+        defer ids_b.deinit();
+        for (0..len) |i| ids_b.append(@intCast(i % 3)) catch return;
+        var ids = ids_b.finish() catch return;
+        defer ids.release();
+        expectCall(ctx, "hash_min_max", .hash_aggregate, &.{ d, .{ .array = ids } }, .none, @min(len, 3), &.{});
+    }
+    // The reversed rows as int64 indices.
+    var rev_b = zarrow.Int64Builder.init(gpa, len) catch return;
+    defer rev_b.deinit();
+    for (0..len) |i| rev_b.append(@intCast(len - 1 - i)) catch return;
+    var rev = rev_b.finish() catch return;
+    defer rev.release();
+    expectCall(ctx, "scatter", .vector, &.{ d, .{ .array = rev } }, .none, len, &.{});
+    var inv = ctx.invoke("inverse_permutation", .vector, &.{.{ .array = rev }}, .none) catch |e| std.debug.panic("fuzz-invariant: inverse_permutation failed: {s}", .{@errorName(e)});
+    defer inv.release();
+    expectValid("inverse_permutation", inv.array, len);
+    for ((zarrow.PrimitiveArray(i64){ .data = inv.array.data() }).values() catch unreachable, 0..) |v, i| {
+        if (v != @as(i64, @intCast(len - 1 - i))) std.debug.panic("fuzz-invariant: inverse_permutation of the reversed rows gave {d} at {d}", .{ v, i });
+    }
+    var mask_b = zarrow.BooleanBuilder.init(gpa, len) catch return;
+    defer mask_b.deinit();
+    for (0..len) |i| (if (i % 5 == 4) mask_b.appendNull() else mask_b.append(i % 3 == 0)) catch return;
+    var mask = mask_b.finish() catch return;
+    defer mask.release();
+    expectCall(ctx, "replace_with_mask", .vector, &.{ d, .{ .array = mask }, d }, .none, len, &.{ error.NoMatchingKernel, error.UnsupportedType });
+    switch (dt) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+            expectCall(ctx, "cumulative_sum", .vector, &.{d}, .{ .cumulative = .{ .skip_nulls = true } }, len, &.{});
+            expectCall(ctx, "cumulative_max", .vector, &.{d}, .none, len, &.{});
+            expectCall(ctx, "cumulative_prod_checked", .vector, &.{d}, .none, len, &.{error.Overflow});
+            expectCall(ctx, "cumulative_mean", .vector, &.{d}, .{ .cumulative = .{ .skip_nulls = true } }, len, &.{});
+            expectCall(ctx, "pairwise_diff", .vector, &.{d}, .{ .pairwise = .{ .period = -2 } }, len, &.{});
+            expectCall(ctx, "winsorize", .vector, &.{d}, .{ .winsorize = .{ .lower_limit = 0.1, .upper_limit = 0.8 } }, len, &.{});
+            expectAnyLen(ctx, "indices_nonzero", &.{d}, .none, &.{});
+        },
+        .bool, .decimal32, .decimal128, .decimal256 => expectAnyLen(ctx, "indices_nonzero", &.{d}, .none, &.{}),
+        .half_float => {
+            expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .float = {} }, true), len, &.{});
+            expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{});
+            expectCall(ctx, "add", .scalar, &.{ d, d }, .none, len, &.{});
+            expectCall(ctx, "less", .scalar, &.{ d, d }, .none, len, &.{});
+            expectKernel(ctx, "is_nan", .scalar, &.{d}, len, false);
+        },
+        .date32, .date64, .timestamp, .time32, .time64, .duration => expectCall(ctx, "pairwise_diff_checked", .vector, &.{d}, .none, len, &.{ error.Overflow, error.NotImplemented }),
+        else => {},
+    }
+    exerciseNestedCasts(ctx, a);
+}
+
+/// Nested casts on a decoded list-like, struct or map array (see exerciseRound18).
+fn exerciseNestedCasts(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    // A child type the cast may not support, a list size it does not match, a map to a fixed
+    // size list, offsets past 32 bits, or a non-nullable target field over nulls.
+    const allowed = [_]anyerror{ error.UnsupportedType, error.InvalidCast, error.Overflow, error.NotImplemented };
+    switch (a.data().data_type) {
+        inline .list, .large_list, .list_view, .large_list_view, .fixed_size_list => |l| {
+            const f = l.value_field;
+            for ([_]DataType{
+                .{ .list = .{ .value_field = f } },
+                .{ .large_list = .{ .value_field = f } },
+                .{ .list_view = .{ .value_field = f } },
+                .{ .large_list_view = .{ .value_field = f } },
+                .{ .fixed_size_list = .{ .value_field = f, .list_size = 2 } },
+            }) |to| expectCall(ctx, "cast", .scalar, &.{d}, cast(to, true), len, &allowed);
+        },
+        .map => |m| {
+            const fields = [_]Field{ m.key_field, m.item_field };
+            const entries = DataType{ .struct_ = .{ .fields = &fields } };
+            expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .large_list = .{ .value_field = .{ .name = "e", .data_type = &entries } } }, true), len, &allowed);
+            expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .map = .{ .key_field = m.key_field, .item_field = m.item_field, .keys_sorted = true } }, true), len, &allowed);
+        },
+        .struct_ => |st| {
+            if (st.fields.len > 8) return;
+            var reversed: [8]Field = undefined;
+            for (reversed[0..st.fields.len], 0..) |*r, i| r.* = st.fields[st.fields.len - 1 - i];
+            expectCall(ctx, "cast", .scalar, &.{d}, cast(.{ .struct_ = .{ .fields = reversed[0..st.fields.len] } }, true), len, &allowed);
+        },
+        else => {},
     }
 }
 

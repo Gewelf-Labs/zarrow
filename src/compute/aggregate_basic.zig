@@ -40,6 +40,7 @@ const decimal = @import("decimal.zig");
 const dense = @import("dense.zig");
 const is_null = @import("is_null.zig");
 const primitive_array = @import("../array/primitive_array.zig");
+const sort = @import("sort.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
@@ -76,6 +77,9 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         try add(registry, "max", 1, check, scalarAggregateOptions, DecimalMinMax(T, .max));
         try add(registry, "min_max", 1, check, scalarAggregateOptions, DecimalMinMax(T, .min_max));
     }
+    try add(registry, "min", 1, orderedArg, scalarAggregateOptions, OrderedMinMax(.min));
+    try add(registry, "max", 1, orderedArg, scalarAggregateOptions, OrderedMinMax(.max));
+    try add(registry, "min_max", 1, orderedArg, scalarAggregateOptions, OrderedMinMax(.min_max));
 }
 
 fn noArgs(args: []const Datum) bool {
@@ -703,4 +707,312 @@ pub fn oneDecimal(comptime T: type, allocator: std.mem.Allocator, dt: DataType, 
         validity.?.data[0] = 0;
     }
     return dense.finishFixed(allocator, dt, 1, &buf, validity);
+}
+
+// ------------------------------------------------------------------------------ ordered types
+
+/// Whether min / max / min_max take `dt` through `OrderedMinMax`: the null type, bool, the
+/// temporal types, decimal32 / decimal64 and the string / binary layouts with
+/// fixed_size_binary (pyarrow 26 has all but duration, the views and decimal32 / decimal64).
+pub fn isOrderedType(dt: DataType) bool {
+    return switch (dt) {
+        .null, .bool, .date32, .date64, .timestamp, .time32, .time64, .duration, .decimal32, .decimal64 => true,
+        .string, .large_string, .string_view, .binary, .large_binary, .binary_view, .fixed_size_binary => true,
+        else => false,
+    };
+}
+
+fn orderedArg(args: []const Datum) bool {
+    return args.len == 1 and isOrderedType(args[0].dataType());
+}
+
+/// The rows of the smallest and largest valid value of a chunk and its valid row count.
+pub const Extremes = struct { lo: usize = 0, hi: usize = 0, count: u64 = 0 };
+
+/// Scan the valid rows of `data` (typed rows `vals`).
+pub fn extremesOf(data: *const ArrayData, vals: *const sort.Values) Extremes {
+    return switch (vals.*) {
+        .bytes => |op| switch (op) {
+            inline else => |r| scanRows(data, r),
+        },
+        .fixed => |f| scanRows(data, FixedRows{ .data = f.data, .width = f.width, .offset = f.offset }),
+        .boolean => |b| scanRows(data, BoolRows{ .bits = b.bits, .offset = b.offset }),
+        inline .i32, .i64 => |s| scanRows(data, SliceRows(@TypeOf(s[0])){ .vals = s }),
+        // isOrderedType admits no other storage.
+        else => .{},
+    };
+}
+
+const FixedRows = struct {
+    data: []const u8,
+    width: usize,
+    offset: usize,
+    inline fn get(self: FixedRows, i: usize) []const u8 {
+        return self.data[(self.offset + i) * self.width ..][0..self.width];
+    }
+};
+
+const BoolRows = struct {
+    bits: []const u8,
+    offset: usize,
+    inline fn get(self: BoolRows, i: usize) u1 {
+        return @intFromBool(bitmap.bitIsSet(self.bits, self.offset + i));
+    }
+};
+
+fn SliceRows(comptime T: type) type {
+    return struct {
+        vals: []const T,
+        inline fn get(self: @This(), i: usize) T {
+            return self.vals[i];
+        }
+    };
+}
+
+/// The first 8 bytes of `s` as a big-endian integer, zero padded: integer order is byte order
+/// up to a tie (equal keys: compare the rest).
+inline fn prefixKey(s: []const u8) u64 {
+    const n = s.len;
+    if (n >= 8) return std.mem.readInt(u64, s[0..8], .big);
+    // Short rows without a copy: two overlapping loads land every byte at its place.
+    if (n >= 4) {
+        const first: u64 = std.mem.readInt(u32, s[0..4], .big);
+        const last: u64 = std.mem.readInt(u32, s[n - 4 ..][0..4], .big);
+        return (first << 32) | (last << @intCast(64 - 8 * n));
+    }
+    if (n == 0) return 0;
+    const b0: u64 = s[0];
+    const bm: u64 = s[n / 2];
+    const bl: u64 = s[n - 1];
+    return (b0 << 56) | (bm << @intCast(56 - 8 * (n / 2))) | (bl << @intCast(56 - 8 * (n - 1)));
+}
+
+/// Byte order of `a` before `b`, 8 bytes at a time.
+fn bytesLess(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    while (true) : (i += 8) {
+        const ka = prefixKey(a[i..]);
+        const kb = prefixKey(b[i..]);
+        if (ka != kb) return ka < kb;
+        // Equal padded keys: one ran out (the shorter is first) or both go on.
+        if (a.len - i <= 8 or b.len - i <= 8) return a.len < b.len;
+    }
+}
+
+/// The padded key of bytes 8..16 (0 for a row of at most 8 bytes).
+inline fn restKey(s: []const u8) u64 {
+    return if (s.len > 8) prefixKey(s[8..]) else 0;
+}
+
+/// Order of two byte rows whose padded 16-byte prefixes are equal: a row of at most 16 bytes
+/// is the shorter one, else the bytes from 16 on decide.
+inline fn tailLess(a: []const u8, b: []const u8) bool {
+    if (a.len <= 16 or b.len <= 16) return a.len < b.len;
+    return bytesLess(a[16..], b[16..]);
+}
+
+fn scanRows(data: *const ArrayData, rows: anytype) Extremes {
+    if (@TypeOf(rows.get(0)) == []const u8) return scanBytes(data, rows);
+    const bits = dense.validityBits(data);
+    var i: usize = 0;
+    if (bits) |b| {
+        while (i < data.length and !bitmap.bitIsSet(b, data.offset + i)) i += 1;
+    }
+    if (i == data.length) return .{};
+    var out: Extremes = .{ .lo = i, .hi = i, .count = 1 };
+    var lo = rows.get(i);
+    var hi = lo;
+    for (i + 1..data.length) |j| {
+        if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + j)) continue;
+        const x = rows.get(j);
+        // A value below the minimum cannot be above the maximum.
+        if (x < lo) {
+            lo = x;
+            out.lo = j;
+        } else if (hi < x) {
+            hi = x;
+            out.hi = j;
+        }
+        out.count += 1;
+    }
+    return out;
+}
+
+/// Byte rows in blocks: the 8-byte prefix key of every row goes to a stack buffer with the
+/// block's smallest and largest key, then only the rows of the extreme keys are compared
+/// further (the next 8 bytes, then the rest).
+fn scanBytes(data: *const ArrayData, rows: anytype) Extremes {
+    const bits = dense.validityBits(data);
+    const n = data.length;
+    const Best = struct {
+        row: ?usize = null,
+        k: u64 = 0,
+        k2: u64 = 0,
+        v: []const u8 = &.{},
+    };
+    var lo: Best = .{};
+    var hi: Best = .{};
+    var count: u64 = 0;
+    var keys: [1024]u64 = undefined;
+    var start: usize = 0;
+    while (start < n) : (start += keys.len) {
+        const m = @min(keys.len, n - start);
+        var block_lo: u64 = std.math.maxInt(u64);
+        var block_hi: u64 = 0;
+        var valid: usize = m;
+        if (bits) |b| {
+            valid = 0;
+            for (keys[0..m], start..) |*k, j| {
+                k.* = prefixKey(rows.get(j));
+                if (bitmap.bitIsSet(b, data.offset + j)) {
+                    block_lo = @min(block_lo, k.*);
+                    block_hi = @max(block_hi, k.*);
+                    valid += 1;
+                }
+            }
+        } else for (keys[0..m], start..) |*k, j| {
+            k.* = prefixKey(rows.get(j));
+            block_lo = @min(block_lo, k.*);
+            block_hi = @max(block_hi, k.*);
+        }
+        if (valid == 0) continue;
+        count += valid;
+        if (lo.row == null or block_lo < lo.k) lo = .{ .k = block_lo };
+        if (hi.row == null or block_hi > hi.k) hi = .{ .k = block_hi };
+        for (keys[0..m], start..) |k, j| {
+            if (k != lo.k and k != hi.k) continue;
+            if (bits) |b| if (!bitmap.bitIsSet(b, data.offset + j)) continue;
+            const x = rows.get(j);
+            const k2 = restKey(x);
+            if (k == lo.k and (lo.row == null or k2 < lo.k2 or (k2 == lo.k2 and tailLess(x, lo.v)))) lo = .{ .row = j, .k = k, .k2 = k2, .v = x };
+            if (k == hi.k and (hi.row == null or k2 > hi.k2 or (k2 == hi.k2 and tailLess(hi.v, x)))) hi = .{ .row = j, .k = k, .k2 = k2, .v = x };
+        }
+    }
+    if (count == 0) return .{};
+    return .{ .lo = lo.row.?, .hi = hi.row.?, .count = count };
+}
+
+/// min / max / min_max of the ordered non-numeric types (`isOrderedType`): bool (false < true),
+/// dates, timestamps, times and durations and decimal32 / decimal64 by value, the string /
+/// binary layouts and fixed_size_binary by bytes. The state keeps one-row slices of the input
+/// holding the smallest and largest value so far; the options rules are those of `MinMax`
+/// (null with no valid row whatever `min_count`; min_max gives `struct<min, max>` of the input
+/// type, stored with its payload array).
+fn OrderedMinMax(comptime which: enum { min, max, min_max }) type {
+    return struct {
+        pub const update_takes_ref = true;
+
+        pub const State = struct {
+            allocator: std.mem.Allocator,
+            min: ?ArrayRef = null,
+            max: ?ArrayRef = null,
+            /// min_max: a one-row slice of the first null input row, the null field of a null
+            /// result without a new value (a fixed_size_binary may be wide).
+            null_row: ?ArrayRef = null,
+            count: u64 = 0,
+            nulls: u64 = 0,
+            dt: DataType = .{ .null = {} },
+        };
+
+        pub const resultType = if (which == .min_max) {} else struct {
+            fn f(args: []const Datum, _: Options) KernelError!DataType {
+                if (args.len != 1) return error.InvalidArity;
+                return args[0].dataType();
+            }
+        }.f;
+
+        pub const resultTypeAlloc = if (which != .min_max) {} else struct {
+            fn f(allocator: std.mem.Allocator, args: []const Datum, _: Options) KernelError!DataType {
+                if (args.len != 1) return error.InvalidArity;
+                const dt = args[0].dataType();
+                return dense.structTypeAlloc(allocator, &min_max_names, &.{ dt, dt });
+            }
+        }.f;
+
+        pub fn initState(ctx: *ExecContext, _: Options) KernelError!State {
+            return .{ .allocator = ctx.allocator };
+        }
+
+        pub fn deinitState(state: *State) void {
+            if (state.min) |*a| a.release();
+            if (state.max) |*a| a.release();
+            if (state.null_row) |*a| a.release();
+        }
+
+        /// Keep row `row` of `arr` in `slot` when the slot is empty or the row orders `want`
+        /// (.lt: smaller, .gt: larger) against the value held.
+        fn offer(slot: *?ArrayRef, arr: ArrayRef, vals: *const sort.Values, row: usize, want: std.math.Order) KernelError!void {
+            if (slot.*) |held| {
+                const hv = try sort.valuesOf(held);
+                if (sort.valueOrder(vals, row, &hv, 0) != want) return;
+            }
+            const one = arr.slice(row, 1) catch return error.OutOfMemory;
+            if (slot.*) |*old| old.release();
+            slot.* = one;
+        }
+
+        pub fn update(state: *State, arr: ArrayRef) KernelError!void {
+            const data = arr.data();
+            if (!isOrderedType(data.data_type)) return error.InvalidInput;
+            if (state.dt != .null and !state.dt.eql(data.data_type)) return error.InvalidInput;
+            state.dt = data.data_type;
+            if (data.data_type == .null) {
+                state.nulls += data.length;
+                return;
+            }
+            const vals = try sort.valuesOf(arr);
+            const ext = extremesOf(data, &vals);
+            state.nulls += data.length - ext.count;
+            if (which == .min_max and state.null_row == null and ext.count < data.length) {
+                var i: usize = 0;
+                while (!data.isNull(i)) i += 1;
+                state.null_row = arr.slice(i, 1) catch return error.OutOfMemory;
+            }
+            if (ext.count == 0) return;
+            state.count += ext.count;
+            if (which != .max) try offer(&state.min, arr, &vals, ext.lo, .lt);
+            if (which != .min) try offer(&state.max, arr, &vals, ext.hi, .gt);
+        }
+
+        pub fn updateScalar(state: *State, s: Scalar) KernelError!void {
+            var arr = try dense.chunkArray(state.allocator, .{ .scalar = s });
+            defer arr.release();
+            arr.data().validateLayout() catch return error.InvalidInput;
+            try update(state, arr);
+        }
+
+        pub fn merge(state: *State, other: *const State) KernelError!void {
+            if (state.dt != .null and other.dt != .null and !state.dt.eql(other.dt)) return error.InvalidInput;
+            if (other.min) |a| try offer(&state.min, a, &(try sort.valuesOf(a)), 0, .lt);
+            if (other.max) |a| try offer(&state.max, a, &(try sort.valuesOf(a)), 0, .gt);
+            if (state.null_row == null) if (other.null_row) |a| {
+                state.null_row = a.retain();
+            };
+            state.count += other.count;
+            state.nulls += other.nulls;
+            if (state.dt == .null) state.dt = other.dt;
+        }
+
+        pub fn finalize(ctx: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            const valid = state.count != 0 and !nullByOptions(aggregateOptions(options), state.count, state.nulls);
+            if (which != .min_max) {
+                const held = if (which == .min) state.min else state.max;
+                if (!valid or held == null) return nullScalar(state.dt);
+                return .{ .scalar = try dense.scalarAt0(held.?) };
+            }
+            // An empty input has no row to lend its buffers to the null fields: a value of a
+            // fixed_size_binary past 16 MiB is not allocated from nothing (hostile schema).
+            if (state.null_row == null and state.dt == .fixed_size_binary and state.dt.fixed_size_binary.byte_width > 1 << 24 and !(valid and state.min != null)) return error.UnsupportedType;
+            var parts: [2]ArrayRef = undefined;
+            for (&parts, [_]?ArrayRef{ state.min, state.max }, 0..) |*p, held, k| {
+                p.* = if (valid and held != null) held.?.retain() else if (state.null_row) |r| r.retain() else dense.nullArray(ctx.allocator, state.dt, 1) catch |err| {
+                    for (parts[0..k]) |*q| q.release();
+                    return err;
+                };
+            }
+            var payload = try dense.structArray(ctx.allocator, &min_max_names, &parts, 1, null);
+            defer payload.release();
+            return .{ .scalar = try Scalar.initNested(payload.data().data_type, payload) };
+        }
+    };
 }

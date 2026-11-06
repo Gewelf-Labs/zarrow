@@ -413,6 +413,12 @@ pub const TDigestOptions = options_mod.TDigestOptions;
 pub const UnexpectedKeyBehavior = options_mod.UnexpectedKeyBehavior;
 pub const PivotWiderOptions = options_mod.PivotWiderOptions;
 pub const DictionaryEncodeOptions = options_mod.DictionaryEncodeOptions;
+pub const ScatterOptions = options_mod.ScatterOptions;
+pub const InversePermutationOptions = options_mod.InversePermutationOptions;
+pub const CumulativeOptions = options_mod.CumulativeOptions;
+pub const PairwiseOptions = options_mod.PairwiseOptions;
+pub const WinsorizeOptions = options_mod.WinsorizeOptions;
+pub const RandomOptions = options_mod.RandomOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;
