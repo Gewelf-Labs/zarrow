@@ -13,7 +13,7 @@ pub const OptionsTag = enum {
     arithmetic,
     /// Filter behavior.
     filter,
-    /// Sort behavior (order, null placement, NaN handling, stability).
+    /// Sort behavior (order, sort keys, null placement).
     sort,
     /// day_of_week numbering.
     day_of_week,
@@ -73,6 +73,14 @@ pub const OptionsTag = enum {
     select_k,
     /// Order, null placement and tie breaking of rank.
     rank,
+    /// Order and null placement of rank_quantile / rank_normal.
+    rank_quantile,
+    /// Side of search_sorted.
+    search_sorted,
+    /// Quantiles, compression and null handling of tdigest / hash_tdigest.
+    tdigest,
+    /// Keys and unexpected-key behavior of pivot_wider / hash_pivot_wider.
+    pivot_wider,
     /// Null encoding of dictionary_encode.
     dictionary_encode,
     /// Escape hatch for downstream custom kernels.
@@ -113,18 +121,15 @@ pub const SortNullPlacement = enum {
     at_end,
 };
 
-/// NaN placement strategy for floating-point sort-like kernels.
-pub const SortNaNPlacement = enum {
-    at_start,
-    at_end,
-};
-
 /// One sort key of sort_indices / select_k_unstable (Arrow `SortKey`): a column by position
-/// (the arguments of sort_indices) or by name (`sortIndicesRecordBatch` / `sortIndicesTable`).
+/// (the array arguments) or by name (a record batch or table argument).
 pub const SortKey = struct {
-    /// Column name (record batch / table helpers); unused for positional arguments.
+    /// Column name (record batch / table input); unused for positional arguments.
     name: []const u8 = "",
     order: SortOrder = .ascending,
+    /// Where the nulls of this key go (Arrow 26 places NaN next to the nulls: between the
+    /// values and the nulls; it has no separate NaN placement).
+    null_placement: SortNullPlacement = .at_end,
 };
 
 /// Common options for sort-like kernels (Arrow `SortOptions` and `ArraySortOptions`).
@@ -132,14 +137,11 @@ pub const SortOptions = struct {
     /// Ordering direction (array_sort_indices, and every column when `sort_keys` is empty).
     order: SortOrder = .ascending,
     /// One key per sort column, in priority order (sort_indices); empty: every argument with
-    /// `order`.
+    /// `order` (an array or chunked argument; a record batch or table needs keys).
     sort_keys: []const SortKey = &.{},
-    /// Null placement behavior.
-    null_placement: SortNullPlacement = .at_end,
-    /// Optional NaN placement policy for floating-point inputs.
-    nan_placement: ?SortNaNPlacement = null,
-    /// If true, equal-key ordering should be stable.
-    stable: bool = false,
+    /// Null placement of every key when set (Arrow's `SortOptions.null_placement`, which
+    /// overrides the keys'); null: each key's own (`at_end` without keys).
+    null_placement: ?SortNullPlacement = null,
 };
 
 /// Options of day_of_week (Arrow `DayOfWeekOptions`).
@@ -410,6 +412,43 @@ pub const RankOptions = struct {
     tiebreaker: RankTiebreaker = .first,
 };
 
+/// Options of rank_quantile and rank_normal (Arrow `RankQuantileOptions`).
+pub const RankQuantileOptions = struct {
+    order: SortOrder = .ascending,
+    null_placement: SortNullPlacement = .at_end,
+};
+
+/// Options of search_sorted (Arrow `SearchSortedOptions`).
+pub const SearchSortedOptions = struct {
+    /// `left`: the first position the needle can be inserted at (lower bound); `right`: the
+    /// last (upper bound).
+    side: enum { left, right } = .left,
+};
+
+/// Options of tdigest and hash_tdigest (Arrow `TDigestOptions`).
+pub const TDigestOptions = struct {
+    /// Quantiles, each in [0, 1] (at most 65536 of them).
+    q: []const f64 = &.{0.5},
+    /// Compression: about `delta` centroids (at least 10 are used; at most 2^20).
+    delta: u32 = 100,
+    /// Values buffered before they are merged into the digest (at least 1 is used; at most 2^24).
+    buffer_size: u32 = 500,
+    skip_nulls: bool = true,
+    /// Fewer valid rows than this give null quantiles.
+    min_count: u32 = 0,
+};
+
+/// What pivot_wider does with a key that is not in `key_names` (Arrow
+/// `PivotWiderOptions::UnexpectedKeyBehavior`).
+pub const UnexpectedKeyBehavior = enum { ignore, raise };
+
+/// Options of pivot_wider and hash_pivot_wider (Arrow `PivotWiderOptions`).
+pub const PivotWiderOptions = struct {
+    /// The output columns, one per key value (distinct).
+    key_names: []const []const u8 = &.{},
+    unexpected_key_behavior: UnexpectedKeyBehavior = .ignore,
+};
+
 /// Options of dictionary_encode (Arrow `DictionaryEncodeOptions`).
 pub const DictionaryEncodeOptions = struct {
     /// `mask`: a null row stays null; `encode`: nulls become one dictionary entry.
@@ -460,6 +499,10 @@ pub const Options = union(OptionsTag) {
     partition_nth: PartitionNthOptions,
     select_k: SelectKOptions,
     rank: RankOptions,
+    rank_quantile: RankQuantileOptions,
+    search_sorted: SearchSortedOptions,
+    tdigest: TDigestOptions,
+    pivot_wider: PivotWiderOptions,
     dictionary_encode: DictionaryEncodeOptions,
     custom: CustomOptions,
 

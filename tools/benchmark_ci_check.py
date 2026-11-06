@@ -74,6 +74,11 @@ EXPECTED_BENCHES = {
     "compute_unique_int32",
     "compute_sort_indices_int32",
     "compute_stddev_float64",
+    "compute_take_record_batch",
+    "compute_unique_dictionary",
+    "compute_partition_nth_int32",
+    "compute_select_k_int32",
+    "compute_tdigest_float64",
 }
 
 

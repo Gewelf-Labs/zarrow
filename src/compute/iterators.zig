@@ -108,18 +108,20 @@ pub const NaryExecChunk = struct {
     }
 };
 
-fn datumArrayLikeLen(datum: Datum) ?usize {
+fn datumArrayLikeLen(datum: Datum) KernelError!?usize {
     return switch (datum) {
         .array => |arr| arr.data().length,
         .chunked => |chunks| chunks.len(),
         .scalar => null,
+        // Element-wise execution has no meaning for a record batch or table.
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
 /// Infer binary execution length with scalar-broadcast semantics.
 pub fn inferBinaryExecLen(lhs: Datum, rhs: Datum) KernelError!usize {
-    const lhs_len = datumArrayLikeLen(lhs);
-    const rhs_len = datumArrayLikeLen(rhs);
+    const lhs_len = try datumArrayLikeLen(lhs);
+    const rhs_len = try datumArrayLikeLen(rhs);
 
     if (lhs_len == null and rhs_len == null) return 1;
     if (lhs_len == null) return rhs_len.?;
@@ -134,7 +136,7 @@ pub fn inferNaryExecLen(args: []const Datum) KernelError!usize {
 
     var array_like_len: ?usize = null;
     for (args) |arg| {
-        const current_len = datumArrayLikeLen(arg);
+        const current_len = try datumArrayLikeLen(arg);
         if (current_len == null) continue;
         if (array_like_len == null) {
             array_like_len = current_len.?;
@@ -158,12 +160,15 @@ const ExecDatumCursor = union(enum) {
     scalar: struct {
         scalar: Scalar,
     },
+    /// A record batch or table: every step fails with `InvalidInput`.
+    tabular,
 
     fn init(datum: Datum) ExecDatumCursor {
         return switch (datum) {
             .array => |arr| .{ .array = .{ .array = arr } },
             .chunked => |chunks| .{ .chunked = .{ .chunked = chunks } },
             .scalar => |s| .{ .scalar = .{ .scalar = s } },
+            .record_batch, .table => .tabular,
         };
     }
 
@@ -181,7 +186,7 @@ const ExecDatumCursor = union(enum) {
                     break;
                 }
             },
-            .scalar => {},
+            .scalar, .tabular => {},
         }
     }
 
@@ -195,6 +200,7 @@ const ExecDatumCursor = union(enum) {
                 break :blk chunk_len - s.offset;
             },
             .scalar => std.math.maxInt(usize),
+            .tabular => 0,
         };
     }
 
@@ -230,6 +236,7 @@ const ExecDatumCursor = union(enum) {
                 break :blk .{ .array = out };
             },
             .scalar => |s| .{ .scalar = s.scalar.retain() },
+            .tabular => error.InvalidInput,
         };
     }
 };
@@ -246,6 +253,7 @@ pub const UnaryExecChunkIterator = struct {
                 .array => |arr| arr.data().length,
                 .chunked => |chunks| chunks.len(),
                 .scalar => 1,
+                .record_batch, .table => datum.length(),
             },
         };
     }

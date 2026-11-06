@@ -1009,6 +1009,7 @@ fn predicateDecisionAt(predicate: Datum, logical_index: usize, options: FilterOp
             const keep = bool_array.value(located.local_index) catch |err| return mapArrayReadError(err);
             break :blk if (keep) .keep else .drop;
         },
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
@@ -1102,6 +1103,7 @@ pub fn datumFilterSelectionIndices(
                 }
             }
         },
+        .record_batch, .table => return error.InvalidInput,
     }
     return selections.toOwnedSlice(allocator);
 }
@@ -1111,6 +1113,7 @@ pub fn datumFilterSelectionIndices(
 /// For chunked inputs this helper preserves chunked output and avoids forcing
 /// concat pre-normalization.
 pub fn datumTake(datum: Datum, indices: []const usize) KernelError!Datum {
+    if (datum.isTabular()) return takeTabular(datum, indices);
     const allocator = common.inferDatumAllocator(datum) orelse std.heap.page_allocator;
     const out_type = datum.dataType();
 
@@ -1134,6 +1137,7 @@ pub fn datumTake(datum: Datum, indices: []const usize) KernelError!Datum {
 /// For chunked inputs this helper preserves chunked output and avoids forcing
 /// concat pre-normalization.
 pub fn datumTakeNullable(datum: Datum, indices: []const ?usize) KernelError!Datum {
+    if (datum.isTabular()) return takeTabular(datum, indices);
     const allocator = common.inferDatumAllocator(datum) orelse std.heap.page_allocator;
     const out_type = datum.dataType();
     return switch (datum) {
@@ -1212,6 +1216,7 @@ pub fn datumSelectNullable(indices: []const ?usize, values: []const Datum) Kerne
 /// This helper composes `datumFilterSelectionIndices` + `datumTakeNullable`,
 /// preserving chunked output when the input datum is chunked.
 pub fn datumFilterChunkAware(datum: Datum, predicate: Datum, options: FilterOptions) KernelError!Datum {
+    if (datum.isTabular()) return filterTabular(datum, predicate, options);
     const input_len = try inferBinaryExecLen(datum, predicate);
     const allocator = common.inferDatumsAllocator(&[_]Datum{ datum, predicate });
     const selections = try datumFilterSelectionIndices(allocator, predicate, input_len, options);
@@ -1223,6 +1228,7 @@ pub fn datumFilterChunkAware(datum: Datum, predicate: Datum, options: FilterOpti
 ///
 /// This preserves the historical array-output shape for compatibility.
 pub fn datumFilter(datum: Datum, predicate: Datum, options: FilterOptions) KernelError!Datum {
+    if (datum.isTabular()) return filterTabular(datum, predicate, options);
     const output_len = try inferBinaryExecLen(datum, predicate);
     const allocator = common.inferDatumsAllocator(&[_]Datum{ datum, predicate });
     const out_type = datum.dataType();
@@ -1252,4 +1258,73 @@ fn takeAsArray(allocator: std.mem.Allocator, datum: Datum, out_type: DataType, i
     if (pieces.items.len == 1) return Datum.fromArray(pieces.items[0].retain());
     if (pieces.items.len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
     return Datum.fromArray(concat_array_refs.concatArrayRefs(allocator, out_type, pieces.items) catch |err| return common.mapConcatError(err));
+}
+
+/// The rows `indices` of a record batch or table (Arrow `Take` on a `RecordBatch` / `Table`):
+/// every column taken, the schema kept; a table keeps chunked columns. A null index gives a
+/// null row (`InvalidInput` when a non-nullable field would get it).
+fn takeTabular(datum: Datum, indices: anytype) KernelError!Datum {
+    const nullable = @TypeOf(indices) == []const ?usize or @TypeOf(indices) == []?usize;
+    switch (datum) {
+        .record_batch => |shared| {
+            const batch = shared.get();
+            const allocator = shared.node.allocator;
+            const cols = allocator.alloc(ArrayRef, batch.columns.len) catch return error.OutOfMemory;
+            var made: usize = 0;
+            errdefer {
+                for (cols[0..made]) |*c| c.release();
+                allocator.free(cols);
+            }
+            for (batch.columns) |col| {
+                var out = if (nullable) try datumTakeNullable(.{ .array = col }, indices) else try datumTake(.{ .array = col }, indices);
+                cols[made] = out.asArray() orelse {
+                    out.release();
+                    return error.InvalidInput;
+                };
+                made += 1;
+            }
+            const out = core.RecordBatch.initPrevalidatedOwned(allocator, batch.schema_ref.retain(), cols) catch {
+                var schema_ref = batch.schema_ref;
+                schema_ref.release();
+                return error.InvalidInput;
+            };
+            return common.ownBatch(allocator, out);
+        },
+        .table => |shared| {
+            const table = shared.get();
+            const allocator = shared.node.allocator;
+            const cols = allocator.alloc(ChunkedArray, table.columns.len) catch return error.OutOfMemory;
+            var made: usize = 0;
+            defer {
+                for (cols[0..made]) |*c| c.release();
+                allocator.free(cols);
+            }
+            for (table.columns) |col| {
+                var out = if (nullable) try datumTakeNullable(.{ .chunked = col }, indices) else try datumTake(.{ .chunked = col }, indices);
+                cols[made] = out.asChunked() orelse {
+                    out.release();
+                    return error.InvalidInput;
+                };
+                made += 1;
+            }
+            var schema_ref = table.schema_ref.retain();
+            const out = core.Table.init(allocator, schema_ref, cols) catch |err| {
+                schema_ref.release();
+                return common.mapTabularError(err);
+            };
+            return common.ownTable(allocator, out);
+        },
+        else => return error.InvalidInput,
+    }
+}
+
+/// Filter the rows of a record batch or table by a bool predicate (array, chunked or scalar of
+/// the row count): `FilterOptions.drop_nulls` as for arrays.
+fn filterTabular(datum: Datum, predicate: Datum, options: FilterOptions) KernelError!Datum {
+    if (predicate.isTabular()) return error.InvalidInput;
+    if (predicate != .scalar and predicate.length() != datum.length()) return error.InvalidInput;
+    const allocator = common.inferDatumAllocator(datum) orelse std.heap.page_allocator;
+    const selections = try datumFilterSelectionIndices(allocator, predicate, datum.length(), options);
+    defer allocator.free(selections);
+    return takeTabular(datum, @as([]const ?usize, selections));
 }

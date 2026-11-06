@@ -17,6 +17,7 @@ const OptionsTag = common.OptionsTag;
 const SortOptions = common.SortOptions;
 const SortOrder = common.SortOrder;
 const SortNullPlacement = common.SortNullPlacement;
+const SortKey = common.core.SortKey;
 const FilterOptions = common.FilterOptions;
 const UnaryExecChunkIterator = common.UnaryExecChunkIterator;
 const BinaryExecChunkIterator = common.BinaryExecChunkIterator;
@@ -247,14 +248,13 @@ test "compute explain helpers provide readable diagnostics" {
 test "compute sort options defaults and tag dispatch" {
     const defaults = SortOptions{};
     try std.testing.expectEqual(SortOrder.ascending, defaults.order);
-    try std.testing.expectEqual(SortNullPlacement.at_end, defaults.null_placement);
-    try std.testing.expect(defaults.nan_placement == null);
-    try std.testing.expect(!defaults.stable);
+    try std.testing.expect(defaults.null_placement == null);
+    try std.testing.expectEqual(SortNullPlacement.at_end, (SortKey{}).null_placement);
 
     const sort_options = Options{ .sort = .{} };
     try std.testing.expectEqual(OptionsTag.sort, sort_options.tag());
     try std.testing.expect(switch (sort_options) {
-        .sort => |opts| opts.order == .ascending and opts.null_placement == .at_end and opts.nan_placement == null and !opts.stable,
+        .sort => |opts| opts.order == .ascending and opts.null_placement == null and opts.sort_keys.len == 0,
         else => false,
     });
 }

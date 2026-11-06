@@ -206,10 +206,12 @@ fn computeTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
         var batch = (try reader.nextRecordBatch()) orelse return;
         defer batch.deinit();
         fb.batches += 1;
+        var all_valid = true;
         for (0..batch.numColumns()) |i| {
             const col = batch.column(i).*;
-            if (fb.noteArray(col)) try exerciseCompute(gpa, col, prng.random());
+            if (fb.noteArray(col)) try exerciseCompute(gpa, col, prng.random()) else all_valid = false;
         }
+        if (all_valid) try exerciseTabular(gpa, &batch, prng.random());
     }
 }
 
@@ -275,6 +277,145 @@ fn exerciseCompute(gpa: Allocator, arr: ArrayRef, rng: std.Random) !void {
         defer out.release();
         expectValid("dictionary concat", out, len + sub_len);
     } else |_| {}
+}
+
+/// Record batch and table datums over a batch whose columns passed validateFull (the table
+/// chunks every column at one random cut): take (with null indices), filter, drop_null, slice,
+/// column selection, sort_indices on every sortable column and select_k_unstable. Every output
+/// column must validate with the expected row count, drop_null must leave no null, and sort
+/// results must be permutations (select_k: distinct in-range rows, `min(k, n)` of them).
+fn exerciseTabular(gpa: Allocator, batch: *const zarrow.RecordBatch, rng: std.Random) !void {
+    const compute = zarrow.compute;
+    const n = batch.numRows();
+    var ctx = compute.ExecContext.init(gpa, kernelRegistry());
+    var rb = rb: {
+        var copy = try batch.slice(0, n);
+        break :rb compute.Datum.fromRecordBatch(gpa, copy) catch |e| {
+            copy.deinit();
+            std.debug.panic("fuzz-invariant: a batch of valid columns was rejected as a datum: {s}", .{@errorName(e)});
+        };
+    };
+    defer rb.release();
+    const cut = rng.uintAtMost(usize, n);
+    const cols = try gpa.alloc(zarrow.ChunkedArray, batch.numColumns());
+    var made: usize = 0;
+    defer {
+        for (cols[0..made]) |*c| c.release();
+        gpa.free(cols);
+    }
+    for (batch.columns) |c| {
+        var head = try c.slice(0, cut);
+        defer head.release();
+        var tail = try c.slice(cut, n - cut);
+        defer tail.release();
+        cols[made] = try zarrow.ChunkedArray.init(gpa, c.data().data_type, &.{ head, tail });
+        made += 1;
+    }
+    var schema_ref = batch.schema_ref.retain();
+    var table = zarrow.Table.init(gpa, schema_ref, cols) catch |e| {
+        schema_ref.release();
+        return e;
+    };
+    var t = compute.Datum.fromTable(gpa, table) catch |e| {
+        table.deinit();
+        std.debug.panic("fuzz-invariant: a table of valid columns was rejected as a datum: {s}", .{@errorName(e)});
+    };
+    defer t.release();
+
+    var idx: [16]?usize = undefined;
+    // No rows: no index (16 null rows of a type of huge width would be a huge, if legitimate,
+    // output; with rows, every row width is backed by the input).
+    const n_idx = if (n == 0) 0 else rng.uintAtMost(usize, idx.len);
+    for (idx[0..n_idx]) |*ix| ix.* = if (rng.uintLessThan(u8, 8) == 0) null else rng.uintLessThan(usize, n);
+    var pred_builder = try zarrow.BooleanBuilder.init(gpa, n);
+    defer pred_builder.deinit();
+    var kept: usize = 0;
+    for (0..n) |_| if (rng.boolean()) {
+        try pred_builder.append(true);
+        kept += 1;
+    } else try pred_builder.append(false);
+    var pred = try pred_builder.finish();
+    defer pred.release();
+    const off = rng.uintAtMost(usize, n);
+    const sub = rng.uintAtMost(usize, n - off);
+
+    var keys: std.ArrayList(compute.SortKey) = .empty;
+    defer keys.deinit(gpa);
+    for (batch.schema().fields, batch.columns) |f, c| if (zarrow.compute.kernels.sort.isSortable(c.data().data_type)) {
+        try keys.append(gpa, .{ .name = f.name, .order = if (rng.boolean()) .ascending else .descending, .null_placement = if (rng.boolean()) .at_start else .at_end });
+    };
+
+    for ([_]compute.Datum{ rb, t }) |d| {
+        // A non-nullable field never gets a null row from a null index: InvalidInput.
+        if (compute.datumTakeNullable(d, idx[0..n_idx])) |out| {
+            var o = out;
+            defer o.release();
+            expectTabular("take", o, d.kind(), n_idx, false);
+        } else |e| if (e != error.InvalidInput) std.debug.panic("fuzz-invariant: tabular take failed: {s}", .{@errorName(e)});
+        var filtered = compute.datumFilter(d, .{ .array = pred }, .{}) catch |e| std.debug.panic("fuzz-invariant: tabular filter failed: {s}", .{@errorName(e)});
+        expectTabular("filter", filtered, d.kind(), kept, false);
+        filtered.release();
+        var dropped = ctx.invoke("drop_null", .vector, &.{d}, .none) catch |e| std.debug.panic("fuzz-invariant: tabular drop_null failed: {s}", .{@errorName(e)});
+        expectTabular("drop_null", dropped, d.kind(), dropped.length(), true);
+        dropped.release();
+        var sliced = compute.datumSlice(d, off, sub) catch |e| std.debug.panic("fuzz-invariant: tabular slice failed: {s}", .{@errorName(e)});
+        expectTabular("slice", sliced, d.kind(), sub, false);
+        sliced.release();
+        if (batch.numColumns() > 0) {
+            const name = batch.schema().fields[batch.numColumns() - 1].name;
+            var picked = compute.datumSelectColumns(d, &.{ name, name }) catch |e| std.debug.panic("fuzz-invariant: tabular column selection failed: {s}", .{@errorName(e)});
+            expectTabular("select", picked, d.kind(), n, false);
+            picked.release();
+        }
+        if (keys.items.len == 0) continue;
+        // A name several fields share is ambiguous (InvalidOptions, as Arrow).
+        var sorted = ctx.invoke("sort_indices", .vector, &.{d}, .{ .sort = .{ .sort_keys = keys.items } }) catch |e| {
+            if (e == error.InvalidOptions) continue;
+            std.debug.panic("fuzz-invariant: tabular sort_indices failed: {s}", .{@errorName(e)});
+        };
+        expectPermutation("tabular sort_indices", sorted.array, n, false);
+        sorted.release();
+        const k = rng.uintAtMost(usize, n + 2);
+        var top = ctx.invoke("select_k_unstable", .vector, &.{d}, .{ .select_k = .{ .k = k, .sort_keys = keys.items } }) catch |e| std.debug.panic("fuzz-invariant: tabular select_k_unstable failed: {s}", .{@errorName(e)});
+        expectSelection("tabular select_k_unstable", top.array, n, @min(k, n));
+        top.release();
+    }
+}
+
+/// A record batch or table datum of `kind` with `rows` rows whose every column part passes
+/// validateFull (and, for `no_nulls`, holds no null).
+fn expectTabular(op: []const u8, d: zarrow.compute.Datum, kind: zarrow.compute.DatumKind, rows: usize, no_nulls: bool) void {
+    if (d.kind() != kind or d.length() != rows) std.debug.panic("fuzz-invariant: tabular {s} gave a {s} of {d} rows, expected {d}", .{ op, @tagName(d.kind()), d.length(), rows });
+    const check = struct {
+        fn part(o: []const u8, a: ArrayRef, nn: bool) void {
+            a.data().validateFull() catch |e| std.debug.panic("fuzz-invariant: tabular {s} column failed validateFull: {s}", .{ o, @errorName(e) });
+            if (nn and (a.data().hasNulls() or (a.data().data_type == .null and a.data().length > 0))) std.debug.panic("fuzz-invariant: tabular {s} left a null", .{o});
+        }
+    };
+    switch (d) {
+        .record_batch => |b| for (b.get().columns) |c| {
+            if (c.data().length != rows) std.debug.panic("fuzz-invariant: tabular {s} column length differs", .{op});
+            check.part(op, c, no_nulls);
+        },
+        .table => |tb| for (tb.get().columns) |c| {
+            if (c.len() != rows) std.debug.panic("fuzz-invariant: tabular {s} column length differs", .{op});
+            for (c.chunks()) |part| check.part(op, part, no_nulls);
+        },
+        else => unreachable,
+    }
+}
+
+/// A uint64 index array of `k` distinct rows of `[0, n)`.
+fn expectSelection(op: []const u8, arr: ArrayRef, n: usize, k: usize) void {
+    expectValid(op, arr, k);
+    const vals = (zarrow.PrimitiveArray(u64){ .data = arr.data() }).values() catch std.debug.panic("fuzz-invariant: {s} output is not uint64", .{op});
+    const seen = std.heap.page_allocator.alloc(bool, n) catch return;
+    defer std.heap.page_allocator.free(seen);
+    @memset(seen, false);
+    for (vals) |v| {
+        if (v >= n or seen[v]) std.debug.panic("fuzz-invariant: {s} gave row {d} of {d} twice or out of range", .{ op, v, n });
+        seen[v] = true;
+    }
 }
 
 fn expectValid(op: []const u8, arr: ArrayRef, expected_len: usize) void {
@@ -442,8 +583,13 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
         }
         if (zarrow.compute.kernels.hash_aggregate.isKeyType(a.data().data_type)) {
             expectCall(&ctx, "is_in", .scalar, &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = sliced } } }, len, &.{});
-            exerciseGroupBy(&ctx, a);
         }
+        // A dictionary is looked up decoded (against its own dictionary) and grouped by index.
+        if (a.data().data_type == .dictionary and zarrow.compute.kernels.hash_aggregate.isGroupKeyType(a.data().data_type)) {
+            expectCall(&ctx, "is_in", .scalar, &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = a.data().dictionary.? } } }, len, &.{});
+            expectCall(&ctx, "index_in", .scalar, &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = a.data().dictionary.? }, .null_matching_behavior = .skip } }, len, &.{});
+        }
+        if (zarrow.compute.kernels.hash_aggregate.isGroupKeyType(a.data().data_type)) exerciseGroupBy(&ctx, a);
         exerciseRound16(&ctx, a);
     }
 }
@@ -484,10 +630,10 @@ fn exerciseRound16(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
         },
         else => {},
     }
-    if (hash.isKeyType(dt)) {
+    if (hash.isGroupKeyType(dt)) {
         expectAnyLen(ctx, "unique", &.{d}, .none, &.{});
-        expectAnyLen(ctx, "value_counts", &.{d}, .none, &.{});
-        expectCall(ctx, "count_distinct", .aggregate, &.{d}, .{ .count = .{ .mode = .all } }, null, &.{});
+        expectValueCounts(ctx, d, len);
+        if (dt != .dictionary) expectCall(ctx, "count_distinct", .aggregate, &.{d}, .{ .count = .{ .mode = .all } }, null, &.{});
         // dictionary_encode decodes back to the same rows.
         var enc = ctx.invoke("dictionary_encode", .vector, &.{d}, .none) catch |e| std.debug.panic("fuzz-invariant: dictionary_encode of a valid {s} array failed: {s}", .{ @tagName(dt.id()), @errorName(e) });
         defer enc.release();
@@ -507,7 +653,68 @@ fn exerciseRound16(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
         defer r.release();
         expectPermutation("rank", r.array, len, true);
         expectCall(ctx, "select_k_unstable", .vector, &.{d}, .{ .select_k = .{ .k = 5 } }, @min(len, 5), &.{});
+        for ([_]zarrow.compute.SortNullPlacement{ .at_end, .at_start }) |placement| exerciseSelections(ctx, d, len, placement);
     }
+}
+
+/// select_k_unstable must give the prefix of the stable sort, partition_nth_indices a
+/// permutation with the sort's row at the pivot and the sort's first rows before it,
+/// rank_quantile values in (0, 1], and search_sorted of the rows in the sorted rows positions in
+/// [0, len].
+fn exerciseSelections(ctx: *zarrow.compute.ExecContext, d: zarrow.compute.Datum, len: usize, placement: zarrow.compute.SortNullPlacement) void {
+    const gpa = std.heap.page_allocator;
+    const keys = [_]zarrow.compute.SortKey{.{ .null_placement = placement }};
+    var sorted = ctx.invoke("sort_indices", .vector, &.{d}, .{ .sort = .{ .sort_keys = &keys } }) catch |e| std.debug.panic("fuzz-invariant: sort_indices failed: {s}", .{@errorName(e)});
+    defer sorted.release();
+    const order = (zarrow.PrimitiveArray(u64){ .data = sorted.array.data() }).values() catch unreachable;
+    const k = len / 2 + 1;
+    var top = ctx.invoke("select_k_unstable", .vector, &.{d}, .{ .select_k = .{ .k = k, .sort_keys = &keys } }) catch |e| std.debug.panic("fuzz-invariant: select_k_unstable failed: {s}", .{@errorName(e)});
+    defer top.release();
+    expectValid("select_k_unstable", top.array, @min(k, len));
+    const got = (zarrow.PrimitiveArray(u64){ .data = top.array.data() }).values() catch unreachable;
+    if (!std.mem.eql(u64, got, order[0..@min(k, len)])) std.debug.panic("fuzz-invariant: select_k_unstable is not the prefix of the sort", .{});
+    const pivot = len / 3;
+    var part = ctx.invoke("partition_nth_indices", .vector, &.{d}, .{ .partition_nth = .{ .pivot = pivot, .null_placement = placement } }) catch |e| std.debug.panic("fuzz-invariant: partition_nth_indices failed: {s}", .{@errorName(e)});
+    defer part.release();
+    expectPermutation("partition_nth_indices", part.array, len, false);
+    const rows = (zarrow.PrimitiveArray(u64){ .data = part.array.data() }).values() catch unreachable;
+    if (pivot < len) {
+        if (rows[pivot] != order[pivot]) std.debug.panic("fuzz-invariant: partition_nth_indices put row {d} at the pivot, the sort row {d}", .{ rows[pivot], order[pivot] });
+        const before = gpa.alloc(bool, len) catch return;
+        defer gpa.free(before);
+        @memset(before, false);
+        for (order[0..pivot]) |r| before[r] = true;
+        for (rows[0..pivot]) |r| if (!before[r]) std.debug.panic("fuzz-invariant: partition_nth_indices put row {d} before the pivot", .{r});
+    }
+    var q = ctx.invoke("rank_quantile", .vector, &.{d}, .{ .rank_quantile = .{ .null_placement = placement } }) catch |e| std.debug.panic("fuzz-invariant: rank_quantile failed: {s}", .{@errorName(e)});
+    defer q.release();
+    expectValid("rank_quantile", q.array, len);
+    for ((zarrow.PrimitiveArray(f64){ .data = q.array.data() }).values() catch unreachable) |v| {
+        if (!(v > 0 and v <= 1)) std.debug.panic("fuzz-invariant: rank_quantile gave {d}", .{v});
+    }
+    if (placement != .at_end or d.dataType() == .struct_) return; // search_sorted has no struct kernel
+    var ascending = zarrow.computeDatumTake(d, @as([]const usize, @ptrCast(order))) catch return;
+    defer ascending.release();
+    var pos = ctx.invoke("search_sorted", .vector, &.{ ascending, d }, .{ .search_sorted = .{ .side = .right } }) catch |e| std.debug.panic("fuzz-invariant: search_sorted failed: {s}", .{@errorName(e)});
+    defer pos.release();
+    expectValid("search_sorted", pos.array, len);
+    const at = (zarrow.PrimitiveArray(u64){ .data = pos.array.data() }).values() catch unreachable;
+    for (at, 0..) |v, i| if (!pos.array.data().isNull(i) and v > len) std.debug.panic("fuzz-invariant: search_sorted gave {d} of {d}", .{ v, len });
+}
+
+/// value_counts must validate, its counts add up to the rows, and (a dictionary) its values keep
+/// the input's dictionary.
+fn expectValueCounts(ctx: *zarrow.compute.ExecContext, d: zarrow.compute.Datum, len: usize) void {
+    var out = ctx.invoke("value_counts", .vector, &.{d}, .none) catch |e| std.debug.panic("fuzz-invariant: value_counts failed on a valid {s} array: {s}", .{ @tagName(d.dataType().id()), @errorName(e) });
+    defer out.release();
+    expectValid("value_counts", out.array, out.array.data().length);
+    const children = out.array.data().children;
+    const counts = (zarrow.PrimitiveArray(i64){ .data = children[1].data() }).values() catch std.debug.panic("fuzz-invariant: value_counts counts are not int64", .{});
+    var total: usize = 0;
+    for (counts) |c| total += @intCast(c);
+    if (total != len) std.debug.panic("fuzz-invariant: value_counts counts add up to {d}, expected {d}", .{ total, len });
+    if (d.dataType() == .dictionary and children[0].data().dictionary.?.node != d.array.data().dictionary.?.node)
+        std.debug.panic("fuzz-invariant: value_counts of a dictionary changed the dictionary", .{});
 }
 
 /// Invoke vector function `name`: an error outside `allowed` is a finding, the output array
@@ -565,7 +772,14 @@ fn exerciseGroupBy(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
             expectCall(ctx, "hash_sum", .hash_aggregate, &args, .none, groups, &.{});
             expectCall(ctx, "hash_variance", .hash_aggregate, &args, .none, groups, &.{});
             expectCall(ctx, "hash_product", .hash_aggregate, &args, .none, groups, &.{});
+            expectCall(ctx, "hash_tdigest", .hash_aggregate, &args, .{ .tdigest = .{ .q = &.{ 0, 0.5 }, .delta = 10, .buffer_size = 5 } }, groups, &.{});
+            expectCall(ctx, "hash_approximate_median", .hash_aggregate, &args, .none, groups, &.{});
+            expectTDigest(ctx, args[0]);
         },
+        else => {},
+    }
+    switch (a.data().data_type) {
+        .string, .large_string, .binary, .large_binary, .fixed_size_binary, .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => exercisePivot(ctx, a, ids, groups),
         else => {},
     }
 }
@@ -642,6 +856,61 @@ fn exerciseGroupedDecimal(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
         expectCall(ctx, name, .hash_aggregate, &args, .{ .scalar_aggregate = .{ .skip_nulls = false, .min_count = 2 } }, groups, &.{});
     }
     expectCall(ctx, "hash_count", .hash_aggregate, &args, .{ .count = .{ .mode = .only_null } }, groups, &.{});
+    // Decimal products past the precision wrap here (overflow_mode wrapping); 3 groups.
+    if (a.data().data_type == .decimal128 or a.data().data_type == .decimal256) {
+        // A negative scale (or one past the type's digits) has no product (NotImplemented).
+        expectCall(ctx, "hash_product", .hash_aggregate, &args, .none, groups, &.{error.NotImplemented});
+        expectCall(ctx, "product", .aggregate, &.{args[0]}, .{ .scalar_aggregate = .{ .min_count = 0 } }, null, &.{error.NotImplemented});
+        expectCall(ctx, "hash_tdigest", .hash_aggregate, &args, .{ .tdigest = .{ .q = &.{ 0.5, 1 }, .delta = 11, .buffer_size = 3 } }, groups, &.{});
+        expectTDigest(ctx, args[0]);
+    }
+}
+
+/// tdigest at q 0, 0.25, 0.5, 0.75 and 1 with a small digest (delta 12, buffer 7) and with the
+/// defaults: the quantiles must not decrease, and approximate_median must lie between the
+/// first and the last (both within 1e-9 of the value range: interpolation rounds).
+fn expectTDigest(ctx: *zarrow.compute.ExecContext, d: zarrow.compute.Datum) void {
+    const qs = [_]f64{ 0, 0.25, 0.5, 0.75, 1 };
+    for ([_]zarrow.compute.TDigestOptions{ .{ .q = &qs, .delta = 12, .buffer_size = 7 }, .{ .q = &qs } }) |o| {
+        var out = ctx.invoke("tdigest", .aggregate, &.{d}, .{ .tdigest = o }) catch |e| std.debug.panic("fuzz-invariant: tdigest failed: {s}", .{@errorName(e)});
+        defer out.release();
+        expectValid("tdigest", out.array, qs.len);
+        if (out.array.data().hasNulls()) continue;
+        const r = (zarrow.PrimitiveArray(f64){ .data = out.array.data() }).values() catch unreachable;
+        // Values past the float64 range (decimal256, a negative scale) give infinities, and
+        // centroids mixing them NaN, as in Arrow: no order to check then.
+        const finite = for (r) |x| {
+            if (!std.math.isFinite(x)) break false;
+        } else true;
+        if (!finite) continue;
+        // Interpolation rounds: quantiles may step back by a rounding error of the value range.
+        const tol = 1e-9 * (@abs(r[0]) + @abs(r[r.len - 1]));
+        for (r[0 .. r.len - 1], r[1..]) |x, y| if (!(x <= y + tol)) std.debug.panic("fuzz-invariant: tdigest quantiles decrease: {d} then {d} in {any}", .{ x, y, r });
+        var m = ctx.invoke("approximate_median", .aggregate, &.{d}, .{ .scalar_aggregate = .{ .min_count = 0 } }) catch |e| std.debug.panic("fuzz-invariant: approximate_median failed: {s}", .{@errorName(e)});
+        defer m.release();
+        if (m.scalar.isNull()) continue;
+        const v = m.scalar.value.f64;
+        if (!(v >= r[0] - tol and v <= r[r.len - 1] + tol)) std.debug.panic("fuzz-invariant: approximate_median {d} outside [{d}, {d}]", .{ v, r[0], r[r.len - 1] });
+    }
+}
+
+/// pivot_wider and hash_pivot_wider with the array as keys and as values: duplicates, null keys
+/// and names that do not parse as the key type are errors, anything else must validate.
+fn exercisePivot(ctx: *zarrow.compute.ExecContext, a: ArrayRef, ids: ArrayRef, groups: usize) void {
+    // Without rows, a value type of huge width (from the schema) would make huge null fields.
+    if (a.data().length == 0) return;
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const names = [_][]const u8{ "0", "1", "a", "-7" };
+    const ok = [_]anyerror{ error.InvalidInput, error.InvalidOptions };
+    for ([_]zarrow.compute.UnexpectedKeyBehavior{ .ignore, .raise }) |b| {
+        const o: zarrow.compute.Options = .{ .pivot_wider = .{ .key_names = &names, .unexpected_key_behavior = b } };
+        var out = ctx.invoke("pivot_wider", .aggregate, &.{ d, d }, o) catch |e| {
+            if (e == error.InvalidInput or e == error.InvalidOptions) continue;
+            std.debug.panic("fuzz-invariant: pivot_wider failed: {s}", .{@errorName(e)});
+        };
+        out.release();
+        expectCall(ctx, "hash_pivot_wider", .hash_aggregate, &.{ d, d, .{ .array = ids } }, o, groups, &ok);
+    }
 }
 
 /// `a` against itself cast to `to` (unsafe when `safe` is false: InvalidCast is then not
@@ -924,7 +1193,13 @@ fn arrayLayout(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
     const valid = fb.noteArray(arr);
     // The type tree comes straight from the input: only the root type is a useful signal here.
     fb.types = @as(u64, 1) << @intCast(@intFromEnum(dt.id()) % 64);
-    if (valid) try exerciseCompute(gpa, arr, prng.random());
+    if (!valid) return;
+    try exerciseCompute(gpa, arr, prng.random());
+    // The array as the one column of a record batch.
+    const fields = [_]Field{.{ .name = "c", .data_type = dt }};
+    var batch = try zarrow.RecordBatch.initBorrowed(gpa, .{ .fields = &fields }, &.{arr});
+    defer batch.deinit();
+    try exerciseTabular(gpa, &batch, prng.random());
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 //! mode, quantile and their hash_ forms. Expected values are pyarrow 26 results.
 const std = @import("std");
 const common = @import("test_common.zig");
+const hash = @import("hash_aggregate.zig");
 
 const ArrayRef = common.ArrayRef;
 const DataType = common.DataType;
@@ -592,4 +593,110 @@ test "aggregate stats errors: options, types, empty and all-null inputs, malform
     }
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("mode", &.{.{ .array = malformed }}, none));
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("quantile", &.{.{ .array = malformed }}, none));
+}
+
+fn decimalProduct(ctx: *ExecContext, args: []const Datum, options: Options) !?i256 {
+    var out = try ctx.invokeAggregate("product", args, options);
+    defer out.release();
+    try std.testing.expect(out.scalar.data_type.eql(args[0].dataType()));
+    return switch (out.scalar.value) {
+        .null => null,
+        .decimal128 => |v| v,
+        .decimal256 => |v| v,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+test "decimal product and hash_product: input type, Arrow rounding per step and per chunk, overflow modes (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const d10_2 = DataType{ .decimal128 = .{ .precision = 10, .scale = 2 } };
+    const d40_3 = DataType{ .decimal256 = .{ .precision = 40, .scale = 3 } };
+    var a = try common.makeTyped(i128, d10_2, allocator, &.{ 150, 200, null, -325 });
+    defer a.release();
+    try std.testing.expectEqual(@as(?i256, -975), try decimalProduct(&ctx, &.{.{ .array = a }}, none));
+    try std.testing.expectEqual(@as(?i256, null), try decimalProduct(&ctx, &.{.{ .array = a }}, .{ .scalar_aggregate = .{ .skip_nulls = false } }));
+    try std.testing.expectEqual(@as(?i256, null), try decimalProduct(&ctx, &.{.{ .array = a }}, .{ .scalar_aggregate = .{ .min_count = 4 } }));
+    var w = try common.makeTyped(i256, d40_3, allocator, &.{ 1500, 2000, null, -3250 });
+    defer w.release();
+    try std.testing.expectEqual(@as(?i256, -9750), try decimalProduct(&ctx, &.{.{ .array = w }}, none));
+    // The empty product is 1 at the input scale with min_count 0.
+    var empty = try common.makeTyped(i128, d10_2, allocator, &.{});
+    defer empty.release();
+    try std.testing.expectEqual(@as(?i256, null), try decimalProduct(&ctx, &.{.{ .array = empty }}, none));
+    try std.testing.expectEqual(@as(?i256, 100), try decimalProduct(&ctx, &.{.{ .array = empty }}, .{ .scalar_aggregate = .{ .min_count = 0 } }));
+    var all_null = try common.makeTyped(i128, d10_2, allocator, &.{null});
+    defer all_null.release();
+    try std.testing.expectEqual(@as(?i256, 100), try decimalProduct(&ctx, &.{.{ .array = all_null }}, .{ .scalar_aggregate = .{ .min_count = 0 } }));
+    // Each step rescales to the input scale, rounding half away from zero.
+    const rounding = [_]struct { in: []const ?i128, out: i256 }{
+        .{ .in = &.{ 125, 125 }, .out = 156 },
+        .{ .in = &.{ 115, 115, 115 }, .out = 152 },
+        .{ .in = &.{ -125, 125 }, .out = -156 },
+        .{ .in = &.{ 5, 10 }, .out = 1 },
+        .{ .in = &.{ 15, 10 }, .out = 2 },
+        .{ .in = &.{ 101, 101, 129 }, .out = 132 },
+    };
+    for (rounding) |r| {
+        var arr = try common.makeTyped(i128, d10_2, allocator, r.in);
+        defer arr.release();
+        try std.testing.expectEqual(@as(?i256, r.out), try decimalProduct(&ctx, &.{.{ .array = arr }}, none));
+    }
+    // A chunked input: each chunk is a product of its own, merged (Arrow: 1.31, flat 1.32).
+    var three = try common.makeTyped(i128, d10_2, allocator, &.{ 101, 101, 129 });
+    defer three.release();
+    var chunked = try common.chunkedAt(allocator, three, &.{1});
+    defer chunked.release();
+    try std.testing.expectEqual(@as(?i256, 131), try decimalProduct(&ctx, &.{.{ .chunked = chunked }}, none));
+    var scale0 = try common.makeTyped(i128, .{ .decimal128 = .{ .precision = 5, .scale = 0 } }, allocator, &.{ 12, -3 });
+    defer scale0.release();
+    try std.testing.expectEqual(@as(?i256, -36), try decimalProduct(&ctx, &.{.{ .array = scale0 }}, none));
+
+    // Past the precision: checked is Overflow, wrapping gives Arrow's value (pyarrow 26 returns a
+    // decimal128(10, 2) of 999999999700000000020000.00), saturating the largest value.
+    var big = try common.makeTyped(i128, d10_2, allocator, &.{ 9999999999, 9999999999, 9999999999 });
+    defer big.release();
+    try std.testing.expectError(error.Overflow, ctx.invokeAggregate("product", &.{.{ .array = big }}, none));
+    var wrap_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .overflow_mode = .wrapping });
+    try std.testing.expectEqual(@as(?i256, 99999999970000000002000000), try decimalProduct(&wrap_ctx, &.{.{ .array = big }}, none));
+    var sat_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .overflow_mode = .saturating });
+    try std.testing.expectEqual(@as(?i256, 9999999999), try decimalProduct(&sat_ctx, &.{.{ .array = big }}, none));
+    // decimal128(38, 2): Arrow's 128-bit product wraps (pyarrow 26: 8147088236464949819059335416690165.94).
+    const nines: i128 = 99999999999999999999999999999999999999;
+    var huge = try common.makeTyped(i128, .{ .decimal128 = .{ .precision = 38, .scale = 2 } }, allocator, &.{ nines, nines });
+    defer huge.release();
+    try std.testing.expectEqual(@as(?i256, 814708823646494981905933541669016594), try decimalProduct(&wrap_ctx, &.{.{ .array = huge }}, none));
+    try std.testing.expectEqual(@as(?i256, nines), try decimalProduct(&sat_ctx, &.{.{ .array = huge }}, none));
+
+    // hash_product: g = [1, 1, 2, 2, 3] over [1.50, 2.00, None, -3.25, None].
+    var keys = try common.makeArray(i64, allocator, &.{ 1, 1, 2, 2, 3 });
+    defer keys.release();
+    var hv = try common.makeTyped(i128, d10_2, allocator, &.{ 150, 200, null, -325, null });
+    defer hv.release();
+    var by = try hash.groupBy(&ctx, &.{.{ .name = "g", .array = keys }}, &.{
+        .{ .name = "p", .function = "hash_product", .input = hv },
+        .{ .name = "p2", .function = "hash_product", .input = hv, .options = .{ .scalar_aggregate = .{ .skip_nulls = false, .min_count = 0 } } },
+    });
+    defer by.deinit();
+    try std.testing.expect(by.columns[1].data().data_type.eql(d10_2));
+    const p = try common.collect(i128, allocator, .{ .array = by.columns[1] });
+    defer allocator.free(p);
+    try common.expectRows(i128, &.{ 300, -325, null }, p);
+    const p2 = try common.collect(i128, allocator, .{ .array = by.columns[2] });
+    defer allocator.free(p2);
+    try common.expectRows(i128, &.{ 300, null, null }, p2);
+    var one_key = try common.makeArray(i64, allocator, &.{ 1, 1 });
+    defer one_key.release();
+    var two = try common.makeTyped(i128, d10_2, allocator, &.{ 115, 115 });
+    defer two.release();
+    var by2 = try hash.groupBy(&ctx, &.{.{ .name = "g", .array = one_key }}, &.{.{ .name = "p", .function = "hash_product", .input = two }});
+    defer by2.deinit();
+    const p3 = try common.collect(i128, allocator, .{ .array = by2.columns[1] });
+    defer allocator.free(p3);
+    try common.expectRows(i128, &.{132}, p3);
+    var three_keys = try common.makeArray(i64, allocator, &.{ 1, 1, 1 });
+    defer three_keys.release();
+    try std.testing.expectError(error.Overflow, hash.groupBy(&ctx, &.{.{ .name = "g", .array = three_keys }}, &.{.{ .name = "p", .function = "hash_product", .input = big }}));
 }

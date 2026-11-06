@@ -12,14 +12,14 @@ Current conclusion: **the compute framework has array / scalar / chunked entry p
 chunk-aware permutation primitives; kernel families implement concrete kernels on top of it, in this
 repository.**
 
-- `Datum` is now three-state (`array / scalar / chunked`); it is no longer limited to a single chunk.
+- `Datum` has Arrow's five forms (`array / chunked / scalar / record_batch / table`); it is no longer limited to a single chunk.
 - The compute core is responsible for the type and dispatch framework, shared helpers and the options
   conventions. It does not promise a complete function catalog (for example every cast / aggregate / sort
   kernel implementation).
 - For `sort / take / filter`, reuse the core's chunk-aware helpers first; avoid kernels that `concat` chunked
   input before processing it.
-- The options family already includes `sort` (`order / null_placement / nan_placement / stable`), which gives
-  one shared sort semantics.
+- The options family already includes `sort` (`order / sort_keys / null_placement`; each `SortKey` has its own
+  order and null placement, as Arrow 26), which gives one shared sort semantics.
 
 ---
 
@@ -136,9 +136,11 @@ Matching payloads:
 ### 5.2 Current SortOptions fields
 
 - `order`: `ascending | descending`
-- `null_placement`: `at_start | at_end`
-- `nan_placement`: `?at_start | ?at_end`
-- `stable`: `bool`
+- `sort_keys`: `SortKey` (`name`, `order`, `null_placement`) per column
+- `null_placement`: `?at_start | ?at_end` (overrides every key's when set)
+
+Arrow 26 has no NaN placement option (NaN sits next to the nulls) and the sorts are always stable, so
+the former `nan_placement` and `stable` fields are gone.
 
 ### 5.3 Near-term extension directions (compatible with the current model)
 

@@ -226,9 +226,19 @@ test "associative edge cases and errors: empty, scalars, unsupported types, opti
     var list = try common.datumBuildNullLike(.{ .list = .{ .value_field = .{ .name = "item", .data_type = &item } } }, 1);
     defer list.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("unique", &.{list}, none));
-    var nulls = try common.datumBuildNullLike(.{ .null = {} }, 1);
+    // The null type (pyarrow 26): a dictionary of one null; mask leaves every index null,
+    // encode points every row at it.
+    var nulls = try common.datumBuildNullLike(.{ .null = {} }, 3);
     defer nulls.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("dictionary_encode", &.{nulls}, none));
+    for ([_]bool{ false, true }) |encode| {
+        const o: common.Options = if (encode) .{ .dictionary_encode = .{ .null_encoding = .encode } } else none;
+        var ne = try ctx.invokeVector("dictionary_encode", &.{nulls}, o);
+        defer ne.release();
+        try ne.array.data().validateFull();
+        try std.testing.expect(ne.array.data().dictionary.?.data().data_type == .null);
+        try std.testing.expectEqual(@as(usize, 1), ne.array.data().dictionary.?.data().length);
+        try std.testing.expectEqual(@as(usize, if (encode) 0 else 3), ne.array.data().null_count.?);
+    }
     try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("unique", &.{.{ .array = empty }}, .{ .count = .{} }));
     try std.testing.expectError(error.InvalidArity, ctx.invokeVector("value_counts", &.{ .{ .array = empty }, .{ .array = empty } }, none));
     // The plain result-type path cannot hold a struct over the input type.

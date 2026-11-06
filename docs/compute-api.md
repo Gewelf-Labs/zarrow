@@ -44,9 +44,9 @@ defer sum.release();
 | Math | `math.zig` | `sqrt`, `exp`, `expm1`, `ln`, `log10`, `log2`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` (+ `_checked` where Arrow has one), `atan2`, `logb` (+ `_checked`), `power` (+ `_checked`), `bit_wise_and`, `bit_wise_or`, `bit_wise_xor`, `bit_wise_not`, `shift_left`, `shift_right` (+ `_checked`) |
 | Rounding | `round.zig` | `round` (`RoundOptions`), `round_to_multiple` (`RoundToMultipleOptions`), `round_binary` (`RoundBinaryOptions`), `ceil`, `floor`, `trunc` (floats, integers, decimal128 / decimal256) |
 | Temporal arithmetic | `temporal_arith.zig` | the timestamp, date, time and duration kernels of `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` (+ `_checked`) |
-| Associative transforms | `associative.zig` | `unique`, `value_counts`, `dictionary_encode` (`DictionaryEncodeOptions`) |
-| Selecting and null replacement | `selection.zig` | `coalesce`, `if_else`, `case_when`, `choose` (scalar); `drop_null`, `fill_null_forward`, `fill_null_backward` (vector) |
-| Sorts and partitions | `sort.zig` | `sort_indices`, `array_sort_indices` (`SortOptions`), `partition_nth_indices` (`PartitionNthOptions`), `select_k_unstable` (`SelectKOptions`), `rank` (`RankOptions`); `sortIndicesRecordBatch`, `sortIndicesTable` |
+| Associative transforms | `associative.zig` | `unique`, `value_counts`, `dictionary_encode` (`DictionaryEncodeOptions`); dictionary inputs keep their dictionary (see Dictionary inputs) |
+| Selecting and null replacement | `selection.zig` | `coalesce`, `if_else`, `case_when`, `choose` (scalar); `drop_null` (also record batches and tables), `fill_null_forward`, `fill_null_backward` (vector) |
+| Sorts and partitions | `sort.zig` | `sort_indices` (array / chunked columns, or one record batch / table by key names), `array_sort_indices` (`SortOptions`), `partition_nth_indices` (`PartitionNthOptions`), `select_k_unstable` (`SelectKOptions`; also record batches / tables), `rank` (`RankOptions`), `rank_quantile`, `rank_normal` (`RankQuantileOptions`), `search_sorted` (`SearchSortedOptions`); `sortIndicesRecordBatch`, `sortIndicesTable` |
 | Categorizations | `is_null.zig` | `is_null` (`NullOptions`), `is_valid`, `true_unless_null`, `is_nan`, `is_finite`, `is_inf` |
 | Conversions | `cast.zig` | `cast` (`CastOptions.to_type`): numbers and bool among themselves, to and from text, string and binary layouts, date32 / date64 / timestamp / time32 / time64 / duration units, timestamp to time of day, same-width integers and temporal types, dictionary decode and encode (every index width), the null type; decimals to and from decimals, integers, floats and text (`decimal.zig`) |
 | Strings | `string.zig` | `ascii_upper`, `ascii_lower`, `ascii_swapcase`, `ascii_capitalize`, `ascii_title`, `ascii_reverse` (ASCII letters), `utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title` (Unicode simple case mappings), `utf8_length`, `binary_length`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim`, `utf8_trim`, `utf8_ltrim`, `utf8_rtrim`, `ascii_*trim_whitespace`, `utf8_*trim_whitespace`, `utf8_slice_codeunits`, `utf8_reverse`, `binary_join_element_wise`, `starts_with`, `ends_with`, `match_substring`, `string_is_ascii`, `ascii_is_alnum`, `ascii_is_alpha`, `ascii_is_decimal`, `ascii_is_lower`, `ascii_is_printable`, `ascii_is_space`, `ascii_is_title`, `ascii_is_upper`, `utf8_is_alnum`, `utf8_is_alpha`, `utf8_is_decimal`, `utf8_is_digit`, `utf8_is_lower`, `utf8_is_numeric`, `utf8_is_printable`, `utf8_is_space`, `utf8_is_title`, `utf8_is_upper` (string, large_string, string_view) |
@@ -54,6 +54,8 @@ defer sum.release();
 | Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `us_year`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp, time32, time64); `subsecond` (timestamp, time32, time64) |
 | Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between` (date32, date64, timestamp); `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between`, `day_time_interval_between`, `month_day_nano_interval_between` and the rounding functions (also time32, time64) |
 | Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, intervals, decimals, fixed_size_binary, string and binary layouts; a value set of another type is cast) |
+| Approximate quantiles | `tdigest.zig` | `tdigest` (`TDigestOptions`), `approximate_median` (`ScalarAggregateOptions`), `hash_tdigest`, `hash_approximate_median` (Arrow's merging t-digest) |
+| Pivot | `pivot.zig` | `pivot_wider`, `hash_pivot_wider` (`PivotWiderOptions`) |
 | Grouped aggregations | `hash_aggregate.zig` | `Grouper`, `groupBy` (per-aggregate options); kind `hash_aggregate`: `hash_sum`, `hash_mean`, `hash_min`, `hash_max`, `hash_min_max`, `hash_any`, `hash_all`, `hash_product`, `hash_first`, `hash_last`, `hash_first_last` (`ScalarAggregateOptions`; sum, mean, min, max, min_max also on decimal128 / decimal256), `hash_variance`, `hash_stddev` (`VarianceOptions`), `hash_skew`, `hash_kurtosis` (`SkewOptions`), `hash_count`, `hash_count_distinct`, `hash_distinct` (`CountOptions`), `hash_one`, `hash_list`, `hash_count_all` (values plus uint32 group ids, one row per group) |
 
 Element-wise functions take arrays, chunked arrays or scalars (a chunked input gives a chunked output, all
@@ -97,7 +99,8 @@ floating-point dispatch: `.floating` (integers and decimals count as float64, th
 `sqrt`, `ln`, `sin`, ..., `atan2`, `logb`; atan2(float32, int32) is float64, as Arrow),
 `.decimal_to_float` (`commonNumericType`, else a decimal makes float64: `power`) and
 `.integer_to_float` (an integer goes to float64: `ceil`, `floor`, `trunc`; decimals keep their own
-kernels). `resolveResultType` reports the type of the cast call.
+kernels). `.decode` only decodes dictionaries (`is_in`, `index_in`: a dictionary input is looked up by
+its values, as pyarrow 26). `resolveResultType` reports the type of the cast call.
 
 The multiplexers (`coalesce`, `if_else`, `case_when`, `choose`) cast their value arguments themselves
 (`selection.commonValueType`): numbers to `commonNumericType`, temporal types to `commonTemporalType`,
@@ -122,6 +125,27 @@ precision. Sums are exact (256 / 512 bits) until finalize, which applies `ExecCo
 follow Arrow C++ bit for bit where pyarrow 26 can express the case (text, floats, rescaling); the two
 deliberate differences (every overflowing safe scale-up is rejected; float to decimal128 at scales of 32
 and more is rounded exactly) are listed in the support matrix.
+
+### Dictionary inputs
+
+What a function does with a dictionary-encoded argument follows pyarrow 26:
+
+- decoded first (implicit casts): the comparisons, arithmetic, `is_in` / `index_in`, `min_element_wise`
+  / `max_element_wise`; `sort_indices` and the other sorts compare decoded values;
+- on the indices, keeping the dictionary: `unique` and `value_counts` (the result is of the input's
+  dictionary type, unused entries stay; a null index and an index to a null entry are two values),
+  group-by keys (`Grouper`, the key column keeps the dictionary) and the values of `hash_count`,
+  `hash_count_distinct`, `hash_distinct`; chunks with different dictionaries are unified first for
+  `unique` / `value_counts` (Arrow's `DictionaryUnifier`: the first dictionary, then the new values of
+  the next ones, the index type kept; dictionaries with null entries cannot be unified, `InvalidInput`),
+  and a later group-by batch over a different dictionary is `NotImplemented` (as Arrow);
+- the identity: `dictionary_encode`;
+- no kernel (`NoMatchingKernel`, as Arrow): `min`, `max`, `min_max`, `sum`, `count_distinct`, `first`,
+  `last` and the other numeric aggregates.
+
+Before any index is read, a dictionary argument passes `hash_aggregate.validateDictionary` (the
+dictionary's layout and value type, every non-null index below its length) or the equivalent check of
+`cast`; `validateLayout` alone checks neither.
 
 ### Unicode
 
@@ -156,7 +180,7 @@ Arrow C++ function catalog to its status here.
 | `KernelSignature` (`InputType`, `OutputType`, type matchers) | `KernelSignature` (`arity`, `type_check`, `result_type_fn`) |
 | `FunctionOptions` | `Options` (tagged union, section 3) |
 | `ExecContext` + `MemoryPool` | `ExecContext` + `std.mem.Allocator` (section 6) |
-| `Datum` | `Datum` (array, chunked, scalar) |
+| `Datum` | `Datum` (array, chunked, scalar, record_batch, table) |
 | `ExecBatch` / `ExecSpan` chunk-wise execution | exec chunk iterators (section 8) |
 | `Status` / `Result<T>` | Zig error unions (`KernelError!T`, section 5) |
 
@@ -172,13 +196,29 @@ Main public framework types:
 - `ExecContext`
 - `Datum`
 
-`Datum` currently supports all three forms:
+`Datum` has the five forms of Arrow's `Datum` (`DatumKind`):
 
 - `array: ArrayRef`
 - `chunked: ChunkedArray`
 - `scalar: Scalar`
+- `record_batch: SharedRecordBatch`
+- `table: SharedTable`
 
-Lifecycle helpers (`retain/release`) and type access (`dataType`) are implemented for all three variants.
+`retain` / `release`, `dataType`, `length` (rows; 1 for a scalar, as Arrow) and `kind` work on every
+form. A record batch or table datum owns its value through a reference-counted handle
+(`SharedRecordBatch` / `SharedTable`, `get()` borrows it): `Datum.fromRecordBatch(allocator, batch)` /
+`Datum.fromTable(allocator, table)` take the value over after `validateRecordBatch` / `validateTable`
+(one column per schema field, of the field's type, every column `num_rows` long, `validateLayout` of
+every column and chunk; `InvalidInput` otherwise, and the caller keeps the value). `dataType` of a
+tabular datum is the struct of its schema fields (borrowed from the schema; Arrow gives no type).
+
+Tabular datums go to the functions Arrow defines on record batches and tables: `datumTake` /
+`datumTakeNullable`, `datumFilter` / `datumFilterChunkAware`, `datumSlice`, `datumSelectColumns`,
+`datumStructField` (a column), and the registered functions whose signature sets `tabular`
+(`drop_null`, `sort_indices`, `select_k_unstable`). A kernel signature without `tabular` never matches a
+tabular argument, and the registry then answers `NotImplemented` (pyarrow raises TypeError /
+NotImplemented); helpers, iterators (`inferNaryExecLen`, the chunk iterators) and kernel switches over
+`Datum` answer `InvalidInput`. Every `switch` over a `Datum` names the five forms.
 
 ---
 
@@ -215,7 +255,8 @@ Compute options are type-safe and tag-based.
 - `zero_fill`
 - `round`, `round_to_multiple`, `round_binary`
 - `mode`, `variance`, `skew`, `quantile`, `index`
-- `partition_nth`, `select_k`, `rank`
+- `partition_nth`, `select_k`, `rank`, `rank_quantile`, `search_sorted`
+- `tdigest`, `pivot_wider`
 - `dictionary_encode`
 - `custom`
 
@@ -255,7 +296,11 @@ Compute options are type-safe and tag-based.
   `{0.5}`, `interpolation`: `linear | lower | higher | nearest | midpoint`, `skip_nulls`, `min_count`),
   `IndexOptions` (`value`: a `Scalar`)
 - `PartitionNthOptions` (`pivot`, `null_placement`), `SelectKOptions` (`k`, `sort_keys`), `RankOptions`
-  (`order`, `null_placement`, `tiebreaker`: `min | max | first | dense`)
+  (`order`, `null_placement`, `tiebreaker`: `min | max | first | dense`), `RankQuantileOptions` (`order`,
+  `null_placement`) for `rank_quantile` / `rank_normal`, `SearchSortedOptions` (`side`: `left | right`)
+- `TDigestOptions` (`q` = `{0.5}`, each in [0, 1], at most 65536; `delta` = 100, at most 2^20, at least
+  10 used; `buffer_size` = 500, at most 2^24, at least 1 used; `skip_nulls`; `min_count` = 0)
+- `PivotWiderOptions` (`key_names`, distinct, at most 65536; `unexpected_key_behavior`: `ignore | raise`)
 - `DictionaryEncodeOptions` (`null_encoding`: `mask | encode`)
 - `CustomOptions`
 
@@ -267,14 +312,20 @@ Use `KernelSignature.options_check` to validate allowed option families for each
 
 ### SortOptions
 
-`SortOptions` (sort_indices, array_sort_indices):
+`SortOptions` (sort_indices, array_sort_indices), as Arrow 26:
 
 - `order`: `ascending | descending` (array_sort_indices, and every column when `sort_keys` is empty)
-- `sort_keys`: one `SortKey` (`name`, `order`) per column of sort_indices; the name picks the column in
-  `sortIndicesRecordBatch` / `sortIndicesTable`
-- `null_placement`: `at_start | at_end`
-- `nan_placement`, `stable`: kept for compatibility; the sorts always place NaN next to the nulls and
-  are always stable
+- `sort_keys`: one `SortKey` (`name`, `order`, `null_placement` = `at_end`) per array / chunked argument,
+  or the columns of one record batch / table argument by `name` (at least one key, else
+  `InvalidOptions`); `SelectKOptions.sort_keys` the same
+- `null_placement`: `?SortNullPlacement` = null; when set it overrides every key's null placement
+  (Arrow's `SortOptions.null_placement`); null: each key's own (`at_end` without keys)
+
+Arrow 26 has no NaN placement option: NaN always sits next to the nulls, between them and the values
+(`at_end`: values, NaNs, nulls; `at_start`: nulls, NaNs, values). The former `nan_placement` and
+`stable` fields, which changed nothing, are removed; the sorts are always stable (equal rows keep their
+input order). A struct key sorts by its fields in order with a null struct row null in every field (Arrow
+flattens it); a dictionary key by its decoded values.
 
 ---
 
@@ -418,6 +469,8 @@ Permutation-family helpers include:
 - `datumFilterSelectionIndices`
 - `datumFilterChunkAware`
 - `datumSelect`, `datumSelectNullable`
+- `datumSlice`, `datumSelectColumns` (and the tabular forms of `datumTake` / `datumFilter`: every column of
+  a record batch or table, a table kept chunked)
 
 These are intended to help kernels preserve chunked execution/output where possible, instead of pre-concatenating chunked inputs.
 

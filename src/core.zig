@@ -155,7 +155,6 @@ pub const ComputeArithmeticOptions = compute_mod.ArithmeticOptions;
 pub const ComputeFilterOptions = compute_mod.FilterOptions;
 pub const ComputeSortOrder = compute_mod.SortOrder;
 pub const ComputeSortNullPlacement = compute_mod.SortNullPlacement;
-pub const ComputeSortNaNPlacement = compute_mod.SortNaNPlacement;
 pub const ComputeSortOptions = compute_mod.SortOptions;
 pub const ComputeCustomOptions = compute_mod.CustomOptions;
 pub const ComputeOptions = compute_mod.Options;

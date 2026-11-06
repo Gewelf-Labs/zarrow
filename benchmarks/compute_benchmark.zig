@@ -65,7 +65,8 @@ fn fold(d: Datum) u64 {
             .f64 => |v| @bitCast(v),
             else => 0,
         },
-        .chunked => return 0,
+        .chunked => |c| return c.len(),
+        .record_batch, .table => return d.length(),
     }
 }
 
@@ -218,6 +219,59 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     defer a_k.release();
     try timeKernel(io, &ctx, .vector, "compute_unique_int32", "unique", &.{.{ .array = a_k }}, cfg, emit_csv, meta);
     try timeKernel(io, &ctx, .vector, "compute_sort_indices_int32", "sort_indices", &.{.{ .array = a }}, cfg, emit_csv, meta);
+    // partition_nth_indices at the median and select_k_unstable (k = 100) over random int32 rows.
+    try timeKernelWith(io, &ctx, .vector, "compute_partition_nth_int32", "partition_nth_indices", &.{.{ .array = a }}, .{ .partition_nth = .{ .pivot = cfg.rows / 2 } }, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .vector, "compute_select_k_int32", "select_k_unstable", &.{.{ .array = a }}, .{ .select_k = .{ .k = 100 } }, cfg, emit_csv, meta);
+
+    // take of random rows (with repeats) from a record batch of four int32 columns, two with
+    // 10% nulls: ns per row covers all four columns.
+    const i32_type = zarrow.DataType{ .int32 = {} };
+    const take_fields = [_]zarrow.Field{
+        .{ .name = "a", .data_type = &i32_type },  .{ .name = "b", .data_type = &i32_type },
+        .{ .name = "an", .data_type = &i32_type }, .{ .name = "bn", .data_type = &i32_type },
+    };
+    const take_batch = try zarrow.RecordBatch.initBorrowed(allocator, .{ .fields = &take_fields }, &.{ a, b, an, bn });
+    var rb = try Datum.fromRecordBatch(allocator, take_batch);
+    defer rb.release();
+    const take_idx = try allocator.alloc(usize, cfg.rows);
+    defer allocator.free(take_idx);
+    var x: u32 = 19;
+    for (take_idx) |*t| {
+        x = x *% 1664525 +% 1013904223;
+        t.* = (x >> 4) % cfg.rows;
+    }
+    try timeTake(io, "compute_take_record_batch", rb, take_idx, cfg, emit_csv, meta);
+
+    // unique over a dictionary<int32, string> of 1000 entries (the rows of a_k as indices).
+    var dict_values = try zarrow.StringBuilder.init(allocator, 1000, 8000);
+    defer dict_values.deinit();
+    var name_buf: [16]u8 = undefined;
+    for (0..1000) |k| try dict_values.append(std.fmt.bufPrint(&name_buf, "v{d}", .{k}) catch unreachable);
+    var dict = try dict_values.finish();
+    defer dict.release();
+    var dict_builder = try zarrow.DictionaryBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &dict.data().data_type, cfg.rows);
+    defer dict_builder.deinit();
+    for (try (zarrow.PrimitiveArray(i32){ .data = a_k.data() }).values()) |k| try dict_builder.appendIndex(k);
+    var dict_rows = try dict_builder.finish(dict);
+    defer dict_rows.release();
+    try timeKernel(io, &ctx, .vector, "compute_unique_dictionary", "unique", &.{.{ .array = dict_rows }}, cfg, emit_csv, meta);
+    // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
+    try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
+}
+
+/// Time `datumTake` of `indices` from `datum` (one untimed warm-up first).
+fn timeTake(io: std.Io, bench_name: []const u8, datum: Datum, indices: []const usize, cfg: BenchConfig, emit_csv: bool, meta: csv_meta.CsvMeta) !void {
+    var warm_up = try compute.datumTake(datum, indices);
+    warm_up.release();
+    var checksum: u64 = 0;
+    const timer_start = std.Io.Timestamp.now(io, .awake);
+    for (0..cfg.iterations) |_| {
+        var out = try compute.datumTake(datum, indices);
+        defer out.release();
+        checksum +%= fold(out);
+    }
+    const elapsed_ns: u64 = @intCast(timer_start.untilNow(io, .awake).toNanoseconds());
+    report(bench_name, cfg, elapsed_ns, checksum, emit_csv, meta);
 }
 
 /// decimal128(18, 2) values below 10^16 in magnitude, every tenth row null.

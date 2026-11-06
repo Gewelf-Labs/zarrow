@@ -140,6 +140,7 @@ pub fn Aggregate(comptime Impl: type) type {
                 .array => |arr| try consumeArray(state, arr),
                 .chunked => |chunked| for (chunked.chunks()) |chunk| try consumeArray(state, chunk),
                 .scalar => |s| try Impl.updateScalar(state, s),
+                .record_batch, .table => return error.InvalidInput,
             }
         }
 

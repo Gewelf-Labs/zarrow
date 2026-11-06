@@ -66,7 +66,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         });
     }
     try registry.registerVectorKernel("drop_null", .{
-        .signature = .{ .arity = 1, .type_check = notScalar, .options_check = dense.noOptions },
+        .signature = .{ .arity = 1, .type_check = notScalar, .options_check = dense.noOptions, .tabular = true },
         .exec = dropNull,
     });
     inline for (.{ "fill_null_forward", "fill_null_backward" }) |name| {
@@ -349,6 +349,7 @@ fn dropNull(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datu
             return .{ .chunked = out };
         },
         .scalar => return error.NoMatchingKernel,
+        .record_batch, .table => return dropNullTabular(ctx, args[0]),
     }
 }
 
@@ -371,6 +372,40 @@ fn dropArray(allocator: std.mem.Allocator, arr: ArrayRef) KernelError!ArrayRef {
     };
 }
 
+/// drop_null of a record batch or table: the rows with no null in any column (Arrow
+/// `DropNull` on a `RecordBatch` / `Table`); the datum itself when no row has one.
+fn dropNullTabular(ctx: *ExecContext, datum: Datum) KernelError!Datum {
+    const n = datum.length();
+    // ponytail: one byte per row; a bitmap AND of the validity buffers would be 8x smaller.
+    const drop = ctx.allocator.alloc(bool, n) catch return error.OutOfMemory;
+    defer ctx.allocator.free(drop);
+    @memset(drop, false);
+    switch (datum) {
+        .record_batch => |b| for (b.get().columns) |col| markNulls(col.data(), drop),
+        .table => |t| for (t.get().columns) |col| {
+            var pos: usize = 0;
+            for (col.chunks()) |chunk| {
+                const len = chunk.data().length;
+                markNulls(chunk.data(), drop[pos..][0..len]);
+                pos += len;
+            }
+        },
+        else => return error.InvalidInput,
+    }
+    var keep: std.ArrayList(usize) = .empty;
+    defer keep.deinit(ctx.allocator);
+    for (drop, 0..) |d, i| if (!d) keep.append(ctx.allocator, i) catch return error.OutOfMemory;
+    if (keep.items.len == n) return datum.retain();
+    return core.datumTake(datum, keep.items);
+}
+
+/// Mark the null rows of one validated column part.
+fn markNulls(data: *const ArrayData, drop: []bool) void {
+    if (!datatypeHasNoNulls(data)) return @memset(drop, true);
+    if (!data.hasNulls()) return;
+    for (drop, 0..) |*d, i| d.* = d.* or data.isNull(i);
+}
+
 /// The null type has no validity bitmap but every row is null.
 fn datatypeHasNoNulls(data: *const ArrayData) bool {
     return !(data.data_type == .null and data.length > 0);
@@ -384,6 +419,7 @@ fn FillNull(comptime forward: bool) type {
                 .scalar => return args[0].retain(),
                 .array => |*a| a[0..1],
                 .chunked => |c| c.chunks(),
+                .record_batch, .table => return error.InvalidInput,
             };
             var total: usize = 0;
             var any_null = false;

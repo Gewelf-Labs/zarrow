@@ -9,6 +9,8 @@ const registry_mod = @import("registry.zig");
 pub const DataType = datatype.DataType;
 pub const ArrayRef = array_ref_mod.ArrayRef;
 pub const ChunkedArray = chunked_array_mod.ChunkedArray;
+pub const RecordBatch = @import("../record_batch.zig").RecordBatch;
+pub const Table = @import("../table.zig").Table;
 
 pub const FunctionKind = enum {
     scalar,
@@ -128,10 +130,61 @@ pub const Scalar = struct {
     }
 };
 
-pub const Datum = union(enum) {
+/// Reference-counted owner of a record batch or table held by a `Datum`: `retain` shares the
+/// node, the last `release` deinitializes the value.
+pub fn Shared(comptime T: type) type {
+    return struct {
+        node: *Node,
+
+        const Self = @This();
+        const Node = struct {
+            allocator: std.mem.Allocator,
+            ref_count: std.atomic.Value(u32),
+            value: T,
+        };
+
+        /// Take ownership of `value` (on error the caller still owns it).
+        pub fn create(allocator: std.mem.Allocator, value: T) KernelError!Self {
+            const node = allocator.create(Node) catch return error.OutOfMemory;
+            node.* = .{ .allocator = allocator, .ref_count = std.atomic.Value(u32).init(1), .value = value };
+            return .{ .node = node };
+        }
+
+        pub fn retain(self: Self) Self {
+            _ = self.node.ref_count.fetchAdd(1, .monotonic);
+            return self;
+        }
+
+        pub fn release(self: *Self) void {
+            if (self.node.ref_count.fetchSub(1, .acq_rel) != 1) return;
+            const allocator = self.node.allocator;
+            self.node.value.deinit();
+            allocator.destroy(self.node);
+        }
+
+        pub fn get(self: Self) *const T {
+            return &self.node.value;
+        }
+    };
+}
+
+pub const SharedRecordBatch = Shared(RecordBatch);
+pub const SharedTable = Shared(Table);
+
+/// The form of a `Datum` (Arrow `Datum::Kind`, without `NONE`).
+pub const DatumKind = enum { array, chunked, scalar, record_batch, table };
+
+pub const Datum = union(DatumKind) {
     array: ArrayRef,
     chunked: ChunkedArray,
     scalar: Scalar,
+    /// A record batch: equal-length array columns under a schema. Taken by the tabular
+    /// functions only (`datumTake`, `datumFilter`, `datumSlice`, `datumSelectColumns`, drop_null,
+    /// sort_indices, select_k_unstable); the registry rejects it for every other function
+    /// (`NotImplemented`) and the helpers and kernels with `InvalidInput`.
+    record_batch: SharedRecordBatch,
+    /// A table: equal-length chunked columns under a schema (see `record_batch`).
+    table: SharedTable,
 
     pub fn fromArray(arr: ArrayRef) Datum {
         return .{ .array = arr };
@@ -145,6 +198,24 @@ pub const Datum = union(enum) {
         return .{ .scalar = s };
     }
 
+    /// Wrap `batch`, taking ownership of it (on error the caller still owns it). The columns
+    /// are checked against the schema (`validateRecordBatch`).
+    pub fn fromRecordBatch(allocator: std.mem.Allocator, batch: RecordBatch) KernelError!Datum {
+        try validateRecordBatch(&batch);
+        return .{ .record_batch = try SharedRecordBatch.create(allocator, batch) };
+    }
+
+    /// Wrap `table`, taking ownership of it (on error the caller still owns it). The columns
+    /// are checked against the schema (`validateTable`).
+    pub fn fromTable(allocator: std.mem.Allocator, table: Table) KernelError!Datum {
+        try validateTable(&table);
+        return .{ .table = try SharedTable.create(allocator, table) };
+    }
+
+    pub fn kind(self: Datum) DatumKind {
+        return self;
+    }
+
     pub inline fn isArray(self: Datum) bool {
         return self == .array;
     }
@@ -155,6 +226,11 @@ pub const Datum = union(enum) {
 
     pub inline fn isScalar(self: Datum) bool {
         return self == .scalar;
+    }
+
+    /// A record batch or a table.
+    pub inline fn isTabular(self: Datum) bool {
+        return self == .record_batch or self == .table;
     }
 
     pub fn asArray(self: Datum) ?ArrayRef {
@@ -178,11 +254,27 @@ pub const Datum = union(enum) {
         };
     }
 
+    pub fn asRecordBatch(self: Datum) ?*const RecordBatch {
+        return switch (self) {
+            .record_batch => |b| b.get(),
+            else => null,
+        };
+    }
+
+    pub fn asTable(self: Datum) ?*const Table {
+        return switch (self) {
+            .table => |t| t.get(),
+            else => null,
+        };
+    }
+
     pub fn retain(self: Datum) Datum {
         return switch (self) {
             .array => |arr| .{ .array = arr.retain() },
             .chunked => |chunks| .{ .chunked = chunks.retain() },
             .scalar => |s| .{ .scalar = s.retain() },
+            .record_batch => |b| .{ .record_batch = b.retain() },
+            .table => |t| .{ .table = t.retain() },
         };
     }
 
@@ -191,18 +283,65 @@ pub const Datum = union(enum) {
             .array => |*arr| arr.release(),
             .chunked => |*chunks| chunks.release(),
             .scalar => |*s| s.release(),
+            .record_batch => |*b| b.release(),
+            .table => |*t| t.release(),
         }
         self.* = undefined;
     }
 
+    /// The value type; a record batch or table gives the struct of its schema fields (borrowed
+    /// from the schema, valid while the datum lives; Arrow gives them no type).
     pub fn dataType(self: Datum) DataType {
         return switch (self) {
             .array => |arr| arr.data().data_type,
             .chunked => |chunks| chunks.dataType(),
             .scalar => |s| s.data_type,
+            .record_batch => |b| .{ .struct_ = .{ .fields = b.get().schema().fields } },
+            .table => |t| .{ .struct_ = .{ .fields = t.get().schema().fields } },
+        };
+    }
+
+    /// Rows of an array, chunked array, record batch or table; 1 for a scalar (as Arrow).
+    pub fn length(self: Datum) usize {
+        return switch (self) {
+            .array => |arr| arr.data().length,
+            .chunked => |chunks| chunks.len(),
+            .scalar => 1,
+            .record_batch => |b| b.get().num_rows,
+            .table => |t| t.get().num_rows,
         };
     }
 };
+
+/// Check a record batch: one column per schema field, of the field's type, every column
+/// `num_rows` long and passing `validateLayout` (`InvalidInput` otherwise).
+pub fn validateRecordBatch(batch: *const RecordBatch) KernelError!void {
+    const fields = batch.schema().fields;
+    if (fields.len != batch.columns.len) return error.InvalidInput;
+    for (batch.columns, fields) |col, f| {
+        const data = col.data();
+        data.validateLayout() catch return error.InvalidInput;
+        if (data.length != batch.num_rows or !data.data_type.eql(f.data_type.*)) return error.InvalidInput;
+    }
+}
+
+/// `validateRecordBatch` for a table: every column `num_rows` long, every chunk of the column's
+/// type and passing `validateLayout`.
+pub fn validateTable(table: *const Table) KernelError!void {
+    const fields = table.schema().fields;
+    if (fields.len != table.columns.len) return error.InvalidInput;
+    for (table.columns, fields) |col, f| {
+        if (!col.dataType().eql(f.data_type.*)) return error.InvalidInput;
+        var total: usize = 0;
+        for (col.chunks()) |chunk| {
+            const data = chunk.data();
+            data.validateLayout() catch return error.InvalidInput;
+            if (!data.data_type.eql(f.data_type.*)) return error.InvalidInput;
+            total = std.math.add(usize, total, data.length) catch return error.InvalidInput;
+        }
+        if (total != table.num_rows or col.len() != total) return error.InvalidInput;
+    }
+}
 
 pub const KernelError = error{
     OutOfMemory,
@@ -229,7 +368,6 @@ pub const ArithmeticOptions = options_mod.ArithmeticOptions;
 pub const FilterOptions = options_mod.FilterOptions;
 pub const SortOrder = options_mod.SortOrder;
 pub const SortNullPlacement = options_mod.SortNullPlacement;
-pub const SortNaNPlacement = options_mod.SortNaNPlacement;
 pub const SortOptions = options_mod.SortOptions;
 pub const CustomOptions = options_mod.CustomOptions;
 pub const DayOfWeekOptions = options_mod.DayOfWeekOptions;
@@ -269,6 +407,11 @@ pub const PartitionNthOptions = options_mod.PartitionNthOptions;
 pub const SelectKOptions = options_mod.SelectKOptions;
 pub const RankTiebreaker = options_mod.RankTiebreaker;
 pub const RankOptions = options_mod.RankOptions;
+pub const RankQuantileOptions = options_mod.RankQuantileOptions;
+pub const SearchSortedOptions = options_mod.SearchSortedOptions;
+pub const TDigestOptions = options_mod.TDigestOptions;
+pub const UnexpectedKeyBehavior = options_mod.UnexpectedKeyBehavior;
+pub const PivotWiderOptions = options_mod.PivotWiderOptions;
 pub const DictionaryEncodeOptions = options_mod.DictionaryEncodeOptions;
 pub const Options = options_mod.Options;
 
@@ -320,6 +463,8 @@ pub const datumBuildNullLikeWithAllocator = helpers.datumBuildNullLikeWithAlloca
 pub const datumBuildEmptyLike = helpers.datumBuildEmptyLike;
 pub const datumBuildEmptyLikeWithAllocator = helpers.datumBuildEmptyLikeWithAllocator;
 pub const datumSliceEmpty = helpers.datumSliceEmpty;
+pub const datumSlice = helpers.datumSlice;
+pub const datumSelectColumns = helpers.datumSelectColumns;
 pub const datumTake = helpers.datumTake;
 pub const datumTakeNullable = helpers.datumTakeNullable;
 pub const datumSelect = helpers.datumSelect;

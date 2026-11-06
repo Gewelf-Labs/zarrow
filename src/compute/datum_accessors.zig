@@ -199,6 +199,7 @@ pub fn datumListValueAt(datum: Datum, logical_index: usize) KernelError!ArrayRef
             const view = array_mod.ListArray{ .data = payload.data() };
             break :blk view.value(0) catch |err| mapArrayReadError(err);
         },
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
@@ -226,6 +227,7 @@ pub fn datumLargeListValueAt(datum: Datum, logical_index: usize) KernelError!Arr
             const view = array_mod.LargeListArray{ .data = payload.data() };
             break :blk view.value(0) catch |err| mapArrayReadError(err);
         },
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
@@ -253,6 +255,7 @@ pub fn datumFixedSizeListValueAt(datum: Datum, logical_index: usize) KernelError
             const view = array_mod.FixedSizeListArray{ .data = payload.data() };
             break :blk view.value(0) catch |err| mapArrayReadError(err);
         },
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
@@ -324,6 +327,17 @@ pub fn datumStructField(datum: Datum, field_index: usize) KernelError!Datum {
             const field_scalar = try scalarFromSingleArrayRef(field_array);
             break :blk Datum.fromScalar(field_scalar);
         },
+        // A column of a record batch or table (Arrow `RecordBatch::column`).
+        .record_batch => |b| blk: {
+            const batch = b.get();
+            if (field_index >= batch.columns.len) break :blk error.InvalidInput;
+            break :blk Datum.fromArray(batch.columns[field_index].retain());
+        },
+        .table => |t| blk: {
+            const table = t.get();
+            if (field_index >= table.columns.len) break :blk error.InvalidInput;
+            break :blk Datum.fromChunked(table.columns[field_index].retain());
+        },
     };
 }
 
@@ -338,6 +352,7 @@ pub fn datumElementArrayAt(allocator: std.mem.Allocator, datum: Datum, logical_i
             break :blk located.chunk.slice(located.local_index, 1) catch |err| mapArrayReadError(err);
         },
         .scalar => |scalar| builders.scalarToSingleArrayRef(allocator, scalar),
+        .record_batch, .table => error.InvalidInput,
     };
 }
 
@@ -347,5 +362,48 @@ pub fn datumSliceEmpty(datum: Datum) KernelError!Datum {
         .array => |arr| Datum.fromArray(arr.slice(0, 0) catch |err| return mapArrayReadError(err)),
         .chunked => |chunks| Datum.fromChunked(chunks.slice(chunks.node.allocator, 0, 0) catch |err| return common.mapChunkedError(err)),
         .scalar => |s| builders.datumBuildEmptyLikeWithAllocator(common.inferDatumAllocator(datum) orelse std.heap.page_allocator, s.data_type),
+        .record_batch, .table => datumSlice(datum, 0, 0),
     };
+}
+
+/// Rows `offset .. offset + length` of an array, chunked array, record batch or table, zero
+/// copy (Arrow `Array::Slice`, `RecordBatch::Slice`, `Table::Slice`); past the end, or a
+/// scalar, is `InvalidInput`.
+pub fn datumSlice(datum: Datum, offset: usize, length: usize) KernelError!Datum {
+    const end = std.math.add(usize, offset, length) catch return error.InvalidInput;
+    if (datum == .scalar or end > datum.length()) return error.InvalidInput;
+    return switch (datum) {
+        .array => |arr| Datum.fromArray(arr.slice(offset, length) catch |err| return mapArrayReadError(err)),
+        .chunked => |c| Datum.fromChunked(c.slice(c.node.allocator, offset, length) catch |err| return common.mapChunkedError(err)),
+        .scalar => unreachable,
+        .record_batch => |b| common.ownBatch(b.node.allocator, b.get().slice(offset, length) catch |err| return common.mapTabularError(err)),
+        .table => |t| common.ownTable(t.node.allocator, t.get().slice(offset, length) catch |err| return common.mapTabularError(err)),
+    };
+}
+
+/// The columns `names` of a record batch or table, in that order (Arrow `Table::SelectColumns`;
+/// a name may repeat). An unknown name, or another datum form, is `InvalidInput`.
+pub fn datumSelectColumns(datum: Datum, names: []const []const u8) KernelError!Datum {
+    switch (datum) {
+        .table => |t| return common.ownTable(t.node.allocator, t.get().select(names) catch |err| return common.mapTabularError(err)),
+        .record_batch => |b| {
+            const batch = b.get();
+            const allocator = b.node.allocator;
+            const idx = allocator.alloc(usize, names.len) catch return error.OutOfMemory;
+            defer allocator.free(idx);
+            const cols = allocator.alloc(ArrayRef, names.len) catch return error.OutOfMemory;
+            defer allocator.free(cols);
+            for (names, idx, cols) |name, *i, *c| {
+                i.* = batch.schema().fieldIndex(name) orelse return error.InvalidInput;
+                c.* = batch.columns[i.*];
+            }
+            var schema_ref = batch.schema_ref.project(allocator, idx) catch |err| return common.mapTabularError(err);
+            const out = core.RecordBatch.initPrevalidated(allocator, schema_ref, cols) catch |err| {
+                schema_ref.release();
+                return common.mapTabularError(err);
+            };
+            return common.ownBatch(allocator, out);
+        },
+        else => return error.InvalidInput,
+    }
 }

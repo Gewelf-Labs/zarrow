@@ -43,6 +43,7 @@ pub fn rows(comptime T: type, datum: Datum) ![]?T {
         },
         .array => |arr| return partRows(T, &.{arr}),
         .chunked => |c| return partRows(T, c.chunks()),
+        .record_batch, .table => return error.InvalidInput,
     }
 }
 

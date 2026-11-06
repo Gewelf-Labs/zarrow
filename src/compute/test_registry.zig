@@ -529,17 +529,19 @@ test "registerAll registers every kernel family function name with its kind" {
         "round", "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
     };
     const vector_names = [_][]const u8{
-        "unique",   "value_counts", "dictionary_encode",  "drop_null",             "fill_null_forward", "fill_null_backward", "mode",
-        "quantile", "sort_indices", "array_sort_indices", "partition_nth_indices", "select_k_unstable", "rank",
+        "unique",      "value_counts",  "dictionary_encode",  "drop_null",             "fill_null_forward", "fill_null_backward", "mode",
+        "quantile",    "sort_indices",  "array_sort_indices", "partition_nth_indices", "select_k_unstable", "rank",               "rank_quantile",
+        "rank_normal", "search_sorted",
     };
     const aggregate_names = [_][]const u8{
-        "sum",      "mean",   "min",  "max",      "min_max", "count", "count_all",  "any",            "all",   "product",
-        "variance", "stddev", "skew", "kurtosis", "first",   "last",  "first_last", "count_distinct", "index",
+        "sum",                "mean",        "min",  "max",      "min_max", "count", "count_all",  "any",            "all",   "product",
+        "variance",           "stddev",      "skew", "kurtosis", "first",   "last",  "first_last", "count_distinct", "index", "tdigest",
+        "approximate_median", "pivot_wider",
     };
     const hash_names = [_][]const u8{
-        "hash_sum",   "hash_mean",           "hash_min",        "hash_max",     "hash_min_max",  "hash_count",  "hash_count_all", "hash_any",
-        "hash_all",   "hash_count_distinct", "hash_distinct",   "hash_product", "hash_variance", "hash_stddev", "hash_skew",      "hash_kurtosis",
-        "hash_first", "hash_last",           "hash_first_last", "hash_one",     "hash_list",
+        "hash_sum",   "hash_mean",           "hash_min",        "hash_max",     "hash_min_max",  "hash_count",   "hash_count_all",          "hash_any",
+        "hash_all",   "hash_count_distinct", "hash_distinct",   "hash_product", "hash_variance", "hash_stddev",  "hash_skew",               "hash_kurtosis",
+        "hash_first", "hash_last",           "hash_first_last", "hash_one",     "hash_list",     "hash_tdigest", "hash_approximate_median", "hash_pivot_wider",
     };
     for (scalar_names) |name| try std.testing.expect(registry.containsFunction(name, .scalar));
     for (aggregate_names) |name| {

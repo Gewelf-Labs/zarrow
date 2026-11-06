@@ -31,6 +31,9 @@ pub const KernelSignature = struct {
     /// Result type callback of a kernel whose result type needs storage; `inferResultType`
     /// then answers `NotImplemented` and `inferResultTypeAlloc` calls it.
     result_type_alloc_fn: ?ResultTypeAllocFn = null,
+    /// Whether the kernel takes record batch and table arguments; without it a tabular
+    /// argument never matches (the registry then answers `NotImplemented`).
+    tabular: bool = false,
 
     pub fn any(arity: usize) KernelSignature {
         return .{
@@ -163,6 +166,7 @@ pub const KernelSignature = struct {
 
     pub fn matches(self: KernelSignature, args: []const Datum) bool {
         if (!self.matchesArity(args.len)) return false;
+        if (!self.tabular) for (args) |a| if (a.isTabular()) return false;
         if (self.type_check) |check| return check(args);
         return true;
     }
@@ -224,11 +228,17 @@ pub const KernelSignature = struct {
     }
 
     /// Check that the call has a result type (the type itself is dropped): a type that needs
-    /// storage is built in a stack buffer.
+    /// storage is built in a stack buffer, or in a heap arena when it does not fit (a struct of
+    /// many fields, such as pivot_wider with many key names).
     pub fn checkResultType(self: KernelSignature, args: []const Datum, options: Options) KernelError!void {
         var buf: [2048]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buf);
-        _ = try self.inferResultTypeAlloc(fba.allocator(), args, options);
+        _ = self.inferResultTypeAlloc(fba.allocator(), args, options) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            _ = try self.inferResultTypeAlloc(arena.allocator(), args, options);
+        };
     }
 
     /// Human-readable reason for result-type inference failure.
