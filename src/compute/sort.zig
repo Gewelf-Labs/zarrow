@@ -152,8 +152,8 @@ fn sortable(args: []const Datum) bool {
 /// Where a row of a column sorts relative to the values: its class decides first.
 const Class = enum(u2) { value, nan, null };
 
-/// The typed rows of one sort column.
-const Values = union(enum) {
+/// The typed rows of one sort column (also the ordered min / max kernels).
+pub const Values = union(enum) {
     i8: []const i8,
     i16: []const i16,
     i32: []const i32,
@@ -287,14 +287,16 @@ fn asArray(ctx: *ExecContext, datum: Datum) KernelError!ArrayRef {
     }
 }
 
-fn valuesOf(arr: ArrayRef) KernelError!Values {
+/// The typed rows of `arr` (validated by the caller); `UnsupportedType` for an unsortable type.
+pub fn valuesOf(arr: ArrayRef) KernelError!Values {
     const data = arr.data();
     return switch (data.data_type) {
         .bool => .{ .boolean = .{ .bits = data.buffers[1].data, .offset = data.offset } },
         .string, .large_string, .string_view, .binary, .large_binary, .binary_view => .{ .bytes = try dense.StringOperand.init(.{ .array = arr }) },
         .fixed_size_binary => |f| blk: {
             const w: usize = @intCast(f.byte_width);
-            if (w == 0 or data.buffers[1].data.len / w < data.offset + data.length) return error.InvalidInput;
+            // Width 0: every value is empty (all rows compare equal).
+            if (w != 0 and data.buffers[1].data.len / w < data.offset + data.length) return error.InvalidInput;
             break :blk .{ .fixed = .{ .data = data.buffers[1].data, .width = w, .offset = data.offset } };
         },
         .int8 => .{ .i8 = try typed(i8, data) },
@@ -1016,15 +1018,20 @@ fn crossCompare(a: *const Column, i: usize, b: *const Column, j: usize) std.math
     const cb = b.class(j);
     if (ca != cb) return std.math.order(@intFromEnum(ca), @intFromEnum(cb));
     if (ca != .value) return .eq;
-    return switch (a.values) {
-        .boolean => |x| std.math.order(@intFromBool(bitmap.bitIsSet(x.bits, x.offset + i)), @intFromBool(bitmap.bitIsSet(b.values.boolean.bits, b.values.boolean.offset + j))),
+    return valueOrder(&a.values, i, &b.values, j);
+}
+
+/// Compare row `i` of `a` with row `j` of `b` (rows of one type, neither null; floats by `<`).
+pub fn valueOrder(a: *const Values, i: usize, b: *const Values, j: usize) std.math.Order {
+    return switch (a.*) {
+        .boolean => |x| std.math.order(@intFromBool(bitmap.bitIsSet(x.bits, x.offset + i)), @intFromBool(bitmap.bitIsSet(b.boolean.bits, b.boolean.offset + j))),
         .bytes => |op| switch (op) {
-            inline else => |ra| switch (b.values.bytes) {
+            inline else => |ra| switch (b.bytes) {
                 inline else => |rb| std.mem.order(u8, ra.get(i), rb.get(j)),
             },
         },
-        .fixed => |f| std.mem.order(u8, f.data[(f.offset + i) * f.width ..][0..f.width], b.values.fixed.data[(b.values.fixed.offset + j) * f.width ..][0..f.width]),
-        inline else => |v, tag| std.math.order(v[i], @field(b.values, @tagName(tag))[j]),
+        .fixed => |f| std.mem.order(u8, f.data[(f.offset + i) * f.width ..][0..f.width], b.fixed.data[(b.fixed.offset + j) * f.width ..][0..f.width]),
+        inline else => |v, tag| std.math.order(v[i], @field(b.*, @tagName(tag))[j]),
     };
 }
 

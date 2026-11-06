@@ -523,3 +523,388 @@ test "cast times, durations, timestamp to time of day, integer reinterpretation 
     defer ints.release();
     try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = ints }}, to(dictOf(16, true, &int64_type))));
 }
+
+// ------------------------------------------------------------------------------ nested casts
+
+const int8_type = DataType{ .int8 = {} };
+const item32 = common.datatype.Field{ .name = "item", .data_type = &int32_type };
+const item64 = common.datatype.Field{ .name = "item", .data_type = &int64_type };
+const item8 = common.datatype.Field{ .name = "item", .data_type = &int8_type };
+const item_str = common.datatype.Field{ .name = "item", .data_type = &string_type };
+const list32 = DataType{ .list = .{ .value_field = item32 } };
+const list64 = DataType{ .list = .{ .value_field = item64 } };
+const large32 = DataType{ .large_list = .{ .value_field = item32 } };
+const large8 = DataType{ .large_list = .{ .value_field = item8 } };
+const view32 = DataType{ .list_view = .{ .value_field = item32 } };
+const large_view64 = DataType{ .large_list_view = .{ .value_field = item64 } };
+const fsl32_2 = DataType{ .fixed_size_list = .{ .value_field = item32, .list_size = 2 } };
+const fsl64_2 = DataType{ .fixed_size_list = .{ .value_field = item64, .list_size = 2 } };
+const fsl32_3 = DataType{ .fixed_size_list = .{ .value_field = item32, .list_size = 3 } };
+const list_str = DataType{ .list = .{ .value_field = item_str } };
+
+/// A list-like array of `Builder` over `values` with row lengths `lens` (null: a null row).
+fn listArray(comptime Builder: type, allocator: std.mem.Allocator, field: common.datatype.Field, lens: []const ?usize, values: ArrayRef) !ArrayRef {
+    var b = try Builder.init(allocator, lens.len, field);
+    defer b.deinit();
+    for (lens) |l| if (l) |n| try b.appendLen(n) else try b.appendNull();
+    return b.finish(values);
+}
+
+/// The rows of a list-like array of `T` values (null rows null).
+fn expectListRows(comptime T: type, arr: ArrayRef, expected: []const ?[]const ?T) !void {
+    const allocator = std.testing.allocator;
+    const d = arr.data();
+    try d.validateFull();
+    try std.testing.expectEqual(expected.len, d.length);
+    const child = try common.collect(T, allocator, .{ .array = d.children[0] });
+    defer allocator.free(child);
+    for (expected, 0..) |e, i| {
+        if (e == null) {
+            try std.testing.expect(d.isNull(i));
+            continue;
+        }
+        try std.testing.expect(!d.isNull(i));
+        const start: usize, const len: usize = switch (d.data_type) {
+            .list, .map => blk: {
+                const o = (try d.typedBufferAt(1, i32))[d.offset + i ..];
+                break :blk .{ @intCast(o[0]), @intCast(o[1] - o[0]) };
+            },
+            .large_list => blk: {
+                const o = (try d.typedBufferAt(1, i64))[d.offset + i ..];
+                break :blk .{ @intCast(o[0]), @intCast(o[1] - o[0]) };
+            },
+            .list_view => .{ @intCast((try d.typedBufferAt(1, i32))[d.offset + i]), @intCast((try d.typedBufferAt(2, i32))[d.offset + i]) },
+            .large_list_view => .{ @intCast((try d.typedBufferAt(1, i64))[d.offset + i]), @intCast((try d.typedBufferAt(2, i64))[d.offset + i]) },
+            .fixed_size_list => |f| .{ (d.offset + i) * @as(usize, @intCast(f.list_size)), @intCast(f.list_size) },
+            else => return error.TestUnexpectedResult,
+        };
+        try common.expectRows(T, e.?, child[start .. start + len]);
+    }
+}
+
+fn castTo(ctx: *ExecContext, arr: ArrayRef, dt: DataType, safe: bool) !ArrayRef {
+    var out = try ctx.invokeScalar("cast", &.{.{ .array = arr }}, if (safe) to(dt) else unsafeTo(dt));
+    errdefer out.release();
+    try std.testing.expect(out.array.data().data_type.eql(dt));
+    return out.array;
+}
+
+test "cast nested lists: list, large_list, list_view and fixed_size_list among themselves, the child cast recursively (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // [[1, 2], null, [], [300]]
+    var vals = try common.makeArray(i32, allocator, &.{ 1, 2, 300 });
+    defer vals.release();
+    var l = try listArray(common.array_mod.ListBuilder, allocator, item32, &.{ 2, null, 0, 1 }, vals);
+    defer l.release();
+    const rows = [_]?[]const ?i64{ &.{ 1, 2 }, null, &.{}, &.{300} };
+    inline for (.{ list64, large_view64 }) |dt| {
+        var out = try castTo(&ctx, l, dt, true);
+        defer out.release();
+        try expectListRows(i64, out, &rows);
+    }
+    inline for (.{ large32, view32 }) |dt| {
+        var out = try castTo(&ctx, l, dt, true);
+        defer out.release();
+        try expectListRows(i32, out, &.{ &.{ 1, 2 }, null, &.{}, &.{300} });
+    }
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = l }}, to(large8)));
+    var wrapped = try castTo(&ctx, l, large8, false);
+    defer wrapped.release();
+    try expectListRows(i8, wrapped, &.{ &.{ 1, 2 }, null, &.{}, &.{44} });
+    var text = try castTo(&ctx, l, list_str, true);
+    defer text.release();
+    const text_child = try common.collectStrings(allocator, .{ .array = text.data().children[0] });
+    defer allocator.free(text_child);
+    try common.expectStrings(&.{ "1", "2", "300" }, text_child);
+    // To fixed_size_list every valid row needs the size; between fixed sizes they must match.
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = l }}, to(fsl32_2)));
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = l }}, to(string_type)));
+    const nested_list = DataType{ .list = .{ .value_field = .{ .name = "item", .data_type = &list32 } } };
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = l }}, to(nested_list)));
+    // Sliced input: the child window is rebased.
+    var tail = try l.slice(1, 3);
+    defer tail.release();
+    var tail_out = try castTo(&ctx, tail, large32, true);
+    defer tail_out.release();
+    try expectListRows(i32, tail_out, &.{ null, &.{}, &.{300} });
+
+    // [[1, 2], null, [3, 4]] as list (the null row of length 0 gets two null values) and as
+    // fixed_size_list (to list, large_list and fixed_size_list<int64>, not to another size).
+    var four = try common.makeArray(i32, allocator, &.{ 1, 2, 3, 4 });
+    defer four.release();
+    var pairs = try listArray(common.array_mod.ListBuilder, allocator, item32, &.{ 2, null, 2 }, four);
+    defer pairs.release();
+    var as_fsl = try castTo(&ctx, pairs, fsl32_2, true);
+    defer as_fsl.release();
+    try expectListRows(i32, as_fsl, &.{ &.{ 1, 2 }, null, &.{ 3, 4 } });
+    var fsl_vals = try common.makeArray(i32, allocator, &.{ 1, 2, 0, 0, 3, 4 });
+    defer fsl_vals.release();
+    var fb = try common.array_mod.FixedSizeListBuilder.init(allocator, item32, 2);
+    defer fb.deinit();
+    try fb.appendValid();
+    try fb.appendNull();
+    try fb.appendValid();
+    var fsl = try fb.finish(fsl_vals);
+    defer fsl.release();
+    inline for (.{ list64, fsl64_2 }) |dt| {
+        var out = try castTo(&ctx, fsl, dt, true);
+        defer out.release();
+        try expectListRows(i64, out, &.{ &.{ 1, 2 }, null, &.{ 3, 4 } });
+    }
+    var fsl_sliced = try fsl.slice(1, 2);
+    defer fsl_sliced.release();
+    var fsl_large = try castTo(&ctx, fsl_sliced, large32, true);
+    defer fsl_large.release();
+    try expectListRows(i32, fsl_large, &.{ null, &.{ 3, 4 } });
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = fsl }}, to(fsl32_3)));
+
+    // list_view rows out of order: [[3], null, [1, 2]] over [1, 2, 3].
+    var lvb = try common.array_mod.ListViewBuilder.init(allocator, 3, item32);
+    defer lvb.deinit();
+    try lvb.appendLen(2);
+    try lvb.appendNull();
+    try lvb.appendLen(1);
+    var lv = try lvb.finish(vals);
+    defer lv.release();
+    var from_view = try castTo(&ctx, lv, list64, true);
+    defer from_view.release();
+    try expectListRows(i64, from_view, &.{ &.{ 1, 2 }, null, &.{300} });
+
+    // Chunked and scalar inputs.
+    var chunked = try common.chunkedAt(allocator, l, &.{1});
+    defer chunked.release();
+    var cout = try ctx.invokeScalar("cast", &.{.{ .chunked = chunked }}, to(large32));
+    defer cout.release();
+    try std.testing.expectEqual(@as(usize, 2), cout.chunked.numChunks());
+    var one = try l.slice(0, 1);
+    defer one.release();
+    var one_scalar = try Scalar.initNested(list32, one);
+    defer one_scalar.release();
+    var s = try ctx.invokeScalar("cast", &.{.{ .scalar = one_scalar }}, to(large32));
+    defer s.release();
+    try std.testing.expect(s == .scalar and s.scalar.data_type == .large_list);
+    // The null type to nested types.
+    var nulls = try common.datumBuildNullLike(.{ .null = {} }, 2);
+    defer nulls.release();
+    inline for (.{ list32, fsl32_2 }) |dt| {
+        var out = try ctx.invokeScalar("cast", &.{nulls}, to(dt));
+        defer out.release();
+        try out.array.data().validateFull();
+        try std.testing.expectEqual(@as(usize, 2), out.array.data().null_count.?);
+    }
+    // A list<string> to list<dictionary<int32, string>> and back.
+    var words = try common.makeStrings(.string, allocator, &.{ "a", "b", "a" });
+    defer words.release();
+    var lw = try listArray(common.array_mod.ListBuilder, allocator, item_str, &.{ 2, null, 1 }, words);
+    defer lw.release();
+    const list_dict = DataType{ .list = .{ .value_field = .{ .name = "item", .data_type = &dict_string } } };
+    var encoded = try castTo(&ctx, lw, list_dict, true);
+    defer encoded.release();
+    try std.testing.expect(encoded.data().children[0].data().data_type == .dictionary);
+    var decoded = try castTo(&ctx, encoded, list_str, true);
+    defer decoded.release();
+    const back = try common.collectStrings(allocator, .{ .array = decoded.data().children[0] });
+    defer allocator.free(back);
+    try common.expectStrings(&.{ "a", "b", "a" }, back);
+    // A dictionary of lists decodes, then casts.
+    var dict_of_lists = try common.makeDictionary(allocator, pairs, .{ .bit_width = 32, .signed = true }, &.{ 2, 0, null });
+    defer dict_of_lists.release();
+    var from_dict = try castTo(&ctx, dict_of_lists, large32, true);
+    defer from_dict.release();
+    try expectListRows(i32, from_dict, &.{ &.{ 3, 4 }, &.{ 1, 2 }, null });
+}
+
+test "cast struct to struct by field name and map to map or list of struct (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // struct<a: int32, b: string> [{1, "x"}, null, {3, null}]
+    const a = try common.makeArray(i32, allocator, &.{ 1, 0, 3 });
+    const b = try common.makeStrings(.string, allocator, &.{ "x", "", null });
+    var validity = try dense.bitsBuffer(allocator, 3);
+    validity.data[0] = 0b101;
+    var s = try dense.structArray(allocator, &.{ "a", "b" }, &.{ a, b }, 3, validity);
+    defer s.release();
+    const f = common.datatype.Field;
+    const cases = [_]struct { []const f, []const ?i64, []const ?[]const u8 }{
+        .{ &.{ .{ .name = "a", .data_type = &int64_type }, .{ .name = "b", .data_type = &large_string_type } }, &.{ 1, 0, 3 }, &.{ "x", "", null } },
+        .{ &.{ .{ .name = "b", .data_type = &string_type }, .{ .name = "a", .data_type = &int64_type } }, &.{ 1, 0, 3 }, &.{ "x", "", null } },
+        .{ &.{ .{ .name = "a", .data_type = &int64_type }, .{ .name = "c", .data_type = &string_type } }, &.{ 1, 0, 3 }, &.{ null, null, null } },
+        .{ &.{ .{ .name = "x", .data_type = &int64_type }, .{ .name = "b", .data_type = &string_type } }, &.{ null, null, null }, &.{ "x", "", null } },
+    };
+    for (cases) |c| {
+        const dt = DataType{ .struct_ = .{ .fields = c[0] } };
+        var out = try castTo(&ctx, s, dt, true);
+        defer out.release();
+        try out.data().validateFull();
+        try std.testing.expect(out.data().isNull(1) and !out.data().isNull(0));
+        for (c[0], 0..) |field, k| {
+            const child = out.data().children[k];
+            if (field.data_type.* == .int64) {
+                const got = try common.collect(i64, allocator, .{ .array = child });
+                defer allocator.free(got);
+                try common.expectRows(i64, c[1], got);
+            } else {
+                const got = try common.collectStrings(allocator, .{ .array = child });
+                defer allocator.free(got);
+                try common.expectStrings(c[2], got);
+            }
+        }
+    }
+    // A repeated target name takes the next unused source field (none here: all null).
+    const twice = DataType{ .struct_ = .{ .fields = &.{ .{ .name = "a", .data_type = &int32_type }, .{ .name = "a", .data_type = &int32_type } } } };
+    var tw = try castTo(&ctx, s, twice, true);
+    defer tw.release();
+    try std.testing.expectEqual(@as(usize, 3), tw.data().children[1].data().null_count.?);
+    // Non-nullable targets: a missing field is UnsupportedType, a field with nulls InvalidCast,
+    // a field without nulls casts.
+    const missing_nn = DataType{ .struct_ = .{ .fields = &.{.{ .name = "c", .data_type = &int32_type, .nullable = false }} } };
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = s }}, to(missing_nn)));
+    const b_nn = DataType{ .struct_ = .{ .fields = &.{.{ .name = "b", .data_type = &string_type, .nullable = false }} } };
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = s }}, to(b_nn)));
+    const a_nn = DataType{ .struct_ = .{ .fields = &.{.{ .name = "a", .data_type = &int64_type, .nullable = false }} } };
+    var ann = try castTo(&ctx, s, a_nn, true);
+    defer ann.release();
+    // A field cast error surfaces (the null struct row's "" is cast too, as Arrow).
+    const b_int = DataType{ .struct_ = .{ .fields = &.{.{ .name = "b", .data_type = &int32_type }} } };
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = s }}, to(b_int)));
+    // Sliced struct: the validity window and the children follow the slice.
+    var tail = try s.slice(1, 2);
+    defer tail.release();
+    const ba = DataType{ .struct_ = .{ .fields = cases[1][0] } };
+    var tail_out = try castTo(&ctx, tail, ba, true);
+    defer tail_out.release();
+    try tail_out.data().validateFull();
+    try std.testing.expect(tail_out.data().isNull(0) and !tail_out.data().isNull(1));
+    const tail_a = try common.collect(i64, allocator, .{ .array = tail_out.data().children[1] });
+    defer allocator.free(tail_a);
+    try common.expectRows(i64, &.{ 0, 3 }, tail_a);
+    // The null type to a struct; a struct to a list is unsupported.
+    var nulls = try common.datumBuildNullLike(.{ .null = {} }, 2);
+    defer nulls.release();
+    var ns = try ctx.invokeScalar("cast", &.{nulls}, to(ba));
+    defer ns.release();
+    try ns.array.data().validateFull();
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = s }}, to(list32)));
+
+    // map<string, int32> [[("k", 1)], null, []] to map<large_string, int64>, to
+    // list<struct<k, v>> (entries by position), and to map<int32, int32> ("k" fails).
+    const key_str = f{ .name = "key", .data_type = &string_type, .nullable = false };
+    const val32 = f{ .name = "value", .data_type = &int32_type };
+    const keys = try common.makeStrings(.string, allocator, &.{"k"});
+    const items = try common.makeArray(i32, allocator, &.{1});
+    var entries = try dense.structArrayFields(allocator, &.{ key_str, val32 }, &.{ keys, items }, 1, null);
+    defer entries.release();
+    var mb = try common.array_mod.MapBuilder.init(allocator, 3, key_str, val32, false);
+    defer mb.deinit();
+    try mb.appendLen(1);
+    try mb.appendNull();
+    try mb.appendLen(0);
+    var m = try mb.finish(entries);
+    defer m.release();
+    try m.data().validateFull();
+    const map_wide = DataType{ .map = .{ .key_field = .{ .name = "key", .data_type = &large_string_type, .nullable = false }, .item_field = .{ .name = "value", .data_type = &int64_type } } };
+    var mw = try castTo(&ctx, m, map_wide, true);
+    defer mw.release();
+    try mw.data().validateFull();
+    const mw_items = try common.collect(i64, allocator, .{ .array = mw.data().children[0].data().children[1] });
+    defer allocator.free(mw_items);
+    try common.expectRows(i64, &.{1}, mw_items);
+    try std.testing.expect(mw.data().isNull(1));
+    const kv = DataType{ .struct_ = .{ .fields = &.{ .{ .name = "k", .data_type = &string_type }, .{ .name = "v", .data_type = &int64_type } } } };
+    const list_kv = DataType{ .list = .{ .value_field = .{ .name = "item", .data_type = &kv } } };
+    var as_list = try castTo(&ctx, m, list_kv, true);
+    defer as_list.release();
+    try as_list.data().validateFull();
+    const lv_items = try common.collect(i64, allocator, .{ .array = as_list.data().children[0].data().children[1] });
+    defer allocator.free(lv_items);
+    try common.expectRows(i64, &.{1}, lv_items);
+    const map_int = DataType{ .map = .{ .key_field = .{ .name = "key", .data_type = &int32_type, .nullable = false }, .item_field = val32 } };
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = m }}, to(map_int)));
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("cast", &.{.{ .array = as_list }}, to(map_wide)));
+    var nm = try ctx.invokeScalar("cast", &.{nulls}, to(map_wide));
+    defer nm.release();
+    try nm.array.data().validateFull();
+    try std.testing.expectEqual(@as(usize, 2), nm.array.data().null_count.?);
+}
+
+// ------------------------------------------------------------------------------ float16
+
+const half_type = DataType{ .half_float = {} };
+
+test "float16: cast to and from numbers and text, promotion to float32 in arithmetic and comparisons, is_nan / is_inf / is_finite (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const nan16 = std.math.nan(f16);
+    const inf16 = std.math.inf(f16);
+
+    var h = try common.makeArray(f16, allocator, &.{ 1.5, null, 65504, inf16, nan16 });
+    defer h.release();
+    const dh = [_]Datum{.{ .array = h }};
+    try common.expectInvokeWith(f32, &ctx, "cast", &dh, to(.{ .float = {} }), &.{ 1.5, null, 65504, std.math.inf(f32), std.math.nan(f32) });
+    try common.expectInvokeWith(f64, &ctx, "cast", &dh, to(.{ .double = {} }), &.{ 1.5, null, 65504, std.math.inf(f64), std.math.nan(f64) });
+    try common.expectInvokeStrings(&ctx, "cast", &dh, to(string_type), &.{ "1.5", null, "65504", "inf", "nan" });
+    var odd = try common.makeArray(f16, allocator, &.{ 0.1, 1.0 / 3.0, 1e-7, -0.0 });
+    defer odd.release();
+    try common.expectInvokeStrings(&ctx, "cast", &.{.{ .array = odd }}, to(string_type), &.{ "0.0999755859375", "0.333251953125", "1.1920928955078125e-07", "-0" });
+    // To integers: a fraction, inf and NaN fail when safe; unsafe truncates and saturates.
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &dh, to(int32_type)));
+    try common.expectInvokeWith(i32, &ctx, "cast", &dh, unsafeTo(int32_type), &.{ 1, null, 65504, std.math.maxInt(i32), 0 });
+    var whole = try common.makeArray(f16, allocator, &.{ -3, 255, null });
+    defer whole.release();
+    try common.expectInvokeWith(u8, &ctx, "cast", &.{.{ .array = whole }}, unsafeTo(.{ .uint8 = {} }), &.{ 0, 255, null });
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = whole }}, to(.{ .uint8 = {} })));
+    try common.expectInvokeWith(i16, &ctx, "cast", &.{.{ .array = whole }}, to(.{ .int16 = {} }), &.{ -3, 255, null });
+    // From floats: round to nearest even (0.1 -> 0.0999755859375), overflow to inf; from
+    // integers: exact up to 2048, past it InvalidCast when safe (pyarrow 26 rounds silently).
+    var d = try common.makeArray(f64, allocator, &.{ 1.5, 70000.0, 1e-8, null, std.math.nan(f64), 0.1 });
+    defer d.release();
+    try common.expectInvokeWith(f16, &ctx, "cast", &.{.{ .array = d }}, to(half_type), &.{ 1.5, inf16, 0, null, nan16, 0.0999755859375 });
+    var ints = try common.makeArray(i32, allocator, &.{ 1, -2048, 2048 });
+    defer ints.release();
+    try common.expectInvokeWith(f16, &ctx, "cast", &.{.{ .array = ints }}, to(half_type), &.{ 1, -2048, 2048 });
+    var big = try common.makeArray(i64, allocator, &.{ 2049, 70000 });
+    defer big.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = big }}, to(half_type)));
+    try common.expectInvokeWith(f16, &ctx, "cast", &.{.{ .array = big }}, unsafeTo(half_type), &.{ 2048, inf16 });
+    var text = try common.makeStrings(.string, allocator, &.{ "1.5", "inf", null });
+    defer text.release();
+    try common.expectInvokeWith(f16, &ctx, "cast", &.{.{ .array = text }}, to(half_type), &.{ 1.5, inf16, null });
+    var bad = try common.makeStrings(.string, allocator, &.{"x"});
+    defer bad.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("cast", &.{.{ .array = bad }}, to(half_type)));
+    try common.expectInvokeWith(f16, &ctx, "cast", &.{.{ .scalar = common.scalarOf(f64, 2.5) }}, to(half_type), &.{2.5});
+
+    // Arithmetic and comparisons promote float16 to float32 (also against itself), float64 wins.
+    var g = try common.makeArray(f16, allocator, &.{ 2, 1, 3, -inf16, 1 });
+    defer g.release();
+    const hg = [_]Datum{ .{ .array = h }, .{ .array = g } };
+    try common.expectInvokeWith(f32, &ctx, "add", &hg, common.none, &.{ 3.5, null, 65507, std.math.nan(f32), std.math.nan(f32) });
+    try common.expectInvokeWith(bool, &ctx, "less", &hg, common.none, &.{ true, null, false, false, false });
+    try common.expectInvokeWith(bool, &ctx, "equal", &.{ .{ .array = g }, .{ .scalar = common.scalarOf(i32, 1) } }, common.none, &.{ false, true, false, false, true });
+    var f64s = try common.makeArray(f64, allocator, &.{ 0.25, 0, 0, 0, 0 });
+    defer f64s.release();
+    try common.expectInvokeWith(f64, &ctx, "multiply", &.{ .{ .array = g }, .{ .array = f64s } }, common.none, &.{ 0.5, 0, 0, std.math.nan(f64), 0 });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expect((try registry.resolveResultType("add", .scalar, &hg, common.none)).eql(.{ .float = {} }));
+
+    try common.expectInvokeWith(bool, &ctx, "is_nan", &dh, common.none, &.{ false, null, false, false, true });
+    try common.expectInvokeWith(bool, &ctx, "is_inf", &dh, common.none, &.{ false, null, false, true, false });
+    try common.expectInvokeWith(bool, &ctx, "is_finite", &dh, common.none, &.{ true, null, true, false, false });
+    try common.expectInvokeWith(bool, &ctx, "is_null", &dh, .{ .null_options = .{ .nan_is_null = true } }, &.{ false, true, false, false, true });
+    // Selections already handle the 2-byte layout.
+    var taken = try common.core.datumTake(.{ .array = h }, &.{ 4, 0 });
+    defer taken.release();
+    const trows = try common.collect(f16, allocator, taken);
+    defer allocator.free(trows);
+    try common.expectRows(f16, &.{ nan16, 1.5 }, trows);
+}

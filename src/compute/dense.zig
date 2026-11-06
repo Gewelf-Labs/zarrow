@@ -169,6 +169,7 @@ pub fn dataTypeOf(comptime T: type) DataType {
         u64 => .{ .uint64 = {} },
         f32 => .{ .float = {} },
         f64 => .{ .double = {} },
+        f16 => .{ .half_float = {} },
         else => @compileError("no Arrow type for " ++ @typeName(T)),
     };
 }
@@ -424,6 +425,20 @@ pub fn structTypeAlloc(allocator: std.mem.Allocator, names: []const []const u8, 
 /// struct over a type known only at run time (decimal min_max, value_counts, pivot_wider).
 /// `validity` (taken over) may be null.
 pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    return structArrayImpl(allocator, names, null, children, len, validity);
+}
+
+/// `structArray` with the fields of `template` (name, nullability and metadata copied; field
+/// `i` has the type of `children[i]`): a map's entries child, whose fields must equal the
+/// map type's key and item fields.
+pub fn structArrayFields(allocator: std.mem.Allocator, template: []const datatype.Field, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    var names: [2][]const u8 = undefined;
+    std.debug.assert(template.len <= names.len);
+    for (names[0..template.len], template) |*n, f| n.* = f.name;
+    return structArrayImpl(allocator, names[0..template.len], template, children, len, validity);
+}
+
+fn structArrayImpl(allocator: std.mem.Allocator, names: []const []const u8, template: ?[]const datatype.Field, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
     std.debug.assert(names.len == children.len);
     var v = validity;
     var kids_owned = true;
@@ -447,6 +462,10 @@ pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, chil
         f.* = .{ .name = owner.names[name_at..][0..n.len], .data_type = t };
         name_at += n.len;
     }
+    if (template) |tf| for (owner.fields, tf) |*f, src| {
+        f.nullable = src.nullable;
+        f.metadata = src.metadata;
+    };
     const kids = allocator.dupe(ArrayRef, children) catch return error.OutOfMemory;
     errdefer allocator.free(kids);
     const buffers = allocator.alloc(SharedBuffer, 1) catch return error.OutOfMemory;
@@ -548,7 +567,14 @@ pub fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
             s.payload = arr.retain();
             return s;
         },
-        .struct_, .list => return Scalar.initNested(data.data_type, arr),
+        .fixed_size_binary => |f| {
+            const w = std.math.cast(usize, f.byte_width) orelse return error.InvalidInput;
+            if (data.buffers.len < 2 or data.buffers[1].data.len < (data.offset + 1) * w) return error.InvalidInput;
+            var s = Scalar.init(data.data_type, .{ .binary = data.buffers[1].data[data.offset * w ..][0..w] });
+            s.payload = arr.retain();
+            return s;
+        },
+        .struct_, .list, .large_list, .fixed_size_list => return Scalar.initNested(data.data_type, arr),
         inline .date32, .date64, .timestamp, .time32, .time64, .duration, .interval_months, .interval_day_time, .interval_month_day_nano, .decimal32, .decimal64, .decimal128, .decimal256 => |_, tag| {
             const T = switch (tag) {
                 .date32, .time32, .interval_months, .decimal32 => i32,
@@ -561,7 +587,7 @@ pub fn scalarAt0(arr: ArrayRef) KernelError!Scalar {
         },
         else => {},
     }
-    inline for (numeric_types) |T| {
+    inline for (numeric_types ++ [_]type{f16}) |T| {
         if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dataTypeOf(T))) {
             const values = (PrimitiveArray(T){ .data = data }).values() catch return error.InvalidInput;
             return Scalar.init(data.data_type, scalarValueOf(T, values[0]));
@@ -610,6 +636,7 @@ pub fn chunkArray(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!A
         .uint16 => .u16,
         .uint32 => .u32,
         .uint64 => .u64,
+        .half_float => .f16,
         .float => .f32,
         .double => .f64,
         .date32 => .date32,
@@ -627,7 +654,7 @@ pub fn chunkArray(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!A
     if (std.meta.activeTag(s.value) != expected) return error.InvalidInput;
     var values_buf = OwnedBuffer.init(allocator, width) catch return error.OutOfMemory;
     switch (s.value) {
-        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .date32, .date64, .timestamp, .time32, .time64, .duration, .decimal32, .decimal64, .decimal128, .decimal256 => |x| @memcpy(values_buf.data[0..width], std.mem.asBytes(&x)),
+        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f16, .f32, .f64, .date32, .date64, .timestamp, .time32, .time64, .duration, .decimal32, .decimal64, .decimal128, .decimal256 => |x| @memcpy(values_buf.data[0..width], std.mem.asBytes(&x)),
         else => unreachable,
     }
     return finishFixed(allocator, s.data_type, 1, &values_buf, null);

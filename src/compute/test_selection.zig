@@ -1,4 +1,5 @@
-//! coalesce, if_else, case_when, choose, drop_null, fill_null_forward and fill_null_backward.
+//! coalesce, if_else, case_when, choose, drop_null, fill_null_forward, fill_null_backward,
+//! replace_with_mask, scatter and inverse_permutation.
 //! Expected values are pyarrow 26 results.
 const std = @import("std");
 const common = @import("test_common.zig");
@@ -326,4 +327,199 @@ test "selection errors: case_when null struct rows, choose index out of range, s
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("coalesce", &.{ .{ .array = malformed }, .{ .array = x } }, none));
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("drop_null", &.{.{ .array = malformed }}, none));
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("fill_null_forward", &.{.{ .array = malformed }}, none));
+}
+
+/// Invoke vector function `name` with `options`; every array part passes validateFull; compare
+/// the rows (of storage `T`) with `expected`.
+fn expectVector(comptime T: type, ctx: *ExecContext, name: []const u8, args: []const Datum, options: common.Options, expected: []const ?T) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invokeVector(name, args, options);
+    defer out.release();
+    switch (out) {
+        .array => |a| try a.data().validateFull(),
+        .chunked => |c| for (c.chunks()) |p| try p.data().validateFull(),
+        else => return error.TestUnexpectedResult,
+    }
+    const rows = try common.collect(T, allocator, out);
+    defer allocator.free(rows);
+    try common.expectRows(T, expected, rows);
+}
+
+test "replace_with_mask, scatter and inverse_permutation hand-written values (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var v = try common.makeArray(i64, allocator, &.{ 1, 2, null, 4, 5 });
+    defer v.release();
+    var m = try common.makeArray(bool, allocator, &.{ true, false, null, true, false });
+    defer m.release();
+    var r2 = try common.makeArray(i64, allocator, &.{ 10, 20 });
+    defer r2.release();
+    var r3 = try common.makeArray(i64, allocator, &.{ 10, null, 30 });
+    defer r3.release();
+    var r1 = try common.makeArray(i64, allocator, &.{10});
+    defer r1.release();
+    const dv: Datum = .{ .array = v };
+    const dm: Datum = .{ .array = m };
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, dm, .{ .array = r2 } }, none, &.{ 10, 2, null, 20, 5 });
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, dm, .{ .array = r3 } }, none, &.{ 10, 2, null, null, 5 });
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("replace_with_mask", &.{ dv, dm, .{ .array = r1 } }, none));
+    const seven: Datum = .{ .scalar = common.scalarOf(i64, 7) };
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, dm, seven }, none, &.{ 7, 2, null, 7, 5 });
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, .{ .scalar = common.scalarOf(bool, true) }, seven }, none, &.{ 7, 7, 7, 7, 7 });
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, .{ .scalar = common.scalarOf(bool, null) }, seven }, none, &.{ null, null, null, null, null });
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, .{ .scalar = common.scalarOf(bool, false) }, .{ .array = r1 } }, none, &.{ 1, 2, null, 4, 5 });
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ dv, dm, .{ .scalar = common.scalarOf(i64, null) } }, none, &.{ null, 2, null, null, 5 });
+    // Chunked values (a chunked result), sliced inputs, strings (the generic path) and bool.
+    var vc = try common.chunkedAt(allocator, v, &.{2});
+    defer vc.release();
+    var chunked_out = try ctx.invokeVector("replace_with_mask", &.{ .{ .chunked = vc }, dm, .{ .array = r2 } }, none);
+    defer chunked_out.release();
+    try std.testing.expect(chunked_out == .chunked);
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ .{ .chunked = vc }, dm, .{ .array = r2 } }, none, &.{ 10, 2, null, 20, 5 });
+    var vs = try v.slice(1, 3);
+    defer vs.release();
+    var ms = try m.slice(2, 3);
+    defer ms.release();
+    try expectVector(i64, &ctx, "replace_with_mask", &.{ .{ .array = vs }, .{ .array = ms }, .{ .array = r3 } }, none, &.{ null, 10, 4 });
+    var s = try common.makeStrings(.string_view, allocator, &.{ "a", "b", null });
+    defer s.release();
+    var sr = try common.makeStrings(.string_view, allocator, &.{ "x", "a long replacement string" });
+    defer sr.release();
+    var sm = try common.makeArray(bool, allocator, &.{ true, true, false });
+    defer sm.release();
+    var so = try ctx.invokeVector("replace_with_mask", &.{ .{ .array = s }, .{ .array = sm }, .{ .array = sr } }, none);
+    defer so.release();
+    try so.array.data().validateFull();
+    const srows = try common.collectStrings(allocator, so);
+    defer allocator.free(srows);
+    try common.expectStrings(&.{ "x", "a long replacement string", null }, srows);
+    var bv = try common.makeArray(bool, allocator, &.{ true, null });
+    defer bv.release();
+    var br = try common.makeArray(bool, allocator, &.{ false, null });
+    defer br.release();
+    var bm = try common.makeArray(bool, allocator, &.{ true, true });
+    defer bm.release();
+    try expectVector(bool, &ctx, "replace_with_mask", &.{ .{ .array = bv }, .{ .array = bm }, .{ .array = br } }, none, &.{ false, null });
+    // A mask of another length, a chunked mask or replacement, another replacement type.
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("replace_with_mask", &.{ dv, .{ .array = bm }, .{ .array = r2 } }, none));
+    var mc = try common.chunkedAt(allocator, m, &.{1});
+    defer mc.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("replace_with_mask", &.{ dv, .{ .chunked = mc }, .{ .array = r2 } }, none));
+    var r8 = try common.makeArray(i8, allocator, &.{ 1, 2 });
+    defer r8.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("replace_with_mask", &.{ dv, dm, .{ .array = r8 } }, none));
+
+    // scatter: a later row wins on a repeated index, a null index drops its row.
+    var sv = try common.makeArray(i64, allocator, &.{ 10, 20, 30 });
+    defer sv.release();
+    const dsv: Datum = .{ .array = sv };
+    for ([_][3]?i32{ .{ 2, 0, 1 }, .{ 2, 0, null }, .{ 2, 0, 2 } }, [_][3]?i64{ .{ 20, 30, 10 }, .{ 20, null, 10 }, .{ 20, null, 30 } }) |ix, want| {
+        var idx = try common.makeArray(i32, allocator, &ix);
+        defer idx.release();
+        try expectVector(i64, &ctx, "scatter", &.{ dsv, .{ .array = idx } }, none, &want);
+    }
+    var perm = try common.makeArray(i8, allocator, &.{ 2, 0, 1 });
+    defer perm.release();
+    try expectVector(i64, &ctx, "scatter", &.{ dsv, .{ .array = perm } }, .{ .scatter = .{ .max_index = 5 } }, &.{ 20, 30, 10, null, null, null });
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("scatter", &.{ dsv, .{ .array = perm } }, .{ .scatter = .{ .max_index = 1 } }));
+    var bad = try common.makeArray(i64, allocator, &.{ 5, 0, 1 });
+    defer bad.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("scatter", &.{ dsv, .{ .array = bad } }, none));
+    var neg = try common.makeArray(i64, allocator, &.{ -1, 0, 1 });
+    defer neg.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("scatter", &.{ dsv, .{ .array = neg } }, none));
+    var short = try common.makeArray(i64, allocator, &.{ 1, 0 });
+    defer short.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("scatter", &.{ dsv, .{ .array = short } }, none));
+    var unsigned = try common.makeArray(u8, allocator, &.{ 1, 0, 2 });
+    defer unsigned.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("scatter", &.{ dsv, .{ .array = unsigned } }, none));
+    // A hostile max_index past max(length, 2^24) is refused before any allocation.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("scatter", &.{ dsv, .{ .array = perm } }, .{ .scatter = .{ .max_index = 1 << 40 } }));
+    // Chunked values and indices with other boundaries; strings.
+    var svc = try common.chunkedAt(allocator, sv, &.{1});
+    defer svc.release();
+    var pc = try common.chunkedAt(allocator, perm, &.{2});
+    defer pc.release();
+    try expectVector(i64, &ctx, "scatter", &.{ .{ .chunked = svc }, .{ .chunked = pc } }, none, &.{ 20, 30, 10 });
+    var strs = try common.makeStrings(.string, allocator, &.{ "a", null, "c" });
+    defer strs.release();
+    var so2 = try ctx.invokeVector("scatter", &.{ .{ .array = strs }, .{ .array = perm } }, none);
+    defer so2.release();
+    const s2rows = try common.collectStrings(allocator, so2);
+    defer allocator.free(s2rows);
+    try common.expectStrings(&.{ null, "c", "a" }, s2rows);
+
+    // inverse_permutation.
+    var p3 = try common.makeArray(i64, allocator, &.{ 2, 0, 1 });
+    defer p3.release();
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .array = p3 }}, none, &.{ 1, 2, 0 });
+    var pn = try common.makeArray(i64, allocator, &.{ 2, 0, null });
+    defer pn.release();
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .array = pn }}, none, &.{ 1, null, 0 });
+    var pd = try common.makeArray(i64, allocator, &.{ 2, 0, 2 });
+    defer pd.release();
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .array = pd }}, none, &.{ 1, null, 2 });
+    var p2 = try common.makeArray(i64, allocator, &.{ 1, 0 });
+    defer p2.release();
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .array = p2 }}, .{ .inverse_permutation = .{ .max_index = 4 } }, &.{ 1, 0, null, null, null });
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("inverse_permutation", &.{.{ .array = p2 }}, .{ .inverse_permutation = .{ .max_index = 0 } }));
+    try expectVector(i8, &ctx, "inverse_permutation", &.{.{ .array = p2 }}, .{ .inverse_permutation = .{ .output_type = .{ .int8 = {} } } }, &.{ 1, 0 });
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("inverse_permutation", &.{.{ .array = p2 }}, .{ .inverse_permutation = .{ .output_type = .{ .uint8 = {} } } }));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("inverse_permutation", &.{.{ .array = bad }}, none));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("inverse_permutation", &.{.{ .array = neg }}, none));
+    const many = try allocator.alloc(?i64, 128);
+    defer allocator.free(many);
+    for (many, 0..) |*x, i| x.* = @intCast(i);
+    var p128 = try common.makeArray(i64, allocator, many);
+    defer p128.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("inverse_permutation", &.{.{ .array = p128 }}, .{ .inverse_permutation = .{ .output_type = .{ .int8 = {} } } }));
+    var p3c = try common.chunkedAt(allocator, p3, &.{1});
+    defer p3c.release();
+    var ic = try ctx.invokeVector("inverse_permutation", &.{.{ .chunked = p3c }}, none);
+    defer ic.release();
+    try std.testing.expect(ic == .chunked);
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .chunked = p3c }}, none, &.{ 1, 2, 0 });
+    var empty = try p3.slice(0, 0);
+    defer empty.release();
+    try expectVector(i64, &ctx, "inverse_permutation", &.{.{ .array = empty }}, none, &.{});
+}
+
+test "indices_nonzero on numbers, bool, floats and decimals, sliced, chunked and scalar (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var i = try common.makeArray(i64, allocator, &.{ 0, 1, null, -2, 0 });
+    defer i.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = i }}, none, &.{ 1, 3 });
+    var b = try common.makeArray(bool, allocator, &.{ true, false, null, true, true, false, false, false, false, true });
+    defer b.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = b }}, none, &.{ 0, 3, 4, 9 });
+    var bs = try b.slice(3, 6);
+    defer bs.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = bs }}, none, &.{ 0, 1 });
+    var f = try common.makeArray(f64, allocator, &.{ 0.0, -0.0, std.math.nan(f64), null, 1.5 });
+    defer f.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = f }}, none, &.{ 2, 4 });
+    var d = try common.makeTyped(i128, .{ .decimal128 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 0, 150, null });
+    defer d.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = d }}, none, &.{1});
+    var d32 = try common.makeTyped(i32, .{ .decimal32 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 7, 0 });
+    defer d32.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .array = d32 }}, none, &.{0});
+    var u = try common.makeArray(u8, allocator, &.{ 0, 3, 0, 1, 2 });
+    defer u.release();
+    var uc = try common.chunkedAt(allocator, u, &.{ 2, 3 });
+    defer uc.release();
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .chunked = uc }}, none, &.{ 1, 3, 4 });
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .scalar = common.scalarOf(i32, 1) }}, none, &.{0});
+    try expectVector(u64, &ctx, "indices_nonzero", &.{.{ .scalar = common.scalarOf(i32, null) }}, none, &.{});
+    var s = try common.makeStrings(.string, allocator, &.{"a"});
+    defer s.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("indices_nonzero", &.{.{ .array = s }}, none));
 }

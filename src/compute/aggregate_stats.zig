@@ -66,13 +66,14 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         const check = comptime dense.argsOfType(if (T == i128) .decimal128 else .decimal256, 1);
         try basic.add(registry, "product", 1, check, basic.scalarAggregateOptions, ProductDecimal(T));
     }
-    inline for (dense.numeric_types ++ [_]type{ i128, i256 }) |T| {
-        const tag = comptime if (T == i128) .decimal128 else if (T == i256) .decimal256 else std.meta.activeTag(dense.dataTypeOf(T));
-        const check = comptime dense.argsOfType(tag, 1);
-        try basic.add(registry, "variance", 1, check, varianceOptions, Moments(T, .variance));
-        try basic.add(registry, "stddev", 1, check, varianceOptions, Moments(T, .stddev));
-        try basic.add(registry, "skew", 1, check, skewOptions, Moments(T, .skew));
-        try basic.add(registry, "kurtosis", 1, check, skewOptions, Moments(T, .kurtosis));
+    inline for (moment_types) |pair| {
+        const T = pair[0];
+        const check = comptime dense.argsOfType(pair[1], 1);
+        const dec = comptime (pair[1] == .decimal32 or pair[1] == .decimal64 or pair[1] == .decimal128 or pair[1] == .decimal256);
+        try basic.add(registry, "variance", 1, check, varianceOptions, Moments(T, dec, .variance));
+        try basic.add(registry, "stddev", 1, check, varianceOptions, Moments(T, dec, .stddev));
+        try basic.add(registry, "skew", 1, check, skewOptions, Moments(T, dec, .skew));
+        try basic.add(registry, "kurtosis", 1, check, skewOptions, Moments(T, dec, .kurtosis));
     }
     try basic.add(registry, "first", 1, firstLastArg, basic.scalarAggregateOptions, FirstLast(.first));
     try basic.add(registry, "last", 1, firstLastArg, basic.scalarAggregateOptions, FirstLast(.last));
@@ -93,6 +94,18 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         .exec = quantile,
     });
 }
+
+/// Storage and type tag of every input of variance, stddev, skew and kurtosis (and their hash_
+/// forms): the numbers and decimal32..decimal256.
+pub const moment_types = blk: {
+    var out: [dense.numeric_types.len + 4]struct { type, std.meta.Tag(DataType) } = undefined;
+    for (dense.numeric_types, 0..) |T, i| out[i] = .{ T, std.meta.activeTag(dense.dataTypeOf(T)) };
+    out[dense.numeric_types.len] = .{ i32, .decimal32 };
+    out[dense.numeric_types.len + 1] = .{ i64, .decimal64 };
+    out[dense.numeric_types.len + 2] = .{ i128, .decimal128 };
+    out[dense.numeric_types.len + 3] = .{ i256, .decimal256 };
+    break :blk out;
+};
 
 fn varianceOptions(options: Options) bool {
     return options == .none or options == .variance;
@@ -262,10 +275,9 @@ pub const MomentSums = struct {
 
     /// The moments of the valid rows of a chunk read as f64 (two passes: the mean, then the
     /// central sums; `level` 4 also sums the third and fourth powers).
-    pub fn ofChunk(comptime T: type, data: *const ArrayData, scale: i32, comptime level: u8) KernelError!MomentSums {
+    pub fn ofChunk(comptime T: type, comptime is_dec: bool, data: *const ArrayData, scale: i32, comptime level: u8) KernelError!MomentSums {
         const vals = try basic.values(T, data);
         const bits = dense.validityBits(data);
-        const is_dec = T == i128 or T == i256;
         const is_float = @typeInfo(T) == .float;
         var sum: f64 = 0;
         var n: u64 = 0;
@@ -361,8 +373,7 @@ pub fn momentResult(comptime kind: MomentKind, m: MomentSums, nulls: u64, option
     }
 }
 
-fn Moments(comptime T: type, comptime kind: MomentKind) type {
-    const is_dec = T == i128 or T == i256;
+fn Moments(comptime T: type, comptime is_dec: bool, comptime kind: MomentKind) type {
     const level: u8 = if (kind == .skew or kind == .kurtosis) 4 else 2;
     return struct {
         pub const State = struct { m: MomentSums = .{}, nulls: u64 = 0 };
@@ -370,7 +381,7 @@ fn Moments(comptime T: type, comptime kind: MomentKind) type {
 
         pub fn update(state: *State, data: *const ArrayData) KernelError!void {
             const scale: i32 = if (is_dec) (try decimal.checkedParams(data.data_type)).scale else 0;
-            const m = try MomentSums.ofChunk(T, data, scale, level);
+            const m = try MomentSums.ofChunk(T, is_dec, data, scale, level);
             state.m = MomentSums.merge(state.m, m);
             state.nulls += data.length - m.n;
         }
@@ -381,7 +392,7 @@ fn Moments(comptime T: type, comptime kind: MomentKind) type {
                 return;
             }
             const x: f64 = if (is_dec)
-                decimal.toFloatValue(f64, try decimal.scalarInt(T, s), (try decimal.checkedParams(s.data_type)).scale)
+                decimal.toFloatValue(f64, try decimal.scalarInt(i256, s), (try decimal.checkedParams(s.data_type)).scale)
             else if (@typeInfo(T) == .float) @floatCast(try dense.scalarAs(T, s)) else @floatFromInt(try dense.scalarAs(T, s));
             state.m = MomentSums.merge(state.m, MomentSums.of(x));
         }

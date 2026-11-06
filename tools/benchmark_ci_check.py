@@ -79,6 +79,12 @@ EXPECTED_BENCHES = {
     "compute_partition_nth_int32",
     "compute_select_k_int32",
     "compute_tdigest_float64",
+    "compute_min_max_string",
+    "compute_cumulative_sum_int64",
+    "compute_pairwise_diff_int64",
+    "compute_replace_with_mask_int32",
+    "compute_cast_list_int32_to_int64",
+    "compute_indices_nonzero",
 }
 
 

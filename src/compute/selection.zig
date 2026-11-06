@@ -1,6 +1,7 @@
 //! Selecting, multiplexing and null replacement (Arrow C++ "Selecting / multiplexing", "Replace
 //! functions", "Selections"): coalesce, if_else, case_when, choose (scalar functions),
-//! drop_null, fill_null_forward and fill_null_backward (vector functions).
+//! drop_null, fill_null_forward, fill_null_backward, replace_with_mask, scatter,
+//! inverse_permutation and indices_nonzero (vector functions).
 //!
 //! - coalesce(v0, v1, ...): per row the first valid value (null when none is).
 //! - if_else(cond, a, b): `a` where cond is true, `b` where false, null where cond is null.
@@ -23,6 +24,10 @@
 //!   valid value (across chunk boundaries, as Arrow), leading / trailing nulls stay null; a
 //!   scalar comes back as is. Every type.
 //!
+//! - replace_with_mask(values, mask, replacements), scatter(values, indices) (`ScatterOptions`)
+//!   and inverse_permutation(indices) (`InversePermutationOptions`): see their functions below;
+//!   indices are bounds-checked before any write and option-driven output lengths are capped.
+//!
 //! Inputs pass `validateLayout` before any buffer is read.
 const std = @import("std");
 const core = @import("core.zig");
@@ -43,6 +48,7 @@ const Options = core.Options;
 const Scalar = core.Scalar;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
 const ArrayData = @import("../array/array_data.zig").ArrayData;
+const OwnedBuffer = @import("../buffer.zig").OwnedBuffer;
 
 const Kind = enum { coalesce, if_else, case_when, choose };
 
@@ -75,6 +81,22 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             .exec = FillNull(std.mem.eql(u8, name, "fill_null_forward")).exec,
         });
     }
+    try registry.registerVectorKernel("replace_with_mask", .{
+        .signature = .{ .arity = 3, .type_check = replaceArgs, .options_check = dense.noOptions },
+        .exec = replaceWithMask,
+    });
+    try registry.registerVectorKernel("scatter", .{
+        .signature = .{ .arity = 2, .type_check = scatterArgs, .options_check = scatterOptions },
+        .exec = scatterExec,
+    });
+    try registry.registerVectorKernel("indices_nonzero", .{
+        .signature = .{ .arity = 1, .type_check = nonzeroArg, .options_check = dense.noOptions, .result_type_fn = dense.resultTypeOf(.{ .uint64 = {} }) },
+        .exec = indicesNonzero,
+    });
+    try registry.registerVectorKernel("inverse_permutation", .{
+        .signature = .{ .arity = 1, .type_check = inverseArgs, .options_check = inverseOptions, .result_type_fn = inverseType },
+        .exec = inverseExec,
+    });
 }
 
 fn notScalar(args: []const Datum) bool {
@@ -458,4 +480,458 @@ fn FillNull(comptime forward: bool) type {
             return core.datumTakeNullable(args[0], indices);
         }
     };
+}
+
+// ------------------------------------------------------------------------------ replace_with_mask, scatter, inverse_permutation
+
+fn isSignedInt(dt: DataType) bool {
+    return switch (dt) {
+        .int8, .int16, .int32, .int64 => true,
+        else => false,
+    };
+}
+
+fn replaceArgs(args: []const Datum) bool {
+    return args.len == 3 and args[0] != .scalar and !args[0].isTabular() and args[1].dataType() == .bool and
+        !args[1].isTabular() and !args[2].isTabular() and args[2].dataType().eql(args[0].dataType());
+}
+
+fn scatterArgs(args: []const Datum) bool {
+    return args.len == 2 and args[0] != .scalar and !args[0].isTabular() and args[1] != .scalar and !args[1].isTabular() and isSignedInt(args[1].dataType());
+}
+
+fn inverseArgs(args: []const Datum) bool {
+    return args.len == 1 and args[0] != .scalar and !args[0].isTabular() and isSignedInt(args[0].dataType());
+}
+
+fn scatterOptions(options: Options) bool {
+    return options == .none or options == .scatter;
+}
+
+fn inverseOptions(options: Options) bool {
+    return options == .none or options == .inverse_permutation;
+}
+
+fn inverseType(args: []const Datum, options: Options) KernelError!DataType {
+    if (args.len != 1) return error.InvalidArity;
+    if (options == .inverse_permutation) if (options.inverse_permutation.output_type) |t| return t;
+    return args[0].dataType();
+}
+
+/// The rows of an array or chunked datum as one validated array (chunks concatenated).
+fn wholeArray(allocator: std.mem.Allocator, datum: Datum) KernelError!ArrayRef {
+    const parts: []const ArrayRef = switch (datum) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        else => return error.InvalidInput,
+    };
+    for (parts) |p| p.data().validateLayout() catch return error.InvalidInput;
+    if (parts.len == 1) return parts[0].retain();
+    if (parts.len == 0) return dense.nullArray(allocator, datum.dataType(), 0);
+    return concat.concatArrayRefs(allocator, datum.dataType(), parts) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+}
+
+/// `arr` as a datum of the kind of `like`: a chunked array of one chunk when `like` is chunked.
+fn likeInput(allocator: std.mem.Allocator, like: Datum, arr: ArrayRef) KernelError!Datum {
+    if (like != .chunked) return .{ .array = arr };
+    var a = arr;
+    defer a.release();
+    const out = ChunkedArray.init(allocator, a.data().data_type, &.{a}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    return .{ .chunked = out };
+}
+
+/// One mask row: null, false or true.
+const MaskRow = enum(u2) { null, false, true };
+
+const Mask = union(enum) {
+    scalar: MaskRow,
+    array: struct { values: []const u8, validity: ?[]const u8, offset: usize },
+
+    inline fn at(self: Mask, i: usize) MaskRow {
+        return switch (self) {
+            .scalar => |m| m,
+            .array => |a| if (a.validity) |v| (if (!bitmap.bitIsSet(v, a.offset + i)) .null else if (bitmap.bitIsSet(a.values, a.offset + i)) .true else .false) else if (bitmap.bitIsSet(a.values, a.offset + i)) .true else .false,
+        };
+    }
+};
+
+/// replace_with_mask(values, mask, replacements): each row whose mask is true takes the next
+/// replacement (an array, consumed in order, or a scalar), a null mask row gives null, a false
+/// one keeps the value (Arrow C++). The mask is a bool array of the values' length or a bool
+/// scalar; an array of replacements needs at least as many rows as true mask rows
+/// (`InvalidInput`, Arrow's Invalid); a chunked mask or replacement is `InvalidInput`, as Arrow.
+/// Every layout the take kernels handle (Arrow lacks nested and view layouts here).
+fn replaceWithMask(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    if (args.len != 3) return error.InvalidArity;
+    if (args[1] == .chunked or args[2] == .chunked) return error.InvalidInput;
+    const allocator = ctx.allocator;
+    var values = try wholeArray(allocator, args[0]);
+    defer values.release();
+    const vd = values.data();
+    const n = vd.length;
+    var trues: usize = 0;
+    const mask: Mask = switch (args[1]) {
+        .scalar => |s| blk: {
+            const m: MaskRow = if (s.isNull()) .null else if (try dense.scalarAs(bool, s)) .true else .false;
+            if (m == .true) trues = n;
+            break :blk .{ .scalar = m };
+        },
+        .array => |a| blk: {
+            const md = a.data();
+            md.validateLayout() catch return error.InvalidInput;
+            if (md.length != n) return error.InvalidInput;
+            const m: Mask = .{ .array = .{ .values = md.buffers[1].data, .validity = dense.validityBits(md), .offset = md.offset } };
+            const vals = dense.Bits.values(md);
+            const valid = dense.Bits.validity(md);
+            for (0..bitmap.byteLength(n)) |j| {
+                var t = vals.byte(j) & valid.byte(j);
+                if (j * 8 + 8 > n) t &= (@as(u8, 1) << @intCast(n - j * 8)) - 1;
+                trues += @popCount(t);
+            }
+            break :blk m;
+        },
+        else => return error.InvalidInput,
+    };
+    var repl = try dense.chunkArray(allocator, switch (args[2]) {
+        .array => |a| .{ .array = a },
+        .scalar => |s| .{ .scalar = s },
+        else => return error.InvalidInput,
+    });
+    defer repl.release();
+    const rd = repl.data();
+    rd.validateLayout() catch return error.InvalidInput;
+    const broadcast = args[2] == .scalar;
+    if (!broadcast and rd.length < trues) return error.InvalidInput;
+    if (!rd.data_type.eql(vd.data_type)) return error.InvalidInput;
+    const out = try replaceFast(allocator, vd, mask, rd, broadcast) orelse try replaceTake(allocator, values, mask, repl, broadcast);
+    return likeInput(allocator, args[0], out);
+}
+
+/// Fixed-width values of 1..32 bytes (numbers, temporal types, decimals, half floats): one pass
+/// writing the values and the validity; null when the type takes the generic path.
+fn replaceFast(allocator: std.mem.Allocator, vd: *const ArrayData, mask: Mask, rd: *const ArrayData, broadcast: bool) KernelError!?ArrayRef {
+    switch (vd.data_type) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .half_float, .float, .double => {},
+        .date32, .date64, .timestamp, .time32, .time64, .duration => {},
+        .interval_months, .interval_day_time, .interval_month_day_nano => {},
+        .decimal32, .decimal64, .decimal128, .decimal256 => {},
+        else => return null,
+    }
+    const bits = vd.data_type.bitWidth() orelse return null;
+    // 16- and 32-byte values as byte arrays: no alignment beyond the buffer's own.
+    inline for (.{ u8, u16, u32, u64, [16]u8, [32]u8 }) |U| if (bits == @bitSizeOf(U)) {
+        return try replaceFixed(U, allocator, vd, mask, rd, broadcast);
+    };
+    return null;
+}
+
+fn replaceFixed(comptime U: type, allocator: std.mem.Allocator, vd: *const ArrayData, mask: Mask, rd: *const ArrayData, broadcast: bool) KernelError!ArrayRef {
+    const n = vd.length;
+    const src = (PrimitiveArray(U){ .data = vd }).values() catch return error.InvalidInput;
+    const rep = (PrimitiveArray(U){ .data = rd }).values() catch return error.InvalidInput;
+    const rep_valid = dense.validityBits(rd);
+    var buf = OwnedBuffer.initUninit(allocator, n * @sizeOf(U)) catch return error.OutOfMemory;
+    var validity = dense.bitsBuffer(allocator, n) catch |err| {
+        buf.deinit();
+        return err;
+    };
+    const out = buf.typedSlice(U)[0..n];
+    const vbits = validity.data[0..bitmap.byteLength(n)];
+    // Mask and value bits 8 rows at a time (a scalar mask is a splat).
+    const mvals: dense.Bits, const mvalid: dense.Bits = switch (mask) {
+        .scalar => |m| .{ dense.Bits.of(m == .true), dense.Bits.of(m != .null) },
+        .array => |a| .{ .{ .bytes = a.values, .offset = a.offset }, if (a.validity) |v| .{ .bytes = v, .offset = a.offset } else .{} },
+    };
+    const svalid = dense.Bits.validity(vd);
+    // Replacement row `k` clamped to the last one: rows past it are never selected.
+    const last = if (rep.len == 0) 0 else rep.len - 1;
+    var k: usize = 0;
+    for (vbits, 0..) |*vb, j| {
+        const mv = mvals.byte(j);
+        const mok = mvalid.byte(j);
+        const take = mv & mok;
+        var ob = ~mv & mok & svalid.byte(j);
+        const base = j * 8;
+        const cnt = @min(8, n - base);
+        if (take == 0 or rep.len == 0) {
+            // (No replacement row means no true row: `trues` bounds the replacements.)
+            @memcpy(out[base..][0..cnt], src[base..][0..cnt]);
+        } else for (0..cnt) |r| {
+            const i = base + r;
+            const t = (take >> @intCast(r)) & 1;
+            const ri = if (broadcast) 0 else @min(k, last);
+            out[i] = if (t != 0) rep[ri] else src[i];
+            const rv: u8 = if (rep_valid) |b| @intFromBool(bitmap.bitIsSet(b, rd.offset + ri)) else 1;
+            ob |= (t & rv) << @intCast(r);
+            k += t;
+        }
+        vb.* = ob;
+    }
+    if (n % 8 != 0) vbits[vbits.len - 1] &= (@as(u8, 1) << @intCast(n % 8)) - 1;
+    var v: ?OwnedBuffer = validity;
+    if (bitmap.countUnsetBit(validity.data, n) == 0) {
+        validity.deinit();
+        v = null;
+    }
+    return dense.finishFixed(allocator, vd.data_type, n, &buf, v);
+}
+
+/// Every other layout: one take over the values followed by the replacements.
+fn replaceTake(allocator: std.mem.Allocator, values: ArrayRef, mask: Mask, repl: ArrayRef, broadcast: bool) KernelError!ArrayRef {
+    const n = values.data().length;
+    var both = concat.concatArrayRefs(allocator, values.data().data_type, &.{ values, repl }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    defer both.release();
+    const indices = allocator.alloc(?usize, n) catch return error.OutOfMemory;
+    defer allocator.free(indices);
+    var k: usize = 0;
+    for (indices, 0..) |*ix, i| ix.* = switch (mask.at(i)) {
+        .null => null,
+        .false => i,
+        .true => blk: {
+            defer k += 1;
+            break :blk n + (if (broadcast) 0 else k);
+        },
+    };
+    var taken = try core.datumTakeNullable(.{ .array = both }, indices);
+    return switch (taken) {
+        .array => |a| a,
+        else => {
+            taken.release();
+            return error.InvalidInput;
+        },
+    };
+}
+
+/// Output rows of scatter / inverse_permutation: `max_index + 1`, or `n` when negative.
+/// Capped at max(n, 2^24) rows so an option cannot force an allocation the input does not
+/// justify (`InvalidOptions`).
+fn outputLength(max_index: i64, n: usize) KernelError!usize {
+    if (max_index < 0) return n;
+    const want = std.math.cast(usize, max_index) orelse return error.InvalidOptions;
+    if (want >= @max(n, @as(usize, 1) << 24)) return error.InvalidOptions;
+    return want + 1;
+}
+
+/// Call `sink.put(position, index)` for every valid row of a signed integer index datum
+/// (array or chunked; every chunk passes `validateLayout`).
+fn eachIndex(datum: Datum, sink: anytype) KernelError!void {
+    const parts: []const ArrayRef = switch (datum) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        else => return error.InvalidInput,
+    };
+    var pos: usize = 0;
+    for (parts) |p| {
+        const d = p.data();
+        d.validateLayout() catch return error.InvalidInput;
+        switch (d.data_type) {
+            inline .int8, .int16, .int32, .int64 => |_, tag| {
+                const I = switch (tag) {
+                    .int8 => i8,
+                    .int16 => i16,
+                    .int32 => i32,
+                    else => i64,
+                };
+                const xs = (PrimitiveArray(I){ .data = d }).values() catch return error.InvalidInput;
+                const bits = dense.validityBits(d);
+                for (xs, 0..) |x, i| {
+                    if (bits) |b| if (!bitmap.bitIsSet(b, d.offset + i)) continue;
+                    try sink.put(pos + i, x);
+                }
+            },
+            else => return error.InvalidInput,
+        }
+        pos += d.length;
+    }
+}
+
+/// scatter(values, indices): output row `indices[i]` takes `values[i]` (a later row wins on a
+/// repeated index; a null index drops its row; rows no index names are null), Arrow C++. The
+/// indices are signed integers of the values' length, each in `[0, length)` (`InvalidInput`,
+/// Arrow's IndexError); `ScatterOptions.max_index` sets the length (see `outputLength`). Every
+/// layout the take kernels handle; a chunked input gives a chunked output.
+fn scatterExec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+    if (args.len != 2) return error.InvalidArity;
+    const n = args[1].length();
+    if (args[0].length() != n) return error.InvalidInput;
+    const max_index: i64 = if (options == .scatter) options.scatter.max_index else -1;
+    const out_len = try outputLength(max_index, n);
+    const src = ctx.allocator.alloc(?usize, out_len) catch return error.OutOfMemory;
+    defer ctx.allocator.free(src);
+    @memset(src, null);
+    const Sink = struct {
+        src: []?usize,
+        fn put(self: @This(), pos: usize, idx: anytype) KernelError!void {
+            const at = std.math.cast(usize, idx) orelse return error.InvalidInput;
+            if (at >= self.src.len) return error.InvalidInput;
+            self.src[at] = pos;
+        }
+    };
+    try eachIndex(args[1], Sink{ .src = src });
+    switch (args[0]) {
+        .array => |a| a.data().validateLayout() catch return error.InvalidInput,
+        .chunked => |c| for (c.chunks()) |p| p.data().validateLayout() catch return error.InvalidInput,
+        else => return error.InvalidInput,
+    }
+    return core.datumTakeNullable(args[0], src);
+}
+
+/// inverse_permutation(indices): output row `indices[i]` is `i` (a later row wins; null
+/// indices are skipped; rows no index names are null), Arrow C++. Signed integer indices,
+/// each in `[0, length)` (`InvalidInput`); the output type (`InversePermutationOptions.
+/// output_type`, else the index type) is a signed integer type holding the input length
+/// (another type is `InvalidOptions`, a length past its maximum `InvalidInput`, as Arrow).
+fn inverseExec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+    if (args.len != 1) return error.InvalidArity;
+    const out_type = try inverseType(args, options);
+    const n = args[0].length();
+    const max_index: i64 = if (options == .inverse_permutation) options.inverse_permutation.max_index else -1;
+    const out_len = try outputLength(max_index, n);
+    const arr = switch (out_type) {
+        inline .int8, .int16, .int32, .int64 => |_, tag| blk: {
+            const O = switch (tag) {
+                .int8 => i8,
+                .int16 => i16,
+                .int32 => i32,
+                else => i64,
+            };
+            if (n > std.math.maxInt(O)) return error.InvalidInput;
+            break :blk try inverseInto(O, ctx.allocator, args[0], out_type, out_len);
+        },
+        else => return error.InvalidOptions,
+    };
+    return likeInput(ctx.allocator, args[0], arr);
+}
+
+fn inverseInto(comptime O: type, allocator: std.mem.Allocator, indices: Datum, out_type: DataType, out_len: usize) KernelError!ArrayRef {
+    var buf = OwnedBuffer.init(allocator, out_len * @sizeOf(O)) catch return error.OutOfMemory;
+    var validity = dense.bitsBuffer(allocator, out_len) catch |err| {
+        buf.deinit();
+        return err;
+    };
+    @memset(validity.data[0..bitmap.byteLength(out_len)], 0);
+    const Sink = struct {
+        out: []O,
+        valid: []u8,
+        fn put(self: @This(), pos: usize, idx: anytype) KernelError!void {
+            const at = std.math.cast(usize, idx) orelse return error.InvalidInput;
+            if (at >= self.out.len) return error.InvalidInput;
+            self.out[at] = @intCast(pos);
+            bitmap.setBit(self.valid, at);
+        }
+    };
+    eachIndex(indices, Sink{ .out = buf.typedSlice(O)[0..out_len], .valid = validity.data }) catch |err| {
+        buf.deinit();
+        validity.deinit();
+        return err;
+    };
+    var v: ?OwnedBuffer = validity;
+    if (bitmap.countUnsetBit(validity.data, out_len) == 0) {
+        validity.deinit();
+        v = null;
+    }
+    return dense.finishFixed(allocator, out_type, out_len, &buf, v);
+}
+
+// ------------------------------------------------------------------------------ indices_nonzero
+
+fn nonzeroArg(args: []const Datum) bool {
+    if (args.len != 1 or args[0].isTabular()) return false;
+    return switch (args[0].dataType()) {
+        .bool, .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => true,
+        .decimal32, .decimal64, .decimal128, .decimal256 => true,
+        else => false,
+    };
+}
+
+/// indices_nonzero: the uint64 positions of the valid rows that are not zero (bool: true; a
+/// float NaN is nonzero, -0.0 is zero) across every chunk, as one array (Arrow C++). Numbers,
+/// bool and decimals (pyarrow 26 has no decimal32 / decimal64 kernel; zarrow takes them too).
+fn indicesNonzero(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    if (args.len != 1) return error.InvalidArity;
+    var scalar_arr: ?ArrayRef = null;
+    defer if (scalar_arr) |*a| a.release();
+    const parts: []const ArrayRef = switch (args[0]) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        .scalar => |s| blk: {
+            scalar_arr = try dense.chunkArray(ctx.allocator, .{ .scalar = s });
+            break :blk @as(*const [1]ArrayRef, &scalar_arr.?)[0..1];
+        },
+        else => return error.InvalidInput,
+    };
+    var total: usize = 0;
+    for (parts) |p| {
+        p.data().validateLayout() catch return error.InvalidInput;
+        total += try nonzeroIn(p.data(), null, 0);
+    }
+    // One slot of slack: the branch-free writer stores past the last index.
+    var buf = OwnedBuffer.initUninit(ctx.allocator, (total + 1) * 8) catch return error.OutOfMemory;
+    const out = buf.typedSlice(u64)[0 .. total + 1];
+    var k: usize = 0;
+    var base: usize = 0;
+    for (parts) |p| {
+        k += nonzeroIn(p.data(), out[k..], base) catch unreachable;
+        base += p.data().length;
+    }
+    return .{ .array = try dense.finishFixed(ctx.allocator, .{ .uint64 = {} }, total, &buf, null) };
+}
+
+/// Count the nonzero valid rows of `d`, writing `base + row` of each into `out` when given
+/// (`out` holds the count plus one).
+fn nonzeroIn(d: *const ArrayData, out: ?[]u64, base: usize) KernelError!usize {
+    const bits = dense.validityBits(d);
+    if (d.data_type == .bool) {
+        const vals = dense.Bits.values(d);
+        const valid = dense.Bits.validity(d);
+        var k: usize = 0;
+        for (0..bitmap.byteLength(d.length)) |j| {
+            var m = vals.byte(j) & valid.byte(j);
+            if (j + 1 == bitmap.byteLength(d.length) and d.length % 8 != 0) m &= (@as(u8, 1) << @as(u3, @intCast(d.length % 8))) - 1;
+            if (out) |o| {
+                while (m != 0) : (m &= m - 1) {
+                    o[k] = base + j * 8 + @ctz(m);
+                    k += 1;
+                }
+            } else k += @popCount(m);
+        }
+        return k;
+    }
+    inline for (.{ i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, i128, i256 }) |T| {
+        const match = if (T == i128) d.data_type == .decimal128 else if (T == i256) d.data_type == .decimal256 else std.meta.activeTag(d.data_type) == (comptime std.meta.activeTag(dense.dataTypeOf(T))) or
+            (T == i32 and d.data_type == .decimal32) or (T == i64 and d.data_type == .decimal64);
+        if (match) {
+            const xs = (PrimitiveArray(T){ .data = d }).values() catch return error.InvalidInput;
+            var k: usize = 0;
+            if (bits) |b| {
+                if (out) |o| {
+                    for (xs, 0..) |x, i| {
+                        o[k] = base + i;
+                        k += @intFromBool(x != 0 and bitmap.bitIsSet(b, d.offset + i));
+                    }
+                } else for (xs, 0..) |x, i| {
+                    k += @intFromBool(x != 0 and bitmap.bitIsSet(b, d.offset + i));
+                }
+            } else if (out) |o| {
+                // Branch-free: every row writes its index, only a nonzero one advances.
+                for (xs, 0..) |x, i| {
+                    o[k] = base + i;
+                    k += @intFromBool(x != 0);
+                }
+            } else for (xs) |x| {
+                k += @intFromBool(x != 0);
+            }
+            return k;
+        }
+    }
+    return error.InvalidInput;
 }

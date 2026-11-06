@@ -437,7 +437,7 @@ pub const FunctionRegistry = struct {
         var float_bits: u8 = 0;
         for (args) |arg| switch (arg.dataType()) {
             .decimal32, .decimal64, .decimal128, .decimal256 => float_bits = 64,
-            .float => float_bits = @max(float_bits, 32),
+            .half_float, .float => float_bits = @max(float_bits, 32),
             .double => float_bits = 64,
             .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => if (integers) {
                 float_bits = 64;
@@ -575,9 +575,11 @@ pub const FunctionRegistry = struct {
 };
 
 /// Arrow's `CommonNumeric` over the argument types: null unless every argument is int8..int64,
-/// uint8..uint64, float32 or float64 and two of them differ. Any float64 gives float64, else any
-/// float32 gives float32; integers of one signedness give the widest; mixed signedness gives the
-/// signed type wider than every unsigned one (uint64 with a signed type gives int64, as in Arrow).
+/// uint8..uint64, float16, float32 or float64 and two of them differ (or one is float16). Any
+/// float64 gives float64, else any float32 or float16 gives float32 (Arrow's `CommonNumeric`:
+/// float16 arithmetic is not implemented, it is promoted to float32, also against itself);
+/// integers of one signedness give the widest; mixed signedness gives the signed type wider than
+/// every unsigned one (uint64 with a signed type gives int64, as in Arrow).
 pub fn commonNumericType(args: []const Datum) ?DataType {
     if (args.len < 2) return null;
     var differ = false;
@@ -588,6 +590,10 @@ pub fn commonNumericType(args: []const Datum) ?DataType {
         const dt = arg.dataType();
         if (!dt.eql(args[0].dataType())) differ = true;
         switch (dt) {
+            .half_float => {
+                float_bits = @max(float_bits, 32);
+                differ = true;
+            },
             .float => float_bits = @max(float_bits, 32),
             .double => float_bits = 64,
             .int8 => signed_bits = @max(signed_bits, 8),
@@ -626,7 +632,7 @@ pub fn commonDecimalFloatType(args: []const Datum) ?DataType {
     var any_float = false;
     for (args) |arg| switch (arg.dataType()) {
         .decimal32, .decimal64, .decimal128, .decimal256 => any_decimal = true,
-        .float, .double => any_float = true,
+        .half_float, .float, .double => any_float = true,
         .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => {},
         else => return null,
     };

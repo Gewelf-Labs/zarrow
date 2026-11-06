@@ -29,4 +29,5 @@ test {
     _ = @import("test_dictionary.zig");
     _ = @import("test_tdigest.zig");
     _ = @import("test_pivot.zig");
+    _ = @import("test_cumulative.zig");
 }

@@ -526,12 +526,15 @@ test "registerAll registers every kernel family function name with its kind" {
         "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
         "and_not_kleene", "sign",
     } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
-        "round", "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
+        "round",  "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
+        "random",
     };
     const vector_names = [_][]const u8{
-        "unique",      "value_counts",  "dictionary_encode",  "drop_null",             "fill_null_forward", "fill_null_backward", "mode",
-        "quantile",    "sort_indices",  "array_sort_indices", "partition_nth_indices", "select_k_unstable", "rank",               "rank_quantile",
-        "rank_normal", "search_sorted",
+        "unique",                 "value_counts",    "dictionary_encode",       "drop_null",             "fill_null_forward",   "fill_null_backward", "mode",
+        "quantile",               "sort_indices",    "array_sort_indices",      "partition_nth_indices", "select_k_unstable",   "rank",               "rank_quantile",
+        "rank_normal",            "search_sorted",   "replace_with_mask",       "scatter",               "inverse_permutation", "indices_nonzero",    "cumulative_sum",
+        "cumulative_sum_checked", "cumulative_prod", "cumulative_prod_checked", "cumulative_min",        "cumulative_max",      "cumulative_mean",    "pairwise_diff",
+        "pairwise_diff_checked",  "winsorize",
     };
     const aggregate_names = [_][]const u8{
         "sum",                "mean",        "min",  "max",      "min_max", "count", "count_all",  "any",            "all",   "product",
@@ -567,7 +570,7 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sign", .scalar));
     try std.testing.expectEqual(@as(usize, 30), registry.kernelCount("less", .scalar));
     try std.testing.expectEqual(@as(usize, 27), registry.kernelCount("min_element_wise", .scalar));
-    try std.testing.expectEqual(@as(usize, 15), registry.kernelCount("is_nan", .scalar));
+    try std.testing.expectEqual(@as(usize, 16), registry.kernelCount("is_nan", .scalar));
     try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("count_all", .aggregate));
     // Implicit numeric casts: binary arithmetic and the comparisons, not negate / abs.
     try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("add_checked", .scalar).?.implicit_cast);
@@ -575,8 +578,9 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(common.core.ImplicitCast.element_wise, registry.findFunction("max_element_wise", .scalar).?.implicit_cast);
     try std.testing.expectEqual(common.core.ImplicitCast.none, registry.findFunction("negate", .scalar).?.implicit_cast);
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("and_kleene", .scalar));
-    // min_max: ten numeric types plus decimal128 / decimal256.
-    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("min_max", .aggregate));
+    // min_max: ten numeric types, decimal128 / decimal256 and one kernel for the ordered
+    // non-numeric types (bool, temporal, decimal32 / decimal64, string / binary layouts).
+    try std.testing.expectEqual(@as(usize, 13), registry.kernelCount("min_max", .aggregate));
     // One cast kernel for every pair; string kernels per string layout (binary_length also for the
     // binary layouts); temporal date parts for date32 / date64 / timestamp, time parts without date32.
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("cast", .scalar));
@@ -621,7 +625,7 @@ test "ExecContext.invoke add works end to end after registerAll" {
     try std.testing.expect((try registry.resolveResultType("less", .scalar, &args, Options.noneValue())) == .bool);
     try std.testing.expect((try registry.resolveResultType("sum", .aggregate, args[0..1], Options.noneValue())) == .int64);
     try std.testing.expect((try registry.resolveResultType("mean", .aggregate, args[0..1], Options.noneValue())) == .double);
-    try std.testing.expectError(error.FunctionNotFound, ctx.invoke("random", .scalar, &args, Options.noneValue()));
+    try std.testing.expectError(error.FunctionNotFound, ctx.invoke("no_such_function", .scalar, &args, Options.noneValue()));
 
     var total = try ctx.invokeAggregate("sum", &.{.{ .array = out.array }}, Options.noneValue());
     defer total.release();

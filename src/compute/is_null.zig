@@ -4,7 +4,7 @@
 //! null); unions and run-end encoded arrays, whose nulls live in their children, are not. is_null
 //! takes `NullOptions`: with `nan_is_null` a float NaN is null too (other types ignore it).
 //!
-//! is_nan, is_finite and is_inf on float32 / float64 (IEEE 754), the integer types, the decimal
+//! is_nan, is_finite and is_inf on float16 / float32 / float64 (IEEE 754), the integer types, the decimal
 //! types (every value finite, none NaN or infinite) and the null type (all null), as in Arrow C++;
 //! null handling is intersection.
 const std = @import("std");
@@ -43,7 +43,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     }
     inline for (comptime std.meta.tags(FloatOp)) |op| {
         inline for (dense.numeric_types) |T| try registerFloatOp(registry, op, comptime std.meta.activeTag(dense.dataTypeOf(T)));
-        inline for (.{ TypeTag.decimal32, TypeTag.decimal64, TypeTag.decimal128, TypeTag.decimal256, TypeTag.null }) |tag| try registerFloatOp(registry, op, tag);
+        inline for (.{ TypeTag.half_float, TypeTag.decimal32, TypeTag.decimal64, TypeTag.decimal128, TypeTag.decimal256, TypeTag.null }) |tag| try registerFloatOp(registry, op, tag);
     }
 }
 
@@ -91,7 +91,7 @@ fn FloatCheck(comptime op: FloatOp) type {
             const bits = out.values();
             @memset(bits, 0);
             switch (dt) {
-                inline .float, .double => |_, tag| switch (try dense.operand(if (tag == .float) f32 else f64, values[0])) {
+                inline .half_float, .float, .double => |_, tag| switch (try dense.operand(if (tag == .half_float) f16 else if (tag == .float) f32 else f64, values[0])) {
                     inline else => |x| for (0..len) |i| {
                         if (test1(dense.at(x, i))) bits[i / 8] |= @as(u8, 1) << @intCast(i % 8);
                     },
@@ -148,6 +148,10 @@ fn Categorize(comptime op: Op) type {
                 const v = values[0];
                 if (!(v == .scalar and v.scalar.isNull())) switch (v.dataType()) {
                     .float => orNanBits(f32, values_buf.data[0..n], v, len) catch |err| {
+                        values_buf.deinit();
+                        return err;
+                    },
+                    .half_float => orNanBits(f16, values_buf.data[0..n], v, len) catch |err| {
                         values_buf.deinit();
                         return err;
                     },

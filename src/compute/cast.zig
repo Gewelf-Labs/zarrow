@@ -8,7 +8,10 @@
 //!   beyond 2^24 / 2^53 cast to float32 / float64 are `InvalidCast`. Unsafe: integers wrap (two's
 //!   complement truncation), floats truncate toward zero and saturate (NaN gives 0; Arrow C++
 //!   leaves that case undefined). float64 to float32 rounds (overflow gives inf) in both modes.
-//!   bool to number gives 0 / 1, number to bool is `x != 0`.
+//!   bool to number gives 0 / 1, number to bool is `x != 0`. float16 takes part as a float of
+//!   11 significant bits: float16 to any number is exact or checked as above, a float to float16
+//!   rounds to nearest even (overflow gives inf, as pyarrow 26), an integer past 2048 to float16 is
+//!   `InvalidCast` when safe (pyarrow 26 rounds it silently).
 //! - numbers and bool to string / large_string / string_view: integers in plain decimal, floats in
 //!   the shortest digits that round-trip (Python `repr` layout without a trailing `.0`: exponent
 //!   form below 1e-4 and from 1e16, `inf`, `-inf`, `nan`), bool as `true` / `false`.
@@ -33,7 +36,12 @@
 //!   dictionary of another index or value type (the values are cast first). The target's
 //!   `value_type` must outlive the result.
 //! - the null type to any type above (all rows null).
-//! - decimals with decimals, integers, floats and text (`decimal.castArray`). Other pairs: `UnsupportedType`.
+//! - decimals with decimals, integers, floats and text (`decimal.castArray`).
+//! - nested types: list, large_list, list_view, large_list_view, fixed_size_list and map to
+//!   list, large_list, list_view, large_list_view and fixed_size_list (a map also to a map), the
+//!   child cast recursively (`castList`); struct to struct by field name (`castStruct`); the null
+//!   type to list, large_list, fixed_size_list, struct and map. A dictionary of a nested type
+//!   decodes, then casts. Other pairs: `UnsupportedType`.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
@@ -44,6 +52,9 @@ const decimal = @import("decimal.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
+const StructArray = @import("../array/struct_array.zig").StructArray;
+const OwnedBuffer = @import("../buffer.zig").OwnedBuffer;
+const SharedBuffer = @import("../buffer.zig").SharedBuffer;
 const ArrayRef = core.ArrayRef;
 const DataType = core.DataType;
 const Datum = core.Datum;
@@ -93,7 +104,7 @@ fn kindOf(dt: DataType) Kind {
     return switch (dt) {
         .null => .null,
         .bool => .boolean,
-        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => .number,
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .half_float, .float, .double => .number,
         .string, .large_string, .string_view => .string,
         .binary, .large_binary, .binary_view => .binary,
         .date32, .date64, .timestamp, .time32, .time64, .duration => .temporal,
@@ -111,6 +122,7 @@ fn castArray(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelE
     const fk = kindOf(from);
     const tk = kindOf(to);
     if (fk == .null and tk != .dictionary and tk != .other) return dense.nullArray(ctx.allocator, to, data.length);
+    if (fk == .null and (isListLike(to) or to == .struct_)) return nullNested(ctx.allocator, to, data.length);
     if (fk == .dictionary) {
         var decoded = try decode(ctx.allocator, arr);
         defer decoded.release();
@@ -131,6 +143,8 @@ fn castArray(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelE
         }
         return temporal(ctx, data, to, safe);
     }
+    if (isListLike(from) and isListLike(to)) return castList(ctx, arr, to, safe);
+    if (from == .struct_ and to == .struct_) return castStruct(ctx, arr, to, safe);
     return error.UnsupportedType;
 }
 
@@ -302,10 +316,12 @@ inline fn convert(comptime F: type, comptime T: type, x: F) T {
 
 /// Whether the truncated float `t` fits `T` (false for NaN).
 inline fn inIntRange(comptime T: type, t: anytype) bool {
-    const F = @TypeOf(t);
+    // float16 (no std.math.pow) compares exactly as float32.
+    const F = if (@TypeOf(t) == f16) f32 else @TypeOf(t);
+    const x: F = t;
     const max_excl: F = comptime std.math.pow(F, 2, @bitSizeOf(T) - (if (isSigned(T)) 1 else 0));
     const min_incl: F = if (comptime isSigned(T)) -max_excl else 0;
-    return t >= min_incl and t < max_excl;
+    return x >= min_incl and x < max_excl;
 }
 
 /// Whether `convert(F, T, x)` loses information (the safe-mode check).
@@ -322,15 +338,18 @@ inline fn lossy(comptime F: type, comptime T: type, x: F) bool {
     return @as(i128, x) < std.math.minInt(T) or @as(i128, x) > std.math.maxInt(T);
 }
 
+/// The number types of the casts: `dense.numeric_types` and float16.
+const number_types = dense.numeric_types ++ [_]type{f16};
+
 fn numeric(ctx: *ExecContext, data: *const ArrayData, to: DataType, safe: bool) KernelError!ArrayRef {
     if (data.data_type == .bool) {
-        inline for (dense.numeric_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) return fromBool(T, ctx, data);
+        inline for (number_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) return fromBool(T, ctx, data);
         return error.UnsupportedType;
     }
-    inline for (dense.numeric_types) |F| if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dense.dataTypeOf(F))) {
+    inline for (number_types) |F| if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dense.dataTypeOf(F))) {
         const src = (PrimitiveArray(F){ .data = data }).values() catch return error.InvalidInput;
         if (to == .bool) return toBool(F, ctx, data, src);
-        inline for (dense.numeric_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) {
+        inline for (number_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) {
             return numToNum(F, T, ctx, data, src, safe);
         };
     };
@@ -391,7 +410,7 @@ fn toText(ctx: *ExecContext, data: *const ArrayData, to: DataType) KernelError!A
         }
         return out.finish();
     }
-    inline for (dense.numeric_types) |F| if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dense.dataTypeOf(F))) {
+    inline for (number_types) |F| if (std.meta.activeTag(data.data_type) == comptime std.meta.activeTag(dense.dataTypeOf(F))) {
         const src = (PrimitiveArray(F){ .data = data }).values() catch return error.InvalidInput;
         if (@typeInfo(F) == .int) switch (to) {
             .string => return intText(F, i32, ctx, data, src, to),
@@ -420,7 +439,8 @@ fn toText(ctx: *ExecContext, data: *const ArrayData, to: DataType) KernelError!A
                 try out.commit(n);
             } else {
                 var buf: [64]u8 = undefined;
-                try out.append(formatFloat(&buf, x));
+                // float16: the exact value in float64 digits (pyarrow 26: 0.0999755859375).
+                try out.append(formatFloat(&buf, if (F == f16) @as(f64, x) else x));
             }
         }
         return out.finish();
@@ -566,7 +586,7 @@ fn fromText(ctx: *ExecContext, arr: ArrayRef, to: DataType) KernelError!ArrayRef
         }
         return out.finish() catch error.OutOfMemory;
     }
-    inline for (dense.numeric_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) {
+    inline for (number_types) |T| if (std.meta.activeTag(to) == comptime std.meta.activeTag(dense.dataTypeOf(T))) {
         var out = try dense.DenseBinaryOutput(T).initValidity(ctx.allocator, data.length, data, null, to);
         errdefer out.deinit();
         const dst = out.values();
@@ -716,4 +736,347 @@ fn temporalRun(comptime F: type, comptime T: type, ctx: *ExecContext, data: *con
         if (safe and lost and out.isValid(i)) return error.InvalidCast;
     }
     return out.finish() catch error.OutOfMemory;
+}
+
+// ------------------------------------------------------------------------------ nested
+
+fn isListLike(dt: DataType) bool {
+    return switch (dt) {
+        .list, .large_list, .list_view, .large_list_view, .fixed_size_list, .map => true,
+        else => false,
+    };
+}
+
+/// The rows of a list-like array (`validateLayout` passed): offsets, offsets and sizes (views)
+/// or a fixed size, the array offset applied.
+const ListRows = union(enum) {
+    off32: []const i32,
+    off64: []const i64,
+    view32: struct { o: []const i32, s: []const i32 },
+    view64: struct { o: []const i64, s: []const i64 },
+    fixed: struct { size: usize, base: usize },
+
+    fn of(d: *const ArrayData) KernelError!ListRows {
+        const n = d.length;
+        return switch (d.data_type) {
+            .list, .map => .{ .off32 = ((d.typedBufferAt(1, i32) catch return error.InvalidInput)[d.offset..])[0 .. n + 1] },
+            .large_list => .{ .off64 = ((d.typedBufferAt(1, i64) catch return error.InvalidInput)[d.offset..])[0 .. n + 1] },
+            .list_view => .{ .view32 = .{
+                .o = ((d.typedBufferAt(1, i32) catch return error.InvalidInput)[d.offset..])[0..n],
+                .s = ((d.typedBufferAt(2, i32) catch return error.InvalidInput)[d.offset..])[0..n],
+            } },
+            .large_list_view => .{ .view64 = .{
+                .o = ((d.typedBufferAt(1, i64) catch return error.InvalidInput)[d.offset..])[0..n],
+                .s = ((d.typedBufferAt(2, i64) catch return error.InvalidInput)[d.offset..])[0..n],
+            } },
+            .fixed_size_list => |f| blk: {
+                const size = std.math.cast(usize, f.list_size) orelse return error.InvalidInput;
+                break :blk .{ .fixed = .{ .size = size, .base = d.offset * size } };
+            },
+            else => error.InvalidInput,
+        };
+    }
+
+    /// Start (in child rows) and length of row `i` (validateLayout bounds both).
+    inline fn span(self: ListRows, i: usize) [2]usize {
+        return switch (self) {
+            inline .off32, .off64 => |o| .{ @intCast(o[i]), @intCast(o[i + 1] - o[i]) },
+            inline .view32, .view64 => |v| .{ @intCast(v.o[i]), @intCast(v.s[i]) },
+            .fixed => |f| .{ f.base + i * f.size, f.size },
+        };
+    }
+
+    /// The child window of all rows when they are stored back to back in row order.
+    fn contiguous(self: ListRows, n: usize) ?[2]usize {
+        return switch (self) {
+            inline .off32, .off64 => |o| .{ @intCast(o[0]), @intCast(o[n]) },
+            .fixed => |f| .{ f.base, f.base + n * f.size },
+            else => null,
+        };
+    }
+};
+
+/// The array whose validity, offsets and sizes are given, over `child` (all taken over, also
+/// on error).
+fn nestedArray(allocator: std.mem.Allocator, to: DataType, len: usize, validity: ?OwnedBuffer, extra: []const ?OwnedBuffer, extra_bytes: []const usize, child: ArrayRef) KernelError!ArrayRef {
+    var kids = [1]ArrayRef{child};
+    var buffers: [3]SharedBuffer = .{ .empty, .empty, .empty };
+    var made: usize = 1;
+    var v = validity;
+    var rest: [2]?OwnedBuffer = .{ null, null };
+    for (extra, 0..) |e, k| rest[k] = e;
+    errdefer {
+        kids[0].release();
+        for (buffers[0..made]) |*b| b.release();
+        if (v) |*b| b.deinit();
+        for (&rest) |*r| if (r.*) |*b| b.deinit();
+    }
+    var null_count: usize = 0;
+    if (v) |*b| {
+        null_count = bitmap.countUnsetBit(b.data, len);
+        buffers[0] = b.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
+        v = null;
+    }
+    for (extra_bytes, 0..) |bytes, k| {
+        buffers[k + 1] = rest[k].?.toShared(bytes) catch return error.OutOfMemory;
+        rest[k] = null;
+        made = k + 2;
+    }
+    return ArrayRef.fromOwnedInline(allocator, .{
+        .data_type = to,
+        .length = len,
+        .null_count = null_count,
+        .buffers = buffers[0 .. 1 + extra.len],
+        .children = &kids,
+    }) catch error.OutOfMemory;
+}
+
+/// Cast a list, large_list, list_view, large_list_view, fixed_size_list or map array to a list,
+/// large_list, list_view, large_list_view or fixed_size_list (or a map to a map): the child is
+/// cast recursively to the target's value type (a map's entries field by field, by position).
+/// To fixed_size_list every valid row must have the list size (`InvalidCast`, as Arrow; a null
+/// row gets `size` null values); between fixed_size_lists the sizes must match
+/// (`UnsupportedType`, Arrow's TypeError). Offsets past the 32-bit range are `Overflow`.
+fn castList(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelError!ArrayRef {
+    const allocator = ctx.allocator;
+    const d = arr.data();
+    const from = d.data_type;
+    if ((to == .map) != (from == .map) and !(from == .map and (to == .list or to == .large_list or to == .list_view or to == .large_list_view))) return error.UnsupportedType;
+    if (to == .fixed_size_list and from == .fixed_size_list and to.fixed_size_list.list_size != from.fixed_size_list.list_size) return error.UnsupportedType;
+    if (d.children.len != 1) return error.InvalidInput;
+    const child = d.children[0];
+    // validateLayout of a list does not look into its child.
+    child.data().validateLayout() catch return error.InvalidInput;
+    const n = d.length;
+    const rows = try ListRows.of(d);
+    const size: ?usize = if (to == .fixed_size_list) std.math.cast(usize, to.fixed_size_list.list_size) orelse return error.InvalidInput else null;
+
+    // The child rows of the output, as a window of the input child or gathered row by row.
+    var window = rows.contiguous(n);
+    if (size) |s| if (window != null) for (0..n) |i| {
+        if (rows.span(i)[1] != s) {
+            window = null;
+            break;
+        }
+    };
+    var src_child = if (window) |w| child.slice(w[0], w[1] - w[0]) catch return error.OutOfMemory else try gather(allocator, d, rows, child, size);
+    defer src_child.release();
+    var new_child = try castListChild(ctx, src_child, from, to, safe);
+    var child_owned = true;
+    defer if (child_owned) new_child.release();
+
+    var validity = dense.combinedValidity(allocator, n, &.{d}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    errdefer if (validity) |*b| b.deinit();
+    if (size != null) {
+        child_owned = false;
+        const v = validity;
+        validity = null;
+        return nestedArray(allocator, to, n, v, &.{}, &.{}, new_child);
+    }
+    const wide = to == .large_list or to == .large_list_view;
+    const view = to == .list_view or to == .large_list_view;
+    const ow: usize = if (wide) 8 else 4;
+    var offsets = OwnedBuffer.init(allocator, (n + 1) * ow) catch return error.OutOfMemory;
+    var sizes = OwnedBuffer.init(allocator, if (view) n * ow else 0) catch {
+        offsets.deinit();
+        return error.OutOfMemory;
+    };
+    // nestedArray takes both over, also on error.
+    var buffers_owned = true;
+    errdefer if (buffers_owned) {
+        offsets.deinit();
+        sizes.deinit();
+    };
+    // Output row starts: the input offsets rebased to the window, or the running sum of the
+    // gathered (valid) rows.
+    var pos: usize = 0;
+    for (0..n + 1) |i| {
+        const start: usize = if (window) |w| (if (i < n) rows.span(i)[0] else w[1]) - w[0] else pos;
+        if (wide) offsets.typedSlice(i64)[i] = @intCast(start) else offsets.typedSlice(i32)[i] = std.math.cast(i32, start) orelse return error.Overflow;
+        if (i == n) break;
+        const len: usize = if (window != null or !d.isNull(i)) rows.span(i)[1] else 0;
+        if (view) {
+            if (wide) sizes.typedSlice(i64)[i] = @intCast(len) else sizes.typedSlice(i32)[i] = @intCast(len);
+        }
+        pos += len;
+    }
+    child_owned = false;
+    buffers_owned = false;
+    const v = validity;
+    validity = null;
+    if (view) {
+        // A list_view has no trailing offset.
+        return nestedArray(allocator, to, n, v, &.{ offsets, sizes }, &.{ n * ow, n * ow }, new_child);
+    }
+    sizes.deinit();
+    return nestedArray(allocator, to, n, v, &.{offsets}, &.{(n + 1) * ow}, new_child);
+}
+
+/// The child rows of every row of `d` in order (null rows: none, or `size` nulls for a
+/// fixed_size_list target, whose valid rows must have `size` values).
+fn gather(allocator: std.mem.Allocator, d: *const ArrayData, rows: ListRows, child: ArrayRef, size: ?usize) KernelError!ArrayRef {
+    var picks: std.ArrayList(?usize) = .empty;
+    defer picks.deinit(allocator);
+    for (0..d.length) |i| {
+        const sp = rows.span(i);
+        if (d.isNull(i)) {
+            if (size) |s| picks.appendNTimes(allocator, null, s) catch return error.OutOfMemory;
+            continue;
+        }
+        if (size) |s| if (sp[1] != s) return error.InvalidCast;
+        picks.ensureUnusedCapacity(allocator, sp[1]) catch return error.OutOfMemory;
+        for (sp[0]..sp[0] + sp[1]) |r| picks.appendAssumeCapacity(r);
+    }
+    var taken = try core.datumTakeNullable(.{ .array = child }, picks.items);
+    return switch (taken) {
+        .array => |a| a,
+        else => {
+            taken.release();
+            return error.InvalidInput;
+        },
+    };
+}
+
+/// The value type a list-like target holds.
+fn listValueType(to: DataType) *const DataType {
+    return switch (to) {
+        .list, .large_list => |l| l.value_field.data_type,
+        .list_view, .large_list_view => |l| l.value_field.data_type,
+        .fixed_size_list => |l| l.value_field.data_type,
+        else => unreachable,
+    };
+}
+
+/// Cast the gathered child of a list-like input to the child of `to`: the value type, or for a
+/// map input the entries struct field by field by position (to a map: its key and item
+/// fields; to a list: a struct of two fields).
+fn castListChild(ctx: *ExecContext, src: ArrayRef, from: DataType, to: DataType, safe: bool) KernelError!ArrayRef {
+    src.data().validateLayout() catch return error.InvalidInput;
+    if (from != .map) return castArray(ctx, src, listValueType(to).*, safe);
+    const sd = src.data();
+    if (sd.data_type != .struct_ or sd.children.len != 2) return error.InvalidInput;
+    const fields: [2]datatype.Field = if (to == .map) .{ to.map.key_field, to.map.item_field } else switch (listValueType(to).*) {
+        .struct_ => |st| if (st.fields.len == 2) .{ st.fields[0], st.fields[1] } else return error.UnsupportedType,
+        else => return error.UnsupportedType,
+    };
+    var kids: [2]ArrayRef = undefined;
+    var made: usize = 0;
+    defer for (kids[0..made]) |*k| k.release();
+    const view = StructArray{ .data = sd };
+    for (&kids, fields) |*k, f| {
+        var c = view.field(made) catch return error.InvalidInput;
+        defer c.release();
+        c.data().validateLayout() catch return error.InvalidInput;
+        k.* = try castArray(ctx, c, f.data_type.*, safe);
+        made += 1;
+        if (!f.nullable and k.data().hasNulls()) return error.InvalidCast;
+    }
+    var validity = dense.combinedValidity(ctx.allocator, sd.length, &.{sd}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    made = 0;
+    if (to == .map and to.map.entries_type == null) return dense.structArrayFields(ctx.allocator, &fields, &kids, sd.length, validity);
+    const st = if (to == .map) to.map.entries_type.?.* else listValueType(to).*;
+    return structOver(ctx.allocator, st, sd.length, &validity, &kids);
+}
+
+/// A struct array of type `dt` over `kids` (taken over, also on error) and `validity` (taken
+/// over).
+fn structOver(allocator: std.mem.Allocator, dt: DataType, len: usize, validity: *?OwnedBuffer, kids: []ArrayRef) KernelError!ArrayRef {
+    var buffers = [1]SharedBuffer{.empty};
+    var null_count: usize = 0;
+    errdefer {
+        for (kids) |*k| k.release();
+        buffers[0].release();
+        if (validity.*) |*b| b.deinit();
+    }
+    if (validity.*) |*b| {
+        null_count = bitmap.countUnsetBit(b.data, len);
+        buffers[0] = b.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
+        validity.* = null;
+    }
+    return ArrayRef.fromOwnedInline(allocator, .{
+        .data_type = dt,
+        .length = len,
+        .null_count = null_count,
+        .buffers = &buffers,
+        .children = kids,
+    }) catch error.OutOfMemory;
+}
+
+/// Cast a struct to a struct (Arrow 26): every target field takes the first source field of its
+/// name not taken yet (any order), cast recursively; a target field with no source field is
+/// all null, or `UnsupportedType` when it is not nullable (Arrow's TypeError); a non-nullable
+/// target field whose values hold a null is `InvalidCast`. The struct validity is kept.
+fn castStruct(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelError!ArrayRef {
+    const allocator = ctx.allocator;
+    const d = arr.data();
+    const src = d.data_type.struct_.fields;
+    const tgt = to.struct_.fields;
+    if (d.children.len != src.len) return error.InvalidInput;
+    const used = allocator.alloc(bool, src.len) catch return error.OutOfMemory;
+    defer allocator.free(used);
+    @memset(used, false);
+    const kids = allocator.alloc(ArrayRef, tgt.len) catch return error.OutOfMemory;
+    defer allocator.free(kids);
+    var made: usize = 0;
+    defer for (kids[0..made]) |*k| k.release();
+    const view = StructArray{ .data = d };
+    for (tgt, kids) |f, *k| {
+        var found: ?usize = null;
+        for (src, used, 0..) |s, u, idx| if (!u and std.mem.eql(u8, s.name, f.name)) {
+            found = idx;
+            break;
+        };
+        if (found) |idx| {
+            used[idx] = true;
+            var c = view.field(idx) catch return error.InvalidInput;
+            defer c.release();
+            c.data().validateLayout() catch return error.InvalidInput;
+            k.* = try castArray(ctx, c, f.data_type.*, safe);
+        } else {
+            if (!f.nullable) return error.UnsupportedType;
+            k.* = try dense.nullArray(allocator, f.data_type.*, d.length);
+        }
+        made += 1;
+        if (!f.nullable and k.data().hasNulls()) return error.InvalidCast;
+    }
+    var validity = dense.combinedValidity(allocator, d.length, &.{d}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    made = 0;
+    return structOver(allocator, to, d.length, &validity, kids);
+}
+
+/// All-null array of a nested type: list, large_list, fixed_size_list, struct (the null
+/// builder) and map (empty entries).
+fn nullNested(allocator: std.mem.Allocator, to: DataType, len: usize) KernelError!ArrayRef {
+    if (to != .map) return dense.nullArray(allocator, to, len);
+    const m = to.map;
+    var kids: [2]ArrayRef = undefined;
+    kids[0] = try dense.nullArray(allocator, m.key_field.data_type.*, 0);
+    kids[1] = dense.nullArray(allocator, m.item_field.data_type.*, 0) catch |err| {
+        kids[0].release();
+        return err;
+    };
+    var no_validity: ?OwnedBuffer = null;
+    const entries = if (m.entries_type) |et| try structOver(allocator, et.*, 0, &no_validity, &kids) else try dense.structArrayFields(allocator, &.{ m.key_field, m.item_field }, &kids, 0, null);
+    var validity = dense.bitsBuffer(allocator, len) catch |err| {
+        var e = entries;
+        e.release();
+        return err;
+    };
+    @memset(validity.data[0..bitmap.byteLength(len)], 0);
+    const offsets = OwnedBuffer.init(allocator, (len + 1) * 4) catch {
+        validity.deinit();
+        var e = entries;
+        e.release();
+        return error.OutOfMemory;
+    };
+    return nestedArray(allocator, to, len, validity, &.{offsets}, &.{(len + 1) * 4}, entries);
 }

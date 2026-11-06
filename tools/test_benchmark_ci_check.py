@@ -79,6 +79,12 @@ VALID_ROWS = [
     "compute_partition_nth_int32,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_select_k_int32,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_tdigest_float64,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_min_max_string,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_cumulative_sum_int64,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_pairwise_diff_int64,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_replace_with_mask_int32,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_cast_list_int32_to_int64,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_indices_nonzero,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
 ]
 
 

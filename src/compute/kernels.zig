@@ -25,6 +25,7 @@ pub const aggregate_stats = @import("aggregate_stats.zig");
 pub const sort = @import("sort.zig");
 pub const tdigest = @import("tdigest.zig");
 pub const pivot = @import("pivot.zig");
+pub const cumulative = @import("cumulative.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -50,4 +51,5 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try sort.register(registry);
     try tdigest.register(registry);
     try pivot.register(registry);
+    try cumulative.register(registry);
 }

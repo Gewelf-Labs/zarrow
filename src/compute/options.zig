@@ -83,6 +83,18 @@ pub const OptionsTag = enum {
     pivot_wider,
     /// Null encoding of dictionary_encode.
     dictionary_encode,
+    /// Output length of scatter.
+    scatter,
+    /// Output length and type of inverse_permutation.
+    inverse_permutation,
+    /// Start value and null handling of the cumulative_* functions.
+    cumulative,
+    /// Period of pairwise_diff.
+    pairwise,
+    /// Quantile limits of winsorize.
+    winsorize,
+    /// Length and seed of random.
+    random,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -455,6 +467,55 @@ pub const DictionaryEncodeOptions = struct {
     null_encoding: enum { mask, encode } = .mask,
 };
 
+/// Options of scatter (Arrow `ScatterOptions`).
+pub const ScatterOptions = struct {
+    /// The largest index allowed; the output has `max_index + 1` rows (negative: as many rows as
+    /// indices). Capped: more than max(indices, 2^24) output rows is `InvalidOptions`.
+    max_index: i64 = -1,
+};
+
+/// Options of inverse_permutation (Arrow `InversePermutationOptions`).
+pub const InversePermutationOptions = struct {
+    /// As `ScatterOptions.max_index`.
+    max_index: i64 = -1,
+    /// A signed integer type holding the input length (null: the type of the indices).
+    output_type: ?DataType = null,
+};
+
+/// Options of cumulative_sum, cumulative_prod, cumulative_min, cumulative_max (and their
+/// `_checked` forms) and cumulative_mean (Arrow `CumulativeOptions`).
+pub const CumulativeOptions = struct {
+    /// Starting value, a numeric scalar cast (safely) to the input type (null or a null scalar:
+    /// the operation's identity). cumulative_mean ignores it, as Arrow.
+    start: ?core.Scalar = null,
+    /// false: every row from the first null on is null; true: a null row is null and the
+    /// accumulation goes on.
+    skip_nulls: bool = false,
+};
+
+/// Options of pairwise_diff / pairwise_diff_checked (Arrow `PairwiseOptions`).
+pub const PairwiseOptions = struct {
+    /// Row `i` is `x[i] - x[i - period]` (a negative period looks ahead); rows without a
+    /// partner are null.
+    period: i64 = 1,
+};
+
+/// Options of winsorize (Arrow `WinsorizeOptions`): both limits in [0, 1], lower <= upper.
+pub const WinsorizeOptions = struct {
+    lower_limit: f64 = 0,
+    upper_limit: f64 = 1,
+};
+
+/// Options of random (Arrow `RandomOptions`; the length is the batch length Arrow passes).
+pub const RandomOptions = struct {
+    /// Number of values.
+    length: usize = 0,
+    /// `seed`: a deterministic generator seeded with `seed`; `system`: `NotImplemented` (the
+    /// exec context has no I/O source of randomness; draw a seed and pass it instead).
+    initializer: enum { seed, system } = .seed,
+    seed: u64 = 0,
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -504,6 +565,12 @@ pub const Options = union(OptionsTag) {
     tdigest: TDigestOptions,
     pivot_wider: PivotWiderOptions,
     dictionary_encode: DictionaryEncodeOptions,
+    scatter: ScatterOptions,
+    inverse_permutation: InversePermutationOptions,
+    cumulative: CumulativeOptions,
+    pairwise: PairwiseOptions,
+    winsorize: WinsorizeOptions,
+    random: RandomOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {
