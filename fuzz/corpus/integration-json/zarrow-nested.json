@@ -1,0 +1,56 @@
+{"schema": {"fields": [
+  {"name": "list", "nullable": true, "type": {"name": "list"}, "children": [
+    {"name": "item", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 32}, "children": []}]},
+  {"name": "large_list", "nullable": true, "type": {"name": "largelist"}, "children": [
+    {"name": "x", "nullable": false, "type": {"name": "bool"}, "children": []}]},
+  {"name": "list_view", "nullable": true, "type": {"name": "listview"}, "children": [
+    {"name": "item", "nullable": true, "type": {"name": "utf8"}, "children": []}]},
+  {"name": "large_list_view", "nullable": true, "type": {"name": "largelistview"}, "children": [
+    {"name": "item", "nullable": true, "type": {"name": "int", "isSigned": false, "bitWidth": 8}, "children": []}]},
+  {"name": "fsl", "nullable": true, "type": {"name": "fixedsizelist", "listSize": 2}, "children": [
+    {"name": "item", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 16}, "children": []}]},
+  {"name": "struct", "nullable": true, "type": {"name": "struct"}, "children": [
+    {"name": "a", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 64}, "children": []},
+    {"name": "a", "nullable": true, "type": {"name": "utf8"}, "children": []}]},
+  {"name": "map", "nullable": true, "type": {"name": "map", "keysSorted": true}, "children": [
+    {"name": "some_entries", "nullable": false, "type": {"name": "struct"}, "children": [
+      {"name": "some_key", "nullable": false, "type": {"name": "utf8"}, "children": []},
+      {"name": "some_value", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 32}, "children": []}]}]},
+  {"name": "sparse", "nullable": true, "type": {"name": "union", "mode": "SPARSE", "typeIds": [5, 7]}, "children": [
+    {"name": "f1", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 32}, "children": []},
+    {"name": "f2", "nullable": true, "type": {"name": "utf8"}, "children": []}]},
+  {"name": "dense", "nullable": true, "type": {"name": "union", "mode": "DENSE", "typeIds": [10, 20]}, "children": [
+    {"name": "f1", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 16}, "children": []},
+    {"name": "f2", "nullable": true, "type": {"name": "null"}, "children": []}]},
+  {"name": "ree", "nullable": true, "type": {"name": "runendencoded"}, "children": [
+    {"name": "run_ends", "nullable": false, "type": {"name": "int", "isSigned": true, "bitWidth": 16}, "children": []},
+    {"name": "values", "nullable": true, "type": {"name": "utf8"}, "children": []}]}
+]},
+"batches": [{"count": 3, "columns": [
+  {"name": "list", "count": 3, "VALIDITY": [1, 0, 1], "OFFSET": [0, 2, 2, 3], "children": [
+    {"name": "item", "count": 3, "VALIDITY": [1, 0, 1], "DATA": [1, 0, 3]}]},
+  {"name": "large_list", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": ["0", "0", "1", "3"], "children": [
+    {"name": "x", "count": 3, "VALIDITY": [1, 1, 1], "DATA": [true, false, true]}]},
+  {"name": "list_view", "count": 3, "VALIDITY": [1, 1, 0], "OFFSET": [2, 0, 0], "SIZE": [1, 3, 0], "children": [
+    {"name": "item", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": [0, 1, 2, 3], "DATA": ["a", "b", "c"]}]},
+  {"name": "large_list_view", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": ["0", "0", "1"], "SIZE": ["2", "0", "1"], "children": [
+    {"name": "item", "count": 2, "VALIDITY": [1, 1], "DATA": [255, 0]}]},
+  {"name": "fsl", "count": 3, "VALIDITY": [1, 0, 1], "children": [
+    {"name": "item", "count": 6, "VALIDITY": [1, 1, 0, 0, 1, 1], "DATA": [1, 2, 0, 0, 5, 6]}]},
+  {"name": "struct", "count": 3, "VALIDITY": [1, 1, 0], "children": [
+    {"name": "a", "count": 3, "VALIDITY": [1, 0, 1], "DATA": ["1", "0", "3"]},
+    {"name": "a", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": [0, 1, 2, 3], "DATA": ["x", "y", "z"]}]},
+  {"name": "map", "count": 3, "VALIDITY": [1, 1, 0], "OFFSET": [0, 2, 2, 2], "children": [
+    {"name": "some_entries", "count": 2, "VALIDITY": [1, 1], "children": [
+      {"name": "some_key", "count": 2, "VALIDITY": [1, 1], "OFFSET": [0, 1, 2], "DATA": ["a", "b"]},
+      {"name": "some_value", "count": 2, "VALIDITY": [0, 1], "DATA": [0, 2]}]}]},
+  {"name": "sparse", "count": 3, "TYPE_ID": [5, 7, 5], "children": [
+    {"name": "f1", "count": 3, "VALIDITY": [1, 0, 0], "DATA": [11, 0, 0]},
+    {"name": "f2", "count": 3, "VALIDITY": [0, 1, 0], "OFFSET": [0, 0, 2, 2], "DATA": ["", "hi", ""]}]},
+  {"name": "dense", "count": 3, "TYPE_ID": [10, 20, 10], "OFFSET": [0, 0, 1], "children": [
+    {"name": "f1", "count": 2, "VALIDITY": [1, 1], "DATA": [-1, 1]},
+    {"name": "f2", "count": 1}]},
+  {"name": "ree", "count": 3, "children": [
+    {"name": "run_ends", "count": 2, "VALIDITY": [1, 1], "DATA": [2, 3]},
+    {"name": "values", "count": 2, "VALIDITY": [1, 0], "OFFSET": [0, 3, 3], "DATA": ["abc", ""]}]}
+]}]}

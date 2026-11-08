@@ -10,6 +10,7 @@ const fbs_lite_verify = @import("fbs_lite/verify.zig");
 const compression_dynlib = @import("compression_dynlib.zig");
 const tensor_types = @import("tensor_types.zig");
 const concat_array_refs = @import("../concat_array_refs.zig");
+const array_compare = @import("../integration/compare.zig");
 const arrow_fbs = @import("ipc_schema");
 
 pub const StreamError = format.StreamError;
@@ -689,7 +690,7 @@ fn buildFieldT(allocator: std.mem.Allocator, field: Field, next_dictionary_id: *
             try entry_children.append(allocator, try buildFieldT(allocator, map_t.key_field, next_dictionary_id));
             try entry_children.append(allocator, try buildFieldT(allocator, map_t.item_field, next_dictionary_id));
             try children.append(allocator, .{
-                .name = "entries",
+                .name = map_t.entries_name,
                 .nullable = false,
                 .type = .{ .Struct_ = try allocT(allocator, fbs.Struct_T, .{}) },
                 .dictionary = null,
@@ -721,7 +722,6 @@ fn buildFieldT(allocator: std.mem.Allocator, field: Field, next_dictionary_id: *
 
     const dictionary_t = switch (field.data_type.*) {
         .dictionary => |dict| blk: {
-            if (!dict.index_type.signed) return StreamError.InvalidMetadata;
             const dictionary_id = dict.id orelse id_blk: {
                 const assigned = next_dictionary_id.*;
                 next_dictionary_id.* += 1;
@@ -902,6 +902,10 @@ fn collectDictionaryIdsFromField(
 ) error{OutOfMemory}!void {
     switch (field.data_type.*) {
         .dictionary => |dict| {
+            // Dictionaries nested in the value type first: their batches must precede this one's
+            // (whose values use them), and buildFieldT numbers them first too.
+            const value_field = Field{ .name = field.name, .data_type = dict.value_type, .nullable = true };
+            try collectDictionaryIdsFromField(allocator, value_field, next_dictionary_id, ids);
             const dictionary_id = dict.id orelse id_blk: {
                 const assigned = next_dictionary_id.*;
                 next_dictionary_id.* += 1;
@@ -948,8 +952,10 @@ fn collectDictionaryArraysFromData(
 ) error{OutOfMemory}!void {
     switch (storageDataType(data.data_type)) {
         .dictionary => {
-            if (data.dictionary == null) return;
-            try out.append(allocator, data.dictionary.?.retain());
+            const dict = data.dictionary orelse return;
+            // Nested dictionaries (in the dictionary values) first, in collectDictionaryIdsFromField's order.
+            try collectDictionaryArraysFromData(allocator, dict.data(), out);
+            try out.append(allocator, dict.retain());
         },
         .list, .large_list, .fixed_size_list, .list_view, .large_list_view => {
             if (data.children.len == 1) try collectDictionaryArraysFromData(allocator, data.children[0].data(), out);
@@ -1046,6 +1052,8 @@ fn planDictionaryEmission(
         return .{ .mode = .full, .array = current };
     }
     const previous = previous_opt.?;
+    // The same dictionary as last batch (readers attach one ArrayRef to every batch).
+    if (previous.node == current.node) return .{ .mode = .skip, .array = current };
     if (!datatype.dataTypeEql(previous.data().data_type, current.data().data_type)) return StreamError.InvalidMetadata;
 
     if (previous.data().length == current.data().length) {
@@ -1146,7 +1154,9 @@ fn arraysEqualForDelta(left: ArrayRef, right: ArrayRef) (StreamError || error{Ou
         },
         .string, .binary => return try variableBinaryEqualI32(a, b),
         .large_string, .large_binary => return try variableBinaryEqualI64(a, b),
-        else => return false,
+        // Nested and view values: logical equality. Returning false here re-sent an unchanged
+        // dictionary in every batch, a replacement the IPC file format does not allow.
+        else => return array_compare.arraysEqual(a, b, null),
     }
 }
 
@@ -1777,7 +1787,7 @@ test "ipc writer can switch body compression codec between record batches" {
     try std.testing.expectEqual(@as(usize, 2), seen_rb);
 }
 
-test "ipc writer rejects dictionary with unsigned index type" {
+test "ipc writer writes a dictionary with an unsigned index type" {
     const allocator = std.testing.allocator;
 
     const value_type = DataType{ .string = {} };
@@ -1799,7 +1809,13 @@ test "ipc writer rejects dictionary with unsigned index type" {
     var writer = StreamWriter.init(allocator, &out.writer);
     defer writer.deinit();
 
-    try std.testing.expectError(StreamError.InvalidMetadata, writer.writeSchema(schema));
+    try writer.writeSchema(schema);
+    try writer.writeEnd();
+    var in: std.Io.Reader = .fixed(out.written());
+    var reader = @import("stream_reader.zig").StreamReader.init(allocator, &in);
+    defer reader.deinit();
+    const back = try reader.readSchema();
+    try std.testing.expectEqual(datatype.IntType{ .bit_width = 32, .signed = false }, back.fields[0].data_type.dictionary.index_type);
 }
 
 test "ipc writer rejects decimal precision outside allowed range" {

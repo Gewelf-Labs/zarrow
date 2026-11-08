@@ -1,0 +1,14 @@
+{"schema": {"fields": [
+  {"name": "uuid", "nullable": true, "type": {"name": "fixedsizebinary", "byteWidth": 16}, "children": [],
+   "metadata": [{"key": "ARROW:extension:name", "value": "arrow.uuid"}, {"key": "ARROW:extension:metadata", "value": ""}]},
+  {"name": "custom", "nullable": true, "type": {"name": "int", "isSigned": true, "bitWidth": 32}, "children": [],
+   "metadata": [{"key": "k", "value": "v"}, {"key": "ARROW:extension:name", "value": "example.custom"}, {"key": "ARROW:integration:allow_unregistered_extension", "value": "true"}]},
+  {"name": "dict_ext", "nullable": true, "type": {"name": "utf8"}, "children": [],
+   "dictionary": {"id": 0, "indexType": {"name": "int", "isSigned": true, "bitWidth": 8}, "isOrdered": false},
+   "metadata": [{"key": "ARROW:extension:name", "value": "dict-extension"}, {"key": "ARROW:extension:metadata", "value": "dict-extension-serialized"}]}
+], "metadata": [{"key": "schema-level", "value": "é"}, {"key": "schema-level", "value": "duplicate keys are allowed"}]},
+"dictionaries": [{"id": 0, "data": {"count": 1, "columns": [{"name": "DICT0", "count": 1, "VALIDITY": [1], "OFFSET": [0, 1], "DATA": ["x"]}]}}],
+"batches": [{"count": 1, "columns": [
+  {"name": "uuid", "count": 1, "VALIDITY": [1], "DATA": ["000102030405060708090A0B0C0D0E0F"]},
+  {"name": "custom", "count": 1, "VALIDITY": [1], "DATA": [7]},
+  {"name": "dict_ext", "count": 1, "VALIDITY": [1], "DATA": [0]}]}]}

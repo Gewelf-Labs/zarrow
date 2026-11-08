@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) !void {
         .{ "c-abi", "c-abi" },
         .{ "regex", "regex" },
         .{ "temporal", "temporal" },
+        .{ "integration-json", "integration-json" },
     };
     for (corpus_dirs) |entry| {
         const run_replay = b.addRunArtifact(fuzz_exe);
@@ -276,6 +277,34 @@ pub fn build(b: *std.Build) !void {
     addPassthru(run_interop_check);
     const interop_check_step = b.step("interop-fixture-check", "Validate canonical IPC fixture with zarrow");
     interop_check_step.dependOn(&run_interop_check.step);
+
+    // Arrow integration suite (docs/integration-suite.md): archery's integration tester commands
+    // and the golden-file check over an apache/arrow-testing clone.
+    const integration_exe = b.addExecutable(.{
+        .name = "integration-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/integration_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    configureIpcCompression(b, integration_exe, &run_compression_deps_check.step);
+    integration_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
+    b.step("integration-runner", "Install the Arrow integration tester (zig-out/bin/integration-runner)").dependOn(&b.addInstallArtifact(integration_exe, .{}).step);
+    const integration_golden_step = b.step("integration-golden", "Golden-file check over apache/arrow-testing (-Darrow-testing=<dir>)");
+    if (b.option([]const u8, "arrow-testing", "apache/arrow-testing clone for integration-golden")) |testing_dir| {
+        const run_golden = b.addRunArtifact(integration_exe);
+        run_golden.addArg("golden");
+        run_golden.addArg(testing_dir);
+        run_golden.has_side_effects = true;
+        integration_golden_step.dependOn(&run_golden.step);
+    } else {
+        integration_golden_step.dependOn(&b.addFail(
+            \\integration-golden needs -Darrow-testing=<dir>: a clone of apache/arrow-testing at revision
+            \\5a26d35785ff8761e56d79eebff971f6f737e18c, e.g.
+            \\  git clone https://github.com/apache/arrow-testing && git -C arrow-testing checkout 5a26d35785ff8761e56d79eebff971f6f737e18c
+        ).step);
+    }
 
     // Compute compatibility runner used by PyArrow compute alignment checks.
     const compute_compat_exe = b.addExecutable(.{

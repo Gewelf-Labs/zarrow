@@ -1,0 +1,8 @@
+Files named at-<version>-<name>.json in this directory are the decompressed <name>.json.gz of
+apache/arrow-testing (https://github.com/apache/arrow-testing, revision
+5a26d35785ff8761e56d79eebff971f6f737e18c), data/arrow-ipc-stream/integration/<version>/, the same
+cases as src/ipc/testdata/at-*.json.gz (src/ipc/testdata/NOTICE). They are licensed under the
+Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0); see LICENSE.txt in
+that repository.
+
+zarrow-*.json: the hand-made documents of src/integration/test_json.zig.

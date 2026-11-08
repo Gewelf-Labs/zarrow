@@ -264,7 +264,7 @@ fn exportFieldSchema(allocator: std.mem.Allocator, field: Field) Error!ArrowSche
         errdefer allocator.free(priv.children_ptrs);
 
         if (map_t.entries_type) |entries_type| {
-            const entries_field = Field{ .name = "entries", .data_type = entries_type, .nullable = false };
+            const entries_field = Field{ .name = map_t.entries_name, .data_type = entries_type, .nullable = false };
             priv.children_storage[0] = try exportFieldSchema(allocator, entries_field);
         } else {
             const entry_fields = [_]Field{
@@ -272,7 +272,7 @@ fn exportFieldSchema(allocator: std.mem.Allocator, field: Field) Error!ArrowSche
                 map_t.item_field,
             };
             const entries_dt = DataType{ .struct_ = .{ .fields = entry_fields[0..] } };
-            const entries_field = Field{ .name = "entries", .data_type = &entries_dt, .nullable = false };
+            const entries_field = Field{ .name = map_t.entries_name, .data_type = &entries_dt, .nullable = false };
             priv.children_storage[0] = try exportFieldSchema(allocator, entries_field);
         }
         priv.children_ptrs[0] = &priv.children_storage[0];
@@ -661,6 +661,7 @@ fn importDataType(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!Da
                 .item_field = entry_fields[1],
                 .keys_sorted = (c_schema.flags & ARROW_FLAG_MAP_KEYS_SORTED) != 0,
                 .entries_type = entries_field.data_type,
+                .entries_name = entries_field.name,
             },
         };
     }
@@ -1115,7 +1116,7 @@ fn childFieldsForDataType(allocator: std.mem.Allocator, dt: DataType) Error![]co
         .map => |m| blk: {
             const out = try allocator.alloc(Field, 1);
             if (m.entries_type) |entries_type| {
-                out[0] = Field{ .name = "entries", .data_type = entries_type, .nullable = false };
+                out[0] = Field{ .name = m.entries_name, .data_type = entries_type, .nullable = false };
             } else {
                 return error.UnsupportedType;
             }
@@ -1884,6 +1885,28 @@ test "c data schema supports map format" {
     try std.testing.expect(imported.schema.fields[0].data_type.map.item_field.data_type.* == .string);
 }
 
+test "c data schema keeps a non-canonical map entries field name" {
+    // Found by the integration suite (generated_map_non_canonical): export wrote "entries" and
+    // import dropped the name.
+    const allocator = std.testing.allocator;
+    const key_ty = DataType{ .string = {} };
+    const item_ty = DataType{ .int32 = {} };
+    const kv = [_]Field{
+        .{ .name = "some_key", .data_type = &key_ty, .nullable = false },
+        .{ .name = "some_value", .data_type = &item_ty, .nullable = true },
+    };
+    const entries_ty = DataType{ .struct_ = .{ .fields = kv[0..] } };
+    const map_ty = DataType{ .map = .{ .key_field = kv[0], .item_field = kv[1], .entries_type = &entries_ty, .entries_name = "some_entries" } };
+    const fields = [_]Field{.{ .name = "m", .data_type = &map_ty, .nullable = true }};
+    var c_schema = try exportSchema(allocator, .{ .fields = fields[0..] });
+    defer if (c_schema.release) |release_fn| release_fn(&c_schema);
+    try std.testing.expectEqualStrings("some_entries", cString(childPtrsSchema(childPtrsSchema(&c_schema).?[0].?).?[0].?.name).?);
+    var imported = try importSchemaOwned(allocator, &c_schema);
+    defer imported.deinit();
+    try std.testing.expectEqualStrings("some_entries", imported.schema.fields[0].data_type.map.entries_name);
+    try std.testing.expect(imported.schema.fields[0].eql(fields[0]));
+}
+
 test "c data array import supports map with entries_type" {
     const allocator = std.testing.allocator;
 
@@ -2488,6 +2511,54 @@ test "c data dictionary field imports as dictionary and rejects indices past the
         defer arr.release();
         var c_array = try exportArray(allocator, arr);
         if (ok) {
+            var back = try importArray(allocator, imported_type, &c_array);
+            defer back.release();
+            try back.data().validateFull();
+        } else {
+            try std.testing.expectError(error.InvalidOffset, importArray(allocator, imported_type, &c_array));
+        }
+    }
+}
+
+test "c data unsigned dictionary index formats round trip and bound every index" {
+    const allocator = std.testing.allocator;
+    const value_type = DataType{ .string = {} };
+    const offsets = [_]i32{ 0, 1, 3 };
+    const dict_bufs = [_]SharedBuffer{ SharedBuffer.empty, SharedBuffer.fromSlice(std.mem.sliceAsBytes(offsets[0..])), SharedBuffer.fromSlice("abb") };
+    var dict = try ArrayRef.fromBorrowed(allocator, .{ .data_type = value_type, .length = 2, .null_count = 0, .buffers = &dict_bufs });
+    defer dict.release();
+    const validity = [_]u8{0b101};
+    const Case = struct { width: u8, format: []const u8, indices: [3]u64, ok: bool };
+    const cases = [_]Case{
+        .{ .width = 8, .format = "C", .indices = .{ 1, 255, 0 }, .ok = true },
+        .{ .width = 8, .format = "C", .indices = .{ 0, 0, 255 }, .ok = false },
+        .{ .width = 16, .format = "S", .indices = .{ 1, 0, 2 }, .ok = false },
+        .{ .width = 32, .format = "I", .indices = .{ 0, 9, 1 }, .ok = true },
+        .{ .width = 64, .format = "L", .indices = .{ 0, 0, (1 << 63) + 5 }, .ok = false },
+        .{ .width = 64, .format = "L", .indices = .{ 1, std.math.maxInt(u64), 0 }, .ok = true },
+    };
+    for (cases) |c| {
+        const dict_type = DataType{ .dictionary = .{ .index_type = .{ .bit_width = c.width, .signed = false }, .value_type = &value_type } };
+        const fields = [_]Field{.{ .name = "d", .data_type = &dict_type, .nullable = true }};
+        var c_schema = try exportSchema(allocator, .{ .fields = &fields });
+        try std.testing.expectEqualStrings(c.format, cString(childPtrsSchema(&c_schema).?[0].?.format).?);
+        var owned = try importSchemaOwned(allocator, &c_schema);
+        defer owned.deinit();
+        const imported_type = owned.schema.fields[0].data_type;
+        try std.testing.expectEqual(datatype.IntType{ .bit_width = c.width, .signed = false }, imported_type.dictionary.index_type);
+
+        var raw: [3 * 8]u8 align(8) = undefined;
+        for (c.indices, 0..) |v, k| switch (c.width) {
+            8 => std.mem.writeInt(u8, raw[k..][0..1], @intCast(v), .little),
+            16 => std.mem.writeInt(u16, raw[k * 2 ..][0..2], @intCast(v), .little),
+            32 => std.mem.writeInt(u32, raw[k * 4 ..][0..4], @intCast(v), .little),
+            else => std.mem.writeInt(u64, raw[k * 8 ..][0..8], v, .little),
+        };
+        const bufs = [_]SharedBuffer{ SharedBuffer.fromSlice(&validity), SharedBuffer.fromSlice(raw[0 .. 3 * @as(usize, c.width / 8)]) };
+        var arr = try ArrayRef.fromBorrowed(allocator, .{ .data_type = dict_type, .length = 3, .null_count = 1, .buffers = &bufs, .dictionary = dict });
+        defer arr.release();
+        var c_array = try exportArray(allocator, arr);
+        if (c.ok) {
             var back = try importArray(allocator, imported_type, &c_array);
             defer back.release();
             try back.data().validateFull();

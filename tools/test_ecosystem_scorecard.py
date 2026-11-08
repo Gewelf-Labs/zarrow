@@ -43,5 +43,6 @@ assert "nope" in errors[1], errors  # "nope" must not pass as "no"
 counts, errors = scorecard.count("| a | b |\n|---|---|\n| yes | yes |\n")
 assert counts == {} and errors == []  # no Status column: not a claim table
 
+assert "docs/integration-suite.md" in scorecard.DOCS
 assert scorecard.main(list(scorecard.DOCS)) == 0
 print("OK: test_ecosystem_scorecard")

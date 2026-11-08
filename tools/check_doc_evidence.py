@@ -25,6 +25,7 @@ DEFAULT_DOCS = [
     "docs/type-coverage.md",
     "docs/interop-c-abi.md",
     "docs/interop-arrow-go.md",
+    "docs/integration-suite.md",
 ]
 STATUS_NEEDING_EVIDENCE = ("| yes", "| partial")
 

@@ -171,6 +171,7 @@ fn cloneDataType(a: std.mem.Allocator, dt: DataType) error{OutOfMemory}!DataType
                 .item_field = vf,
                 .keys_sorted = mt.keys_sorted,
                 .entries_type = entries_type,
+                .entries_name = try a.dupe(u8, mt.entries_name),
             } };
         },
         .sparse_union => |ut| DataType{ .sparse_union = try cloneUnionType(a, ut) },

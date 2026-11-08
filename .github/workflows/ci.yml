@@ -82,6 +82,32 @@ jobs:
           python tools/fuzz_triage.py .fuzz-smoke
           test -z "$(ls .fuzz-smoke/*/index.json 2>/dev/null)"
 
+  integration-golden:
+    name: Arrow integration gold files (apache/arrow-testing)
+    runs-on: ubuntu-latest
+    env:
+      ARROW_TESTING_REV: 5a26d35785ff8761e56d79eebff971f6f737e18c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.0"
+
+      - name: Clone apache/arrow-testing at the pinned revision
+        run: |
+          git clone --depth 1 https://github.com/apache/arrow-testing.git "$RUNNER_TEMP/arrow-testing"
+          git -C "$RUNNER_TEMP/arrow-testing" fetch --depth 1 origin "$ARROW_TESTING_REV"
+          git -C "$RUNNER_TEMP/arrow-testing" checkout "$ARROW_TESTING_REV"
+
+      - name: Check the vendored lz4 / zstd (IPC compression cases)
+        run: zig build check-ipc-compression-deps
+
+      - name: Golden-file check (docs/integration-suite.md)
+        run: zig build integration-golden -Darrow-testing="$RUNNER_TEMP/arrow-testing" -j2
+
   test:
     name: Test on ${{ matrix.os }} with Zig ${{ matrix.zig }}
     runs-on: ${{ matrix.os }}

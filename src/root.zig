@@ -17,6 +17,9 @@ const compute_mod = @import("compute/mod.zig");
 pub const compute = compute_mod;
 /// Linear-time regular expressions (RE2 syntax, leftmost-first), used by the regex compute kernels.
 pub const regex = @import("regex/regex.zig");
+/// The Arrow integration suite: the integration JSON format (read / write), logical batch
+/// comparison and the golden-file check (docs/integration-suite.md).
+pub const integration = @import("integration/integration.zig");
 /// Arrow canonical extension types: names, storage and metadata checks, typed accessors.
 pub const canonical_extensions = @import("extension/canonical.zig");
 pub const SharedBuffer = buffer.SharedBuffer;
@@ -279,6 +282,7 @@ test {
     _ = @import("compute/core.zig");
     _ = @import("regex/regex.zig");
     _ = @import("extension/canonical.zig");
+    _ = @import("integration/test_json.zig");
     _ = @import("array/array.zig");
     _ = @import("array/array_data.zig");
     _ = @import("array/primitive_array.zig");

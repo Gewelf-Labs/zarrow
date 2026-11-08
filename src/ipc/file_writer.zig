@@ -26,6 +26,9 @@ pub const FileError = stream_writer.StreamError || fbs_lite_builder.PackError ||
     InvalidMessage,
     MissingSchema,
     UnsupportedMessage,
+    /// A non-delta dictionary batch for an id already written: the file format has one
+    /// dictionary per id (deltas may extend it).
+    DictionaryReplacement,
 };
 
 const fbs = struct {
@@ -52,6 +55,8 @@ pub const FileWriter = struct {
     record_batch_blocks: std.ArrayList(fbs.BlockT),
     tensor_blocks: std.ArrayList(fbs.BlockT),
     sparse_tensor_blocks: std.ArrayList(fbs.BlockT),
+    /// Ids of the dictionaries written so far.
+    dictionary_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
     stream_offset: usize = 0,
     header_written: bool = false,
     saw_stream_end: bool = false,
@@ -92,6 +97,7 @@ pub const FileWriter = struct {
         }
         if (self.schema_metadata_bytes) |bytes| self.allocator.free(bytes);
         self.dictionary_blocks.deinit(self.allocator);
+        self.dictionary_ids.deinit(self.allocator);
         self.record_batch_blocks.deinit(self.allocator);
         self.tensor_blocks.deinit(self.allocator);
         self.sparse_tensor_blocks.deinit(self.allocator);
@@ -231,6 +237,9 @@ pub const FileWriter = struct {
                         .bodyLength = envelope.body_length,
                     };
                     if (msg_t.header == .DictionaryBatch) {
+                        const dict = msg_t.header.DictionaryBatch orelse return error.InvalidMessage;
+                        const seen = try self.dictionary_ids.getOrPut(self.allocator, dict.id);
+                        if (seen.found_existing and !dict.isDelta) return error.DictionaryReplacement;
                         try self.dictionary_blocks.append(self.allocator, block);
                     } else {
                         try self.record_batch_blocks.append(self.allocator, block);
