@@ -9,8 +9,9 @@
 //! Arrow C++. Inputs are date32, date64 and timestamp (both operands of a difference of the same
 //! type), and time32 / time64 for the rounding functions, hours_between .. nanoseconds_between and
 //! the two interval differences (a time is a timestamp of its unit on 1970-01-01, as in Arrow);
-//! timestamps without a timezone or in UTC only (another timezone is `NotImplemented`). Null
-//! handling is intersection.
+//! a timestamp in another timezone is rounded (or compared) in its local time, a rounded local
+//! time mapped back to UTC (ambiguous or nonexistent: `InvalidInput`, as Arrow). Null handling is
+//! intersection.
 //!
 //! The calendar math is temporal.zig's (proleptic Gregorian, days floored). Rounding follows
 //! Arrow C++ step by step: multiples count from 1970-01-01 (weeks from the Monday or Sunday
@@ -29,6 +30,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
 const temporal = @import("temporal.zig");
+const temporal_zone = @import("temporal_zone.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
@@ -128,14 +130,6 @@ fn weekStartOptions(options: Options) bool {
         .day_of_week => |o| o.week_start >= 1 and o.week_start <= 7,
         else => false,
     };
-}
-
-/// `NotImplemented` for a timestamp in a timezone other than UTC.
-fn checkTimezone(dt: DataType) KernelError!void {
-    switch (dt) {
-        .timestamp => |ts| if (ts.timezone) |tz| if (!temporal.isUtc(tz)) return error.NotImplemented,
-        else => {},
-    }
 }
 
 /// Nanoseconds per value of a date32 / date64 / timestamp / time32 / time64 type.
@@ -293,9 +287,30 @@ fn Round(comptime op: RoundOp) type {
         /// Round each row (array, chunked or scalar) to a multiple of the unit.
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 1) return error.InvalidArity;
-            try checkTimezone(args[0].dataType());
             const o: RoundTemporalOptions = if (options == .round_temporal) options.round_temporal else .{};
             _ = try Plan.init(o, nsPerTick(args[0].dataType()));
+            // A zoned timestamp rounds its local time; the result maps back to UTC (an ambiguous
+            // or nonexistent local result is InvalidInput, as Arrow).
+            if (temporal_zone.zoneName(args[0].dataType())) |name| {
+                var local = try temporal_zone.localize(ctx, args[0], name);
+                defer local.release();
+                // Arrow maps the floor (ceil: the floor; round: the floor and the ceil) back to UTC
+                // too: an ambiguous or nonexistent one fails the call even when not the result.
+                const checks: []const RoundOp = switch (op) {
+                    .floor_temporal => &.{},
+                    .ceil_temporal => &.{.floor_temporal},
+                    .round_temporal => &.{ .floor_temporal, .ceil_temporal },
+                };
+                inline for (checks) |c| {
+                    var r = try dense.execElementwiseWith(ctx, &.{local}, options, local.dataType(), true, Round(c).chunk);
+                    defer r.release();
+                    var u = try temporal_zone.unlocalize(ctx, r, name, args[0].dataType());
+                    u.release();
+                }
+                var rounded = try dense.execElementwiseWith(ctx, &.{local}, options, local.dataType(), true, chunk);
+                defer rounded.release();
+                return temporal_zone.unlocalize(ctx, rounded, name, args[0].dataType());
+            }
             return dense.execElementwiseWith(ctx, args, options, args[0].dataType(), true, chunk);
         }
 
@@ -379,7 +394,14 @@ fn Diff(comptime b: Between) type {
         /// Return the number of unit boundaries from the first to the second argument of each row.
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 2) return error.InvalidArity;
-            try checkTimezone(args[0].dataType());
+            // Zoned timestamps (both of one type) compare their local times.
+            if (temporal_zone.zoneName(args[0].dataType())) |name| {
+                var x = try temporal_zone.localize(ctx, args[0], name);
+                defer x.release();
+                var y = try temporal_zone.localize(ctx, args[1], name);
+                defer y.release();
+                return dense.execElementwiseWith(ctx, &.{ x, y }, options, betweenType(b), true, chunk);
+            }
             return dense.execElementwiseWith(ctx, args, options, betweenType(b), true, chunk);
         }
 

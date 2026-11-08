@@ -420,6 +420,10 @@ pub const PairwiseOptions = options_mod.PairwiseOptions;
 pub const WinsorizeOptions = options_mod.WinsorizeOptions;
 pub const RandomOptions = options_mod.RandomOptions;
 pub const ExtractRegexOptions = options_mod.ExtractRegexOptions;
+pub const StrftimeOptions = options_mod.StrftimeOptions;
+pub const StrptimeOptions = options_mod.StrptimeOptions;
+pub const AssumeTimezoneOptions = options_mod.AssumeTimezoneOptions;
+pub const Utf8NormalizeOptions = options_mod.Utf8NormalizeOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;

@@ -16,6 +16,7 @@ pub const SparseTensorMetadata = @import("stream_reader.zig").SparseTensorMetada
 pub const TensorLikeMetadata = @import("stream_reader.zig").TensorLikeMetadata;
 pub const OwnedTensorLikeMessage = @import("stream_reader.zig").OwnedTensorLikeMessage;
 pub const decodeTensorFromMessageMetadata = @import("stream_reader.zig").decodeTensorFromMessageMetadata;
+pub const validateTensor = @import("tensor_types.zig").validateTensor;
 pub const decodeSparseTensorFromMessageMetadata = @import("stream_reader.zig").decodeSparseTensorFromMessageMetadata;
 pub const SchemaRef = @import("../schema.zig").SchemaRef;
 pub const FileWriter = @import("file_writer.zig").FileWriter;

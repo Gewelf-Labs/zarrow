@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Generate src/compute/unicode_tables.zig from a Unicode Character Database UnicodeData.txt.
+"""Generate src/compute/unicode_tables.zig (and src/compute/unicode_props.zig) from the Unicode
+Character Database.
 
-Usage: python -I tools/gen_unicode_tables.py <path/to/UnicodeData.txt> [<unicode version>]
+Usage: python -I tools/gen_unicode_tables.py <UnicodeData.txt> [<version> [<CompositionExclusions.txt> <Scripts.txt>]]
+
+Download the UCD files into their own empty directory first; they are only read as text.
 
 The input is treated as untrusted data: every field is parsed strictly and range-checked, and the
 script fails on anything unexpected. The output is deterministic (same input, same bytes).
@@ -195,11 +198,243 @@ def emit_ints(values: list[str], per_line: int) -> str:
     return "\n".join(lines)
 
 
+
+# ------------------------------------------------------------------ normalization and scripts
+#
+# With CompositionExclusions.txt and Scripts.txt (same UCD version) the script also writes
+# src/compute/unicode_props.zig: the tables of utf8_normalize (canonical combining classes,
+# full canonical and compatibility decompositions, canonical compositions, quick-check flags)
+# and the script runs of the regex `\p{Script}` classes.
+
+NORM_SHIFT = 7
+NORM_LIMIT = 0x30000
+# A code point's full compatibility decomposition (NFKD) has at most this many code points
+# (U+FDFA); the kernels size their buffers by it.
+MAX_DECOMP = 18
+# Hangul syllables decompose algorithmically (UAX #15, section 16).
+HANGUL_S = range(0xAC00, 0xD7A4)
+
+
+def parse_norm(path: Path):
+    """Canonical combining classes and decomposition mappings of UnicodeData.txt."""
+    ccc: dict[int, int] = {}
+    canon: dict[int, list[int]] = {}
+    compat: dict[int, list[int]] = {}
+    raw = path.read_bytes()
+    for lineno, line in enumerate(raw.decode("ascii").splitlines(), 1):
+        fields = line.split(";")
+        cp = parse_cp(fields[0], lineno)
+        if not re.fullmatch(r"\d{1,3}", fields[3]) or int(fields[3]) > 254:
+            fail(f"line {lineno}: bad combining class {fields[3]!r}")
+        if int(fields[3]):
+            if fields[1].endswith(("First>", "Last>")):
+                fail(f"line {lineno}: combining class on a range")
+            ccc[cp] = int(fields[3])
+        d = fields[5]
+        if not d:
+            continue
+        tag = None
+        if d.startswith("<"):
+            m = re.fullmatch(r"<([a-zA-Z]+)> (.*)", d)
+            if not m:
+                fail(f"line {lineno}: bad decomposition tag")
+            tag, d = m.group(1), m.group(2)
+        cps = [parse_cp(x, lineno) for x in d.split(" ")]
+        if not 1 <= len(cps) <= MAX_DECOMP:
+            fail(f"line {lineno}: decomposition of {len(cps)} code points")
+        (compat if tag else canon)[cp] = cps
+    return ccc, canon, compat
+
+
+def parse_exclusions(path: Path) -> set[int]:
+    out = set()
+    raw = path.read_bytes()
+    if len(raw) > 1024 * 1024:
+        fail("CompositionExclusions.txt larger than 1 MiB")
+    for lineno, line in enumerate(raw.decode("utf-8").splitlines(), 1):
+        body = line.split("#", 1)[0].strip()
+        if body:
+            out.add(parse_cp(body, lineno))
+    return out
+
+
+def parse_scripts(path: Path) -> tuple[list[str], list[int]]:
+    """Script names (index 0: Unknown, then sorted) and the script of every code point."""
+    raw = path.read_bytes()
+    if len(raw) > 4 * 1024 * 1024:
+        fail("Scripts.txt larger than 4 MiB")
+    entries = []
+    for lineno, line in enumerate(raw.decode("utf-8").splitlines(), 1):
+        body = line.split("#", 1)[0].strip()
+        if not body:
+            continue
+        m = re.fullmatch(r"([0-9A-F]{4,6})(?:\.\.([0-9A-F]{4,6}))?\s*;\s*([A-Za-z_]+)", body)
+        if not m:
+            fail(f"Scripts.txt line {lineno}: unexpected {body!r}")
+        lo = parse_cp(m.group(1), lineno)
+        hi = parse_cp(m.group(2), lineno) if m.group(2) else lo
+        if hi < lo:
+            fail(f"Scripts.txt line {lineno}: empty range")
+        entries.append((lo, hi, m.group(3)))
+    names = ["Unknown"] + sorted({e[2] for e in entries} - {"Unknown"})
+    if len(names) > 255:
+        fail("too many scripts")
+    script = [0] * (MAX_CP + 1)
+    for lo, hi, name in entries:
+        for cp in range(lo, hi + 1):
+            if script[cp]:
+                fail(f"Scripts.txt: {cp:X} listed twice")
+            script[cp] = names.index(name)
+    return names, script
+
+
+def full_decomp(cp: int, canon, compat, compat_too: bool) -> list[int]:
+    if 0xAC00 <= cp <= 0xD7A3:
+        fail("a Hangul syllable has a decomposition field")
+    d = canon.get(cp) or (compat.get(cp) if compat_too else None)
+    if d is None:
+        return [cp]
+    out = []
+    for x in d:
+        out += full_decomp(x, canon, compat, compat_too)
+    return out
+
+
+def norm_tables(ccc, canon, compat, exclusions):
+    # Full_Composition_Exclusion: listed exclusions, singletons and non-starter decompositions.
+    full_excl = set(exclusions)
+    for cp, d in canon.items():
+        if len(d) == 1 or ccc.get(cp, 0) or ccc.get(d[0], 0):
+            full_excl.add(cp)
+    pairs = {}
+    for cp, d in canon.items():
+        if cp in full_excl:
+            continue
+        if len(d) != 2:
+            fail(f"primary composite {cp:X} does not decompose to a pair")
+        pairs[(d[0] << 21) | d[1]] = cp
+    seconds = {k & ((1 << 21) - 1) for k in pairs}
+    # Hangul vowel and trailing consonant jamo compose algorithmically with the code point before.
+    seconds |= set(range(0x1161, 0x1176)) | set(range(0x11A8, 0x11C3))
+    decomp = []  # (cp, canonical full, compatibility full)
+    for cp in sorted(set(canon) | set(compat)):
+        nfd = full_decomp(cp, canon, compat, False)
+        nfkd = full_decomp(cp, canon, compat, True)
+        if len(nfkd) > MAX_DECOMP or len(nfd) > 4:
+            fail(f"decomposition of {cp:X} too long")
+        decomp.append((cp, nfd if cp in canon else [cp], nfkd))
+    props = [0] * NORM_LIMIT
+    for cp in range(MAX_CP + 1):
+        v = ccc.get(cp, 0)
+        if cp in canon or cp in HANGUL_S:
+            v |= 1 << 8
+        # Bit 9: the compatibility decomposition differs from the canonical one (also through a
+        # canonical mapping to a compatibility character, U+0385 -> U+00A8 U+0301).
+        if (cp in canon or cp in compat) and full_decomp(cp, canon, compat, True) != full_decomp(cp, canon, compat, False):
+            v |= 1 << 9
+        if cp in full_excl and cp in canon:
+            v |= 1 << 10
+        if cp in seconds:
+            v |= 1 << 11
+        if cp >= NORM_LIMIT:
+            if v:
+                fail(f"normalization property past 0x{NORM_LIMIT:X} at {cp:X}")
+            continue
+        props[cp] = v
+    blocks: list[tuple[int, ...]] = []
+    index = []
+    for b in range(NORM_LIMIT >> NORM_SHIFT):
+        blk = tuple(props[b << NORM_SHIFT:(b + 1) << NORM_SHIFT])
+        if blk not in blocks:
+            blocks.append(blk)
+        index.append(blocks.index(blk))
+    if len(blocks) > 256:
+        fail("too many property blocks")
+    return pairs, decomp, index, blocks
+
+
+def emit_props(version: str, ccc, canon, compat, exclusions, names, script) -> None:
+    pairs, decomp, index, blocks = norm_tables(ccc, canon, compat, exclusions)
+    data: list[int] = []
+    entries = []
+    for cp, nfd, nfkd in decomp:
+        off = len(data)
+        data += nfd
+        koff = off if nfkd == nfd else len(data)
+        if nfkd != nfd:
+            data += nfkd
+        entries.append((cp, off, len(nfd), koff, len(nfkd)))
+    if len(data) >= 1 << 16:
+        fail("decomposition data past 16-bit offsets")
+    runs = category_runs(script)
+    out = [f"""//! Unicode {version} normalization and script tables (utf8_normalize, regex `\\p{{Script}}`).
+//! Generated by `python -I tools/gen_unicode_tables.py UnicodeData.txt {version}
+//! CompositionExclusions.txt Scripts.txt` from the Unicode Character Database (Unicode {version}).
+//! Do not edit; regenerate.
+//!
+//! Hangul syllables are not listed: the kernels decompose and compose them algorithmically.
+
+/// Unicode version of the tables.
+pub const unicode_version = "{version}";
+
+/// Most code points one code point decomposes to (NFKD of U+FDFA); buffers are sized by it.
+pub const max_decomposition = {MAX_DECOMP};
+
+/// Properties of a code point: canonical combining class (bits 0-7), a canonical decomposition
+/// (bit 8, Hangul syllables included), a compatibility decomposition that differs from the
+/// canonical one (bit 9), excluded from
+/// composition (bit 10: Full_Composition_Exclusion of a canonically decomposable code point),
+/// second code point of a primary composite or a Hangul vowel / trailing jamo (bit 11). Code points from `props_limit` on have none.
+pub const props_shift = {NORM_SHIFT};
+pub const props_limit = 0x{NORM_LIMIT:X};
+
+/// Block of every `1 << props_shift` code points below `props_limit`.
+pub const props_index = [{len(index)}]u8{{"""]
+    out.append(emit_ints([str(x) for x in index], 24))
+    out.append("};")
+    out.append(f"\n/// {len(blocks)} distinct blocks of `1 << props_shift` properties.")
+    out.append(f"pub const props_blocks = [{len(blocks) << NORM_SHIFT}]u16{{")
+    out.append(emit_ints([str(x) for blk in blocks for x in blk], 24))
+    out.append("};")
+    out.append(f"""
+/// A decomposable code point (a `u64` of `decompositions`): its full canonical decomposition
+/// (the code point itself when it has only a compatibility one) and its full compatibility
+/// decomposition, as `[offset, offset + len)` of `decomposition_data`.
+pub const Decomposition = packed struct(u64) {{ cp: u21, canon_off: u16, canon_len: u5, compat_off: u16, compat_len: u5, _: u1 = 0 }};
+
+/// {len(entries)} decompositions (`Decomposition` bits), sorted by code point.
+pub const decompositions = [{len(entries)}]u64{{""")
+    out.append(emit_ints([f"0x{cp | off << 21 | n << 37 | koff << 42 | kn << 58:X}" for cp, off, n, koff, kn in entries], 6))
+    out.append("};")
+    out.append(f"\npub const decomposition_data = [{len(data)}]u21{{")
+    out.append(emit_ints([f"0x{x:X}" for x in data], 12))
+    out.append("};")
+    keys = sorted(pairs)
+    out.append(f"\n/// {len(keys)} canonical compositions: `first << 21 | second`, sorted, and the composite.")
+    out.append(f"pub const composition_keys = [{len(keys)}]u64{{")
+    out.append(emit_ints([f"0x{k:X}" for k in keys], 6))
+    out.append("};")
+    out.append(f"pub const composition_values = [{len(keys)}]u21{{")
+    out.append(emit_ints([f"0x{pairs[k]:X}" for k in keys], 12))
+    out.append("};")
+    out.append(f"\n/// Script names (Scripts.txt); index 0 is Unknown (unassigned and unlisted code points).")
+    out.append(f"pub const script_names = [{len(names)}][]const u8{{")
+    out.append(emit_ints([f'"{n}"' for n in names], 6))
+    out.append("};")
+    out.append(f"\n/// {len(runs)} runs `start << 8 | script`, sorted; run k spans [start k, start k+1).")
+    out.append(f"pub const script_runs = [{len(runs)}]u32{{")
+    out.append(emit_ints([f"0x{(s << 8) | c:08X}" for s, c in runs], 8))
+    out.append("};")
+    target = Path(__file__).resolve().parent.parent / "src" / "compute" / "unicode_props.zig"
+    target.write_bytes(("\n".join(out) + "\n").encode("ascii"))
+    print(f"wrote {target} ({len(entries)} decompositions, {len(keys)} compositions, {len(blocks)} property blocks, {len(runs)} script runs)")
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) not in (1, 2):
+    if len(argv) not in (1, 2, 4):
         print(__doc__.splitlines()[2], file=sys.stderr)
         return 2
-    version = argv[1] if len(argv) == 2 else "17.0.0"
+    version = argv[1] if len(argv) >= 2 else "17.0.0"
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         fail(f"bad version {version!r}")
     cat, upper, lower = parse(Path(argv[0]))
@@ -263,6 +498,10 @@ pub const bucket_limit = 0x{BUCKET_LIMIT:X};
     target = Path(__file__).resolve().parent.parent / "src" / "compute" / "unicode_tables.zig"
     target.write_bytes(("\n".join(out) + "\n").encode("ascii"))
     print(f"wrote {target} ({len(runs)} category runs, {len(ups)} upper and {len(lows)} lower ranges)")
+    if len(argv) == 4:
+        ccc, canon, compat = parse_norm(Path(argv[0]))
+        names, script = parse_scripts(Path(argv[3]))
+        emit_props(version, ccc, canon, compat, parse_exclusions(Path(argv[2])), names, script)
     return 0
 
 

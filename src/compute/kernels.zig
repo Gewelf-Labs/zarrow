@@ -27,6 +27,10 @@ pub const tdigest = @import("tdigest.zig");
 pub const pivot = @import("pivot.zig");
 pub const cumulative = @import("cumulative.zig");
 pub const string_regex = @import("string_regex.zig");
+pub const temporal_text = @import("temporal_text.zig");
+pub const temporal_zone = @import("temporal_zone.zig");
+pub const tz = @import("tz.zig");
+pub const string_normalize = @import("string_normalize.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -54,4 +58,7 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try pivot.register(registry);
     try cumulative.register(registry);
     try string_regex.register(registry);
+    try temporal_text.register(registry);
+    try temporal_zone.register(registry);
+    try string_normalize.register(registry);
 }

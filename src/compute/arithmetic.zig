@@ -44,6 +44,12 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         }
     }
     inline for (dense.numeric_types) |T| try registry.registerScalarKernel("sign", signKernel(T));
+    // float16: negate, abs and sign keep the type (pyarrow 26 has negate and sign; abs is ours).
+    inline for (.{ Op.negate, Op.abs }) |op| {
+        try registry.registerScalarKernel(@tagName(op), kernel(f16, op, false));
+        try registry.registerScalarKernel(@tagName(op) ++ "_checked", kernel(f16, op, true));
+    }
+    try registry.registerScalarKernel("sign", signKernel(f16));
 }
 
 fn signKernel(comptime T: type) Kernel {

@@ -3,7 +3,7 @@
 //!
 //! Syntax: literals, `.`, classes `[...]` (ranges, negation, `[:alpha:]` POSIX classes), Perl
 //! classes `\d \s \w` and their negations (ASCII, as RE2), Unicode general categories `\pL`,
-//! `\p{Lu}`, `\PL`, `\p{^L}` (Unicode 17.0.0 tables; scripts such as `\p{Greek}` are rejected),
+//! `\p{Lu}`, `\PL`, `\p{^L}`, scripts such as `\p{Greek}` (Unicode 17.0.0 tables),
 //! anchors `^ $ \A \z`, word boundaries `\b \B` (ASCII), groups `( )`, `(?: )`, named groups
 //! `(?P<name> )` / `(?<name> )`, alternation, greedy and lazy quantifiers `* + ? {n} {n,}
 //! {n,m}` (n, m <= 1000), flags `(?imsU)` / `(?imsU-imsU: )`, escapes `\a \f \t \n \r \v \x41
@@ -23,7 +23,7 @@ pub const dfa = @import("dfa.zig");
 pub const Options = parse.Options;
 pub const Diagnostic = parse.Diagnostic;
 /// `RegexSyntax`: malformed pattern; `RegexUnsupported`: valid Perl syntax RE2 rejects
-/// (backreferences, lookaround, script classes); `RegexTooLarge`: past a compile limit.
+/// (backreferences, lookaround); `RegexTooLarge`: past a compile limit.
 pub const CompileError = parse.Error;
 pub const MatchError = error{OutOfMemory};
 

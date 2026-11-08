@@ -50,7 +50,9 @@ pub const TensorT = struct {
         const type_off = try rcv.type.Pack(__builder, __pack_opts);
 
         var shape_off: u32 = 0;
-        if (rcv.shape.items.len != 0) {
+        // `shape` is required (Tensor.fbs): written also when empty (a 0-dimensional tensor), or
+        // Arrow C++ rejects the message. Hand edit of the flatc-zig output.
+        {
             const shape_len: i32 = @intCast(rcv.shape.items.len);
             try __tmp_offsets.ensureTotalCapacity(__pack_opts.allocator.?, @as(u32, @bitCast(shape_len)));
             __tmp_offsets.items.len = @as(u32, @bitCast(shape_len));

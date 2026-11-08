@@ -530,8 +530,8 @@ test "registerAll registers every kernel family function name with its kind" {
         "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
         "and_not_kleene", "sign",
     } ++ string_names ++ temporal_names ++ string_transform_names ++ string_regex_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
-        "round",  "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
-        "random",
+        "round",  "round_to_multiple", "round_binary", "ceil",            "floor",           "trunc",  "coalesce",       "if_else", "case_when", "choose",
+        "random", "strftime",          "strptime",     "assume_timezone", "local_timestamp", "is_dst", "utf8_normalize",
     };
     const vector_names = [_][]const u8{
         "unique",                 "value_counts",    "dictionary_encode",       "drop_null",             "fill_null_forward",   "fill_null_backward", "mode",
@@ -570,8 +570,9 @@ test "registerAll registers every kernel family function name with its kind" {
     // temporal, strings, binaries, decimals and fixed_size_binary.
     // add also has the six temporal patterns (timestamp + duration, ...), negate_checked duration.
     try std.testing.expectEqual(@as(usize, 17), registry.kernelCount("add", .scalar));
-    try std.testing.expectEqual(@as(usize, 9), registry.kernelCount("negate_checked", .scalar));
-    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sign", .scalar));
+    // float16 adds negate_checked and sign (round 20).
+    try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("negate_checked", .scalar));
+    try std.testing.expectEqual(@as(usize, 13), registry.kernelCount("sign", .scalar));
     try std.testing.expectEqual(@as(usize, 30), registry.kernelCount("less", .scalar));
     try std.testing.expectEqual(@as(usize, 27), registry.kernelCount("min_element_wise", .scalar));
     try std.testing.expectEqual(@as(usize, 16), registry.kernelCount("is_nan", .scalar));

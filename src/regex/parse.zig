@@ -7,6 +7,7 @@
 const std = @import("std");
 const string = @import("../compute/string.zig");
 const unicode = @import("../compute/unicode_tables.zig");
+const props = @import("../compute/unicode_props.zig");
 
 pub const Error = error{ OutOfMemory, RegexSyntax, RegexUnsupported, RegexTooLarge };
 
@@ -623,7 +624,18 @@ const Parser = struct {
     fn appendUnicodeClass(p: *Parser, rs: *std.ArrayList(Range), name: []const u8, start: usize) Error!void {
         if (std.mem.eql(u8, name, "Any")) return rs.append(p.arena, .{ .lo = 0, .hi = 0x10FFFF });
         const mask = categoryMask(name) orelse {
-            if (name.len > 2) return p.fail(error.RegexUnsupported, "Unicode script classes are not supported", start);
+            // A script (Scripts.txt of Unicode 17.0.0; "Unknown" is not a class, as RE2).
+            for (props.script_names[1..], 1..) |script, index| {
+                if (!std.mem.eql(u8, script, name)) continue;
+                const runs = &props.script_runs;
+                for (runs, 0..) |run, k| {
+                    if (run & 0xFF != index) continue;
+                    const lo: u21 = @intCast(run >> 8);
+                    const hi: u21 = if (k + 1 < runs.len) @intCast((runs[k + 1] >> 8) - 1) else 0x10FFFF;
+                    try rs.append(p.arena, .{ .lo = lo, .hi = hi });
+                }
+                return;
+            }
             return p.fail(error.RegexSyntax, "invalid character class range", start);
         };
         const runs = &unicode.category_runs;

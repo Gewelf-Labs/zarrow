@@ -488,6 +488,7 @@ fn buildTensorLikeMessage(
 ) WriterError!fbs.MessageT {
     return switch (metadata) {
         .tensor => |tensor| blk: {
+            tensor_types.validateTensor(tensor, body.len) catch return StreamError.InvalidBody;
             const type_t = try buildTensorTypeT(allocator, tensor.value_type);
 
             var shape = try std.ArrayList(fbs.TensorDimT).initCapacity(allocator, tensor.shape.len);
@@ -518,7 +519,8 @@ fn buildTensorLikeMessage(
             break :blk fbs.MessageT{
                 .version = toFbsMetadataVersion(metadata_version),
                 .header = .{ .Tensor = tensor_ptr },
-                .bodyLength = try castI64Metadata(body.len),
+                // The body is written padded to 8 bytes; its length says so (Arrow's rule).
+                .bodyLength = try castI64Metadata(format.paddedLen(body.len)),
                 .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(allocator, 0),
             };
         },
@@ -618,7 +620,7 @@ fn buildTensorLikeMessage(
             break :blk fbs.MessageT{
                 .version = toFbsMetadataVersion(metadata_version),
                 .header = .{ .SparseTensor = sparse_ptr },
-                .bodyLength = try castI64Metadata(body.len),
+                .bodyLength = try castI64Metadata(format.paddedLen(body.len)),
                 .custom_metadata = try std.ArrayList(fbs.KeyValueT).initCapacity(allocator, 0),
             };
         },

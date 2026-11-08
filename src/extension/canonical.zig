@@ -447,14 +447,17 @@ pub fn validateValues(data: *const ArrayData) ValueError!void {
             const offsets = list.buffers[1].typedSlice(i32) catch return error.InvalidExtensionValue;
             const dims = shapes.children[0].data();
             const dvals = dims.buffers[1].typedSlice(i32) catch return error.InvalidExtensionValue;
+            // A struct child as long as the struct is already sliced (validateLayout accepts it):
+            // the struct offset applies only to a longer child (fuzz finding regress-977f9dfb).
+            const list_base: usize = if (list.length == data.length) 0 else data.offset;
+            const shape_base: usize = if (shapes.length == data.length) 0 else data.offset;
             for (0..data.length) |i| {
                 if (data.isNull(i)) continue;
-                const row = data.offset + i;
-                const lo = offsets[list.offset + row];
-                const hi = offsets[list.offset + row + 1];
+                const lo = offsets[list.offset + list_base + i];
+                const hi = offsets[list.offset + list_base + i + 1];
                 var product: i64 = 1;
                 for (0..p.ndim) |k| {
-                    const d = dvals[dims.offset + (shapes.offset + row) * p.ndim + k];
+                    const d = dvals[dims.offset + (shapes.offset + shape_base + i) * p.ndim + k];
                     if (d < 0 or (p.shape[k] >= 0 and d != p.shape[k])) return error.InvalidExtensionValue;
                     product *|= d;
                 }
@@ -465,9 +468,10 @@ pub fn validateValues(data: *const ArrayData) ValueError!void {
             const off = data.children[1].data();
             if (off.data_type != .int16) return; // dictionary / run-end encoded offsets
             const vals = off.buffers[1].typedSlice(i16) catch return error.InvalidExtensionValue;
+            const base: usize = if (off.length == data.length) 0 else data.offset;
             for (0..data.length) |i| {
                 if (data.isNull(i)) continue;
-                const v = vals[off.offset + data.offset + i];
+                const v = vals[off.offset + base + i];
                 if (@abs(v) > max_offset_minutes) return error.InvalidExtensionValue;
             }
         },

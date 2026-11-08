@@ -27,7 +27,7 @@
 //!   time of day), duration unit changes. Safe: losing a fraction (date64 to date32, a finer to a
 //!   coarser unit) or overflowing is `InvalidCast`; unsafe truncates toward zero and wraps. A
 //!   timezone change keeps the instants (values unchanged); a timestamp in a timezone other than
-//!   UTC to a date or time is `NotImplemented` (Arrow uses the local time, no timezone database).
+//!   UTC to a date or time takes its local time (as Arrow).
 //! - int32 <-> date32 / time32 and int64 <-> date64 / timestamp / time64 / duration keep the
 //!   stored values (Arrow's zero-copy casts; other integer widths are not cast, as in Arrow).
 //! - dictionary to its value type (decoded with take), then on to any target above; a value
@@ -49,6 +49,8 @@ const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const concat = @import("../concat_array_refs.zig");
 const decimal = @import("decimal.zig");
+const temporal_text = @import("temporal_text.zig");
+const temporal_zone = @import("temporal_zone.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
@@ -136,10 +138,17 @@ fn castArray(ctx: *ExecContext, arr: ArrayRef, to: DataType, safe: bool) KernelE
     if ((fk == .number or fk == .boolean) and tk == .string) return toText(ctx, data, to);
     if (fk == .string and (tk == .number or tk == .boolean)) return fromText(ctx, arr, to);
     if ((fk == .string or fk == .binary) and (tk == .string or tk == .binary)) return bytesCast(ctx, arr, to);
+    if (fk == .temporal and tk == .string) return temporal_text.formatCast(ctx, data, to);
+    if (fk == .string and tk == .temporal) return temporal_text.parseCast(ctx, arr, to);
     if (fk == .temporal and tk == .temporal) {
         if (!temporalPair(from, to)) return error.UnsupportedType;
         if (from == .timestamp and (to == .date32 or to == .date64 or to == .time32 or to == .time64)) {
-            if (from.timestamp.timezone) |tz| if (!@import("temporal.zig").isUtc(tz)) return error.NotImplemented;
+            // A zoned timestamp gives the date or time of its local time.
+            if (temporal_zone.zoneName(from)) |name| {
+                var local = try temporal_zone.localize(ctx, .{ .array = arr }, name);
+                defer local.release();
+                return temporal(ctx, local.array.data(), to, safe);
+            }
         }
         return temporal(ctx, data, to, safe);
     }

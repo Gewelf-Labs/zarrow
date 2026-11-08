@@ -284,7 +284,7 @@ test "temporal scalars, empty and all-null inputs" {
     inline for (date_fields ++ time_fields) |name| try common.expectInvoke(i64, &ctx, .scalar, name, &.{.{ .array = nulls }}, &.{ null, null, null });
 }
 
-test "temporal errors: non-UTC timezone, time parts of date32, options, arity and malformed input" {
+test "temporal errors: unknown timezone, time parts of date32, options, arity and malformed input" {
     const allocator = std.testing.allocator;
     var registry = try common.kernelRegistry(allocator);
     defer registry.deinit();
@@ -292,7 +292,11 @@ test "temporal errors: non-UTC timezone, time parts of date32, options, arity an
     const ny = DataType{ .timestamp = .{ .unit = .second, .timezone = "America/New_York" } };
     var t = try common.makeTyped(i64, ny, allocator, &.{0});
     defer t.release();
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("year", &.{.{ .array = t }}, none));
+    // A named zone reads as local time (1969-12-31 19:00 in New York); an unknown one is InvalidInput.
+    try common.expectInvoke(i64, &ctx, .scalar, "year", &.{.{ .array = t }}, &.{1969});
+    var bad = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .second, .timezone = "Mars/Olympus" } }, allocator, &.{0});
+    defer bad.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("year", &.{.{ .array = bad }}, none));
     var d = try common.makeTyped(i32, date32, allocator, &.{0});
     defer d.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("hour", &.{.{ .array = d }}, none));

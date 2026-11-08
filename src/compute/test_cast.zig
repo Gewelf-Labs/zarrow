@@ -443,11 +443,11 @@ test "cast times, durations, timestamp to time of day, integer reinterpretation 
     defer ts_whole.release();
     try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = ts_whole }}, to(t32s), &.{ 3661, 86399 });
     try common.expectInvokeWith(i64, &ctx, "cast", &.{.{ .array = ts }}, to(t64us), &.{ 3661001000, 86399999000 });
-    // A timezone other than UTC needs local time: not implemented; UTC works.
+    // A timezone other than UTC gives the local time of day and date (1969-12-31 19:00, pyarrow 26).
     var ny = try common.makeTyped(i64, .{ .timestamp = .{ .unit = .second, .timezone = "America/New_York" } }, allocator, &.{0});
     defer ny.release();
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("cast", &.{.{ .array = ny }}, to(t32s)));
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("cast", &.{.{ .array = ny }}, to(date32)));
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = ny }}, to(t32s), &.{68400});
+    try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = ny }}, to(date32), &.{-1});
     var utc = try common.makeTyped(i64, ts_s_utc, allocator, &.{86401});
     defer utc.release();
     try common.expectInvokeWith(i32, &ctx, "cast", &.{.{ .array = utc }}, to(t32s), &.{1});

@@ -81,6 +81,8 @@ pub const IpcSparseTensorMetadata = ipc.SparseTensorMetadata;
 pub const IpcTensorLikeMetadata = ipc.TensorLikeMetadata;
 pub const IpcOwnedTensorLikeMessage = ipc.OwnedTensorLikeMessage;
 pub const decodeIpcTensorFromMessageMetadata = ipc.decodeTensorFromMessageMetadata;
+/// Arrow's tensor checks (value type, shape, strides, data size) of a tensor message.
+pub const validateIpcTensor = ipc.validateTensor;
 pub const decodeIpcSparseTensorFromMessageMetadata = ipc.decodeSparseTensorFromMessageMetadata;
 pub const ArrowSchema = ffi.ArrowSchema;
 pub const ArrowArray = ffi.ArrowArray;

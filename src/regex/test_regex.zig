@@ -148,7 +148,7 @@ test "regex errors: syntax, unsupported constructs and limits" {
         .{ "a{1001}", error.RegexSyntax },       .{ "a{2,1}", error.RegexSyntax },
         .{ "(a{100}){100}", error.RegexSyntax }, .{ "\\1", error.RegexUnsupported },
         .{ "(?=a)", error.RegexUnsupported },    .{ "(?<!a)", error.RegexUnsupported },
-        .{ "(?P=n)", error.RegexUnsupported },   .{ "\\p{Greek}", error.RegexUnsupported },
+        .{ "(?P=n)", error.RegexUnsupported },   .{ "\\p{Klingon}", error.RegexSyntax },
         .{ "\\pX", error.RegexSyntax },          .{ "\\q", error.RegexSyntax },
         .{ "\\", error.RegexSyntax },            .{ "(?P<>a)", error.RegexSyntax },
         .{ "(?x)", error.RegexSyntax },          .{ "(?i-)", error.RegexSyntax },

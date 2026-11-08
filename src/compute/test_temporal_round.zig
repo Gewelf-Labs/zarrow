@@ -374,8 +374,9 @@ test "temporal rounding and differences errors: options, timezone, mismatched ty
     const ny = DataType{ .timestamp = .{ .unit = .second, .timezone = "America/New_York" } };
     var tz = try common.makeTyped(i64, ny, allocator, &.{0});
     defer tz.release();
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("floor_temporal", &.{.{ .array = tz }}, none));
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("days_between", &.{ .{ .array = tz }, .{ .array = tz } }, none));
+    // A named zone rounds and compares local time (New York: 1969-12-31 00:00 local is -68400).
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{.{ .array = tz }}, none, &.{-68400});
+    try common.expectInvokeWith(i64, &ctx, "days_between", &.{ .{ .array = tz }, .{ .array = tz } }, none, &.{0});
     var t_ms = try common.makeTyped(i64, ts_ms, allocator, &.{0});
     defer t_ms.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("days_between", &.{ a[0], .{ .array = t_ms } }, none));

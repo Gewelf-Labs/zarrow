@@ -125,7 +125,7 @@ fn rankQuantileOptions(options: Options) bool {
 /// Whether a column of `dt` can be sorted.
 pub fn isSortable(dt: DataType) bool {
     return switch (dt) {
-        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double, .bool => true,
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .half_float, .float, .double, .bool => true,
         .date32, .date64, .timestamp, .time32, .time64, .duration => true,
         .decimal32, .decimal64, .decimal128, .decimal256 => true,
         .string, .large_string, .string_view, .binary, .large_binary, .binary_view, .fixed_size_binary => true,
@@ -162,6 +162,7 @@ pub const Values = union(enum) {
     u16: []const u16,
     u32: []const u32,
     u64: []const u64,
+    f16: []const f16,
     f32: []const f32,
     f64: []const f64,
     i128: []const i128,
@@ -197,6 +198,7 @@ const Column = struct {
     inline fn class(self: *const Column, i: usize) Class {
         if (self.arr.data().isNull(i)) return .null;
         return switch (self.values) {
+            .f16 => |v| if (std.math.isNan(v[i])) .nan else .value,
             .f32 => |v| if (std.math.isNan(v[i])) .nan else .value,
             .f64 => |v| if (std.math.isNan(v[i])) .nan else .value,
             else => .value,
@@ -307,6 +309,7 @@ pub fn valuesOf(arr: ArrayRef) KernelError!Values {
         .uint16 => .{ .u16 = try typed(u16, data) },
         .uint32 => .{ .u32 = try typed(u32, data) },
         .uint64 => .{ .u64 = try typed(u64, data) },
+        .half_float => .{ .f16 = try typed(f16, data) },
         .float => .{ .f32 = try typed(f32, data) },
         .double => .{ .f64 = try typed(f64, data) },
         .date32, .time32, .decimal32 => .{ .i32 = try typed(i32, data) },
@@ -442,7 +445,7 @@ inline fn radixKey(comptime K: type, v: anytype) K {
 /// decimal64 and bool. False when the column has none (the caller compares rows instead).
 fn withRadixKey(col: *const Column, body: anytype) KernelError!bool {
     switch (col.values) {
-        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64 => |v| {
+        inline .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f16, .f32, .f64 => |v| {
             const T = @typeInfo(@TypeOf(v)).pointer.child;
             const K = if (@bitSizeOf(T) <= 32) u32 else u64;
             try body.run(K, struct {
@@ -467,6 +470,7 @@ fn withRadixKey(col: *const Column, body: anytype) KernelError!bool {
 /// Whether row `i` (valid) of a float column is NaN.
 inline fn isNanAt(col: *const Column, i: usize) bool {
     return switch (col.values) {
+        .f16 => |v| std.math.isNan(v[i]),
         .f32 => |v| std.math.isNan(v[i]),
         .f64 => |v| std.math.isNan(v[i]),
         else => false,

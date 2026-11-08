@@ -31,4 +31,8 @@ test {
     _ = @import("test_pivot.zig");
     _ = @import("test_cumulative.zig");
     _ = @import("test_string_regex.zig");
+    _ = @import("test_temporal_text.zig");
+    _ = @import("tz.zig");
+    _ = @import("test_temporal_zone.zig");
+    _ = @import("test_string_normalize.zig");
 }

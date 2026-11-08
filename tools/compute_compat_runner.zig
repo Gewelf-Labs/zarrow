@@ -80,6 +80,7 @@ fn datumLen(datum: compute.Datum) usize {
         .array => |arr| arr.data().length,
         .chunked => |chunks| chunks.len(),
         .scalar => 1,
+        .record_batch, .table => 0,
     };
 }
 
@@ -402,6 +403,7 @@ fn datumToMaybeI64List(allocator: std.mem.Allocator, datum: compute.Datum) compu
             }
             break :blk out;
         },
+        .record_batch, .table => error.UnsupportedType,
     };
 }
 
@@ -538,4 +540,38 @@ pub fn main(init: std.process.Init) !void {
     try std.json.Stringify.value(Output{ .results = results.items }, .{}, &out_writer.interface);
     try out_writer.interface.writeByte('\n');
     try out_writer.interface.flush();
+}
+
+/// One case of tools/compute/testdata/pyarrow_compute_compat.json: the runner input and the
+/// pyarrow outcome (`tools/compute/pyarrow_compute_compat.py --write-fixture`).
+const FixtureCase = struct {
+    input: CaseInput,
+    expected: struct { status: CaseStatus, values: ?[]const ?i64 = null, @"error": ?[]const u8 = null },
+};
+
+test "compute compat runner matches the pyarrow 26 results of tools/compute/pyarrow_compute_compat.py on every case" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(struct { pyarrow: []const u8, cases: []const FixtureCase }, allocator, @embedFile("compute/testdata/pyarrow_compute_compat.json"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("26.0.0", parsed.value.pyarrow);
+    var registry = compute.FunctionRegistry.init(allocator);
+    defer registry.deinit();
+    try registerCompatKernels(&registry);
+    var ctx = compute.ExecContext.init(allocator, &registry);
+    // Every suite (numeric, nulls, boundary, chunked) of the Python runner.
+    try std.testing.expectEqual(@as(usize, 11), parsed.value.cases.len);
+    for (parsed.value.cases) |case| {
+        const got = runCase(allocator, &ctx, case.input);
+        switch (case.expected.status) {
+            .ok => {
+                const values = try got;
+                defer allocator.free(values);
+                try std.testing.expectEqualSlices(?i64, case.expected.values.?, values);
+            },
+            .@"error" => if (got) |values| {
+                allocator.free(values);
+                return error.TestExpectedError;
+            } else |err| try std.testing.expectEqualStrings(case.expected.@"error".?, @errorName(err)),
+        }
+    }
 }

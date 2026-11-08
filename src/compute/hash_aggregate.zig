@@ -137,7 +137,7 @@ const FixedTable = struct {
 
 /// How the rows of a key type are read (`fixed_bytes`: the value bytes of a wider fixed-width
 /// type, hashed as a byte string).
-const KeyKind = enum { b8, b16, b32, b64, f32, f64, boolean, bytes, fixed_bytes };
+const KeyKind = enum { b8, b16, b32, b64, f16, f32, f64, boolean, bytes, fixed_bytes };
 
 fn keyKind(dt: DataType) ?KeyKind {
     return switch (dt) {
@@ -145,6 +145,7 @@ fn keyKind(dt: DataType) ?KeyKind {
         .int16, .uint16 => .b16,
         .int32, .uint32, .date32, .time32, .decimal32, .interval_months => .b32,
         .int64, .uint64, .date64, .timestamp, .time64, .duration, .decimal64, .interval_day_time => .b64,
+        .half_float => .f16,
         .float => .f32,
         .double => .f64,
         .bool => .boolean,
@@ -255,17 +256,17 @@ pub const KeyMap = struct {
         // A dictionary maps its indices (the caller checked them, see `validateDictionary`).
         const key_type = if (data.data_type == .dictionary) dense.indexType(data.data_type.dictionary) else data.data_type;
         switch (keyKind(key_type) orelse return error.UnsupportedType) {
-            inline .b8, .b16, .b32, .b64, .f32, .f64 => |k| {
+            inline .b8, .b16, .b32, .b64, .f16, .f32, .f64 => |k| {
                 const U = switch (k) {
                     .b8 => u8,
-                    .b16 => u16,
+                    .b16, .f16 => u16,
                     .b32, .f32 => u32,
                     else => u64,
                 };
                 const vals = (PrimitiveArray(U){ .data = data }).values() catch return error.InvalidInput;
                 // Lookups in a frozen narrow key range read the direct table: no hashing, and the
                 // table lives in locals rather than behind `self`.
-                if (mode == .lookup and k != .f32 and k != .f64) if (self.dense) |d| {
+                if (mode == .lookup and k != .f16 and k != .f32 and k != .f64) if (self.dense) |d| {
                     const null_id = self.null_id orelse missing;
                     for (vals, ids, 0..) |v, *id, i| {
                         const off = @as(u64, v) -% d.min;
@@ -282,6 +283,7 @@ pub const KeyMap = struct {
                         continue;
                     };
                     var key: u64 = v;
+                    if (k == .f16 and std.math.isNan(@as(f16, @bitCast(v)))) key = 0x7E00;
                     if (k == .f32 and std.math.isNan(@as(f32, @bitCast(v)))) key = 0x7FC0_0000;
                     if (k == .f64 and std.math.isNan(@as(f64, @bitCast(v)))) key = 0x7FF8_0000_0000_0000;
                     id.* = if (mode == .insert) try self.put(allocator, &self.fixed, key) else self.lookupFixed(key);

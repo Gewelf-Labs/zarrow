@@ -209,7 +209,8 @@ pub fn validUtf8(s: []const u8) bool {
     return isAscii(s) or std.unicode.utf8ValidateSlice(s);
 }
 
-fn isAscii(s: []const u8) bool {
+/// Return whether every byte of `s` is ASCII (16 bytes at a time).
+pub fn isAscii(s: []const u8) bool {
     const L = 16;
     var acc: @Vector(L, u8) = @splat(0);
     var i: usize = 0;
