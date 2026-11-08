@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-TARGETS = ["ipc-stream", "ipc-stream-zero-copy", "ipc-file", "array-layout", "compute", "c-abi", "regex", "temporal"]
+TARGETS = ["ipc-stream", "ipc-stream-zero-copy", "ipc-file", "array-layout", "compute", "c-abi", "regex", "temporal", "integration-json"]
 CORPUS = {"ipc-stream-zero-copy": "ipc-stream", "compute": "ipc-stream"}
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "zig-out" / "bin" / ("zarrow-fuzz.exe" if os.name == "nt" else "zarrow-fuzz")

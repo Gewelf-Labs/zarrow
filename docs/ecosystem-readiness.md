@@ -173,3 +173,13 @@ the former `nan_placement` and `stable` fields are gone.
 - Clarified: the compute core provides the framework and helpers; kernel families in this repository
   implement concrete kernels.
 - Added: the recommended extension path for `sort / take / filter` and the options family (including `sort`).
+
+---
+
+## 8. Arrow integration suite
+
+Cross-implementation compatibility of the IPC formats is checked against Arrow's own integration
+suite: zarrow reads and writes the integration JSON format, has a tester with archery's command set and
+runs the golden-file check over apache/arrow-testing (in CI and, for 16 cases copied into
+`src/ipc/testdata`, in `zig build test`). Status, results per gold case and the zarrow bugs the suite
+found: [integration-suite.md](integration-suite.md).

@@ -21,6 +21,7 @@ DOCS = (
     "docs/type-coverage.md",
     "docs/interop-c-abi.md",
     "docs/interop-arrow-go.md",
+    "docs/integration-suite.md",
 )
 STATUS = "Status"
 DIMENSIONS = ("Build", "Validate", "IPC", "C ABI", "Compute")

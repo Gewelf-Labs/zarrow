@@ -11,6 +11,7 @@ See [docs/fuzzing.md](../../docs/fuzzing.md).
 | `c-abi/` | `c-abi` |
 | `regex/` | `regex` (hand-made: flag byte, u16 pattern length, pattern, text) |
 | `temporal/` | `temporal` (hand-made: flag byte, u16 format length, format, text) |
+| `integration-json/` | `integration-json` (the decompressed JSON of the arrow-testing cases in `src/ipc/testdata`, see `NOTICE`) |
 
 File names:
 

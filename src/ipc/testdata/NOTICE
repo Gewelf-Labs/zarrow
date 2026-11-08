@@ -3,3 +3,8 @@ Files named at-* in this directory are copied unmodified from apache/arrow-testi
 data/arrow-ipc-stream/integration/<version>/<name>, saved as at-<version>-<name>.
 They are licensed under the Apache License, Version 2.0
 (https://www.apache.org/licenses/LICENSE-2.0); see LICENSE.txt in that repository.
+
+The .json.gz, .arrow_file and .stream of each at-* case listed in src/integration/test_json.zig
+(`golden_cases`, 16 cases, among them cpp-21.0.0 generated_dictionary_unsigned with unsigned
+dictionary index types) are checked together by the golden-file tests ("integration golden check
+passes on the arrow-testing cases in src/ipc/testdata"); see docs/integration-suite.md.

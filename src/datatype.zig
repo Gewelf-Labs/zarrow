@@ -181,6 +181,9 @@ pub const MapType = struct {
     item_field: Field,
     keys_sorted: bool = false,
     entries_type: ?*const DataType = null,
+    /// Name of the entries struct field: "entries" by convention, but any name is valid
+    /// (Schema.fbs `Map`); IPC and the C data interface carry it through.
+    entries_name: []const u8 = "entries",
 };
 
 pub const UnionType = struct {
@@ -496,6 +499,7 @@ pub fn dataTypeEql(lhs: DataType, rhs: DataType) bool {
             break :blk fieldEql(l.key_field, r.key_field) and
                 fieldEql(l.item_field, r.item_field) and
                 l.keys_sorted == r.keys_sorted and
+                std.mem.eql(u8, l.entries_name, r.entries_name) and
                 dataTypePtrEql(l.entries_type, r.entries_type);
         },
         .sparse_union => |l| unionTypeEql(l, rhs.sparse_union),

@@ -24,6 +24,7 @@ pub const Target = enum {
     @"c-abi",
     regex,
     temporal,
+    @"integration-json",
 };
 
 /// Inputs over this size are skipped (replay) or never produced (run).
@@ -130,6 +131,7 @@ pub fn runOne(target: Target, parent: Allocator, bytes: []const u8) Feedback {
         .@"c-abi" => cAbi(gpa, bytes, &fb),
         .regex => regexTarget(gpa, bytes, &fb),
         .temporal => temporalTarget(gpa, bytes, &fb),
+        .@"integration-json" => integrationJsonTarget(gpa, bytes, &fb),
     };
     result catch |e| {
         fb.err = e;
@@ -1244,6 +1246,43 @@ fn regexTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// integration-json: the Arrow integration JSON reader (src/integration/json.zig) on any bytes.
+//
+// What it accepts must pass validateFull, write back with the JSON writer (only nesting past the
+// writer's depth limit may fail), read back equal, and, when zarrow's IPC stream writer and
+// reader take it, come back from IPC equal too.
+
+fn integrationJsonTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
+    const integration = zarrow.integration;
+    var doc = try integration.json.read(gpa, bytes);
+    defer doc.deinit();
+    fb.batches = @intCast(@min(doc.batches.len, std.math.maxInt(u32)));
+    for (doc.batches) |*b| for (b.columns) |c| {
+        if (!fb.noteArray(c)) std.debug.panic("fuzz-invariant: integration JSON column fails validateFull: {s}", .{@errorName(fb.invalid.?)});
+    };
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    integration.json.write(gpa, &out.writer, doc.schema().*, doc.batches) catch |e| switch (e) {
+        error.NestingTooDeep => return,
+        else => std.debug.panic("fuzz-invariant: integration JSON write of an accepted document failed: {s}", .{@errorName(e)}),
+    };
+    var again = integration.json.read(gpa, out.written()) catch |e|
+        std.debug.panic("fuzz-invariant: integration JSON written by zarrow does not read back: {s}", .{@errorName(e)});
+    defer again.deinit();
+    var r: integration.golden.Result = .{};
+    if (!integration.golden.same(&r, "JSON round trip", &doc, &again)) std.debug.panic("fuzz-invariant: {s}", .{r.message()});
+
+    // The IPC writers may refuse (a column-less batch with rows);
+    // what they write must read back equal.
+    const ipc = integration.golden.writeIpc(gpa, &doc, .stream) catch return;
+    defer gpa.free(ipc);
+    var back = integration.golden.readStream(gpa, ipc) catch return;
+    defer back.deinit();
+    if (!integration.golden.same(&r, "IPC round trip", &doc, &back)) std.debug.panic("fuzz-invariant: {s}", .{r.message()});
+}
+
+// ---------------------------------------------------------------------------------------------
 // temporal: strptime, strftime and the temporal <-> text casts (src/compute/temporal_text.zig)
 // on a format and a text from the input.
 //
@@ -2209,6 +2248,10 @@ test "fuzz c-abi" {
 
 test "fuzz regex" {
     try std.testing.fuzz(Target.regex, fuzzOne, .{ .corpus = &.{smithSeed("corpus/regex/named-groups.bin")} });
+}
+
+test "fuzz integration-json" {
+    try std.testing.fuzz(Target.@"integration-json", fuzzOne, .{ .corpus = &.{smithSeed("corpus/integration-json/zarrow-nested.json")} });
 }
 
 test "fuzz temporal" {

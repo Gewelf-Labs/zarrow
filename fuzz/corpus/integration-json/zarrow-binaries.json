@@ -1,0 +1,22 @@
+{"schema": {"fields": [
+  {"name": "bin", "nullable": true, "type": {"name": "binary"}, "children": []},
+  {"name": "lbin", "nullable": true, "type": {"name": "largebinary"}, "children": []},
+  {"name": "str", "nullable": true, "type": {"name": "utf8"}, "children": []},
+  {"name": "lstr", "nullable": true, "type": {"name": "largeutf8"}, "children": []},
+  {"name": "fsb", "nullable": true, "type": {"name": "fixedsizebinary", "byteWidth": 3}, "children": []},
+  {"name": "bv", "nullable": true, "type": {"name": "binaryview"}, "children": []},
+  {"name": "sv", "nullable": true, "type": {"name": "utf8view"}, "children": []}
+]},
+"batches": [{"count": 3, "columns": [
+  {"name": "bin", "count": 3, "VALIDITY": [1, 0, 1], "OFFSET": [0, 2, 9, 9], "DATA": ["00FF", "ignored", ""]},
+  {"name": "lbin", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": ["0", "1", "1", "4"], "DATA": ["AB", "", "010203"]},
+  {"name": "str", "count": 3, "VALIDITY": [1, 1, 0], "OFFSET": [0, 6, 9, 9], "DATA": ["héllo", "€", ""]},
+  {"name": "lstr", "count": 3, "VALIDITY": [1, 1, 1], "OFFSET": ["0", "0", "3", "7"], "DATA": ["", "abc", "µµ"]},
+  {"name": "fsb", "count": 3, "VALIDITY": [1, 0, 1], "DATA": ["000102", "", "FFFEFD"]},
+  {"name": "bv", "count": 3, "VALIDITY": [1, 0, 1],
+   "VIEWS": [{"SIZE": 2, "INLINED": "F34D"}, {"SIZE": 0, "INLINED": ""}, {"SIZE": 14, "PREFIX_HEX": "00010203", "BUFFER_INDEX": 1, "OFFSET": 2}],
+   "VARIADIC_DATA_BUFFERS": ["", "FFFF000102030405060708090A0B0C0D"]},
+  {"name": "sv", "count": 3, "VALIDITY": [1, 1, 1],
+   "VIEWS": [{"SIZE": 12, "INLINED": "twelve bytes"}, {"SIZE": 14, "PREFIX_HEX": "74686972", "BUFFER_INDEX": 0, "OFFSET": 0}, {"SIZE": 0, "INLINED": ""}],
+   "VARIADIC_DATA_BUFFERS": ["746869727465656E206279746573"]}
+]}]}

@@ -1,0 +1,32 @@
+{"schema": {"fields": [
+  {"name": "d32", "nullable": true, "type": {"name": "decimal", "precision": 9, "scale": 2, "bitWidth": 32}, "children": []},
+  {"name": "d64", "nullable": true, "type": {"name": "decimal", "precision": 18, "scale": 2, "bitWidth": 64}, "children": []},
+  {"name": "d128", "nullable": true, "type": {"name": "decimal", "precision": 38, "scale": -3}, "children": []},
+  {"name": "d256", "nullable": true, "type": {"name": "decimal256", "precision": 76, "scale": 5}, "children": []},
+  {"name": "date32", "nullable": true, "type": {"name": "date", "unit": "DAY"}, "children": []},
+  {"name": "date64", "nullable": true, "type": {"name": "date", "unit": "MILLISECOND"}, "children": []},
+  {"name": "t32", "nullable": true, "type": {"name": "time", "unit": "MILLISECOND", "bitWidth": 32}, "children": []},
+  {"name": "t64", "nullable": true, "type": {"name": "time", "unit": "NANOSECOND", "bitWidth": 64}, "children": []},
+  {"name": "ts", "nullable": true, "type": {"name": "timestamp", "unit": "MICROSECOND", "timezone": "Europe/Paris"}, "children": []},
+  {"name": "ts_naive", "nullable": true, "type": {"name": "timestamp", "unit": "SECOND"}, "children": []},
+  {"name": "dur", "nullable": true, "type": {"name": "duration", "unit": "NANOSECOND"}, "children": []},
+  {"name": "ym", "nullable": true, "type": {"name": "interval", "unit": "YEAR_MONTH"}, "children": []},
+  {"name": "dt", "nullable": true, "type": {"name": "interval", "unit": "DAY_TIME"}, "children": []},
+  {"name": "mdn", "nullable": true, "type": {"name": "interval", "unit": "MONTH_DAY_NANO"}, "children": []}
+]},
+"batches": [{"count": 2, "columns": [
+  {"name": "d32", "count": 2, "VALIDITY": [1, 0], "DATA": ["-999999999", "junk"]},
+  {"name": "d64", "count": 2, "VALIDITY": [1, 1], "DATA": ["123456789012345678", "-1"]},
+  {"name": "d128", "count": 2, "VALIDITY": [1, 1], "DATA": ["-99999999999999999999999999999999999999", "0"]},
+  {"name": "d256", "count": 2, "VALIDITY": [1, 1], "DATA": ["-5789604461865809771178549250434395392663499233282028201972879200395656481996", "1"]},
+  {"name": "date32", "count": 2, "VALIDITY": [1, 1], "DATA": [-719162, 2932896]},
+  {"name": "date64", "count": 2, "VALIDITY": [1, 0], "DATA": ["1577836800000", "0"]},
+  {"name": "t32", "count": 2, "VALIDITY": [1, 1], "DATA": [0, 86399999]},
+  {"name": "t64", "count": 2, "VALIDITY": [1, 1], "DATA": ["0", "86399999999999"]},
+  {"name": "ts", "count": 2, "VALIDITY": [1, 1], "DATA": ["-62135596800000000", "253402300799999999"]},
+  {"name": "ts_naive", "count": 2, "VALIDITY": [0, 1], "DATA": ["0", "1"]},
+  {"name": "dur", "count": 2, "VALIDITY": [1, 1], "DATA": ["-9223372036854775808", "1"]},
+  {"name": "ym", "count": 2, "VALIDITY": [1, 1], "DATA": [-2147483648, 13]},
+  {"name": "dt", "count": 2, "VALIDITY": [1, 0], "DATA": [{"days": -1, "milliseconds": 86399999}, {}]},
+  {"name": "mdn", "count": 2, "VALIDITY": [1, 1], "DATA": [{"months": 1, "days": -2, "nanoseconds": -9223372036854775808}, {"months": 0, "days": 0, "nanoseconds": "5"}]}
+]}]}

@@ -10,3 +10,7 @@ written by that Arrow version (incl. compression, shared dictionaries, big-endia
 
 Regenerate with: python -I tools/fuzz_import_seeds.py <arrow-testing checkout>
 Other files: gen-* come from `zig build fuzz-gen-seeds`, regress-* are fixed zarrow findings.
+
+at-1.0.0-littleendian-generated_dictionary_unsigned.stream: copied unmodified from
+data/arrow-ipc-stream/integration/1.0.0-littleendian/ of the same revision (unsigned dictionary
+indices). zarrow-integration-*: written by zarrow's fixed IPC writers from the gold JSON.

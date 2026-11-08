@@ -43,6 +43,7 @@ Use `zarrow` when you want to:
 | Record batches | Supported |
 | Arrow IPC stream read/write | Supported |
 | Arrow IPC interop fixtures | Supported |
+| Arrow integration suite (apache/arrow-testing gold files) | all 69 little-endian cases pass, big-endian rejected by design ([docs/integration-suite.md](docs/integration-suite.md)) |
 | Arrow C Data / C Stream ABI | Supported |
 | `zarrow-core` module (core and compute without IPC/FFI) | Supported |
 | Compute kernels | In this repository: selections, concat, dictionary encode and validation today; see [docs/compute-support-matrix.md](docs/compute-support-matrix.md) |
@@ -201,6 +202,8 @@ Use this section as a quick navigation map:
 - Type coverage matrix:
   - [docs/type-coverage.md](docs/type-coverage.md)
   - [docs/type-coverage-zh.md](docs/type-coverage-zh.md)
+- Arrow integration suite (integration JSON, archery-style tester, gold-file results):
+  - [docs/integration-suite.md](docs/integration-suite.md)
 - IPC interop guide:
   - [docs/interop-arrow-go.md](docs/interop-arrow-go.md)
   - [docs/interop-arrow-go-zh.md](docs/interop-arrow-go-zh.md)

@@ -1,0 +1,26 @@
+{"schema": {"fields": [
+  {"name": "d", "nullable": true, "type": {"name": "utf8"}, "children": [],
+   "dictionary": {"id": 3, "indexType": {"name": "int", "isSigned": true, "bitWidth": 16}, "isOrdered": true}},
+  {"name": "shared", "nullable": true, "type": {"name": "utf8"}, "children": [],
+   "dictionary": {"id": 3, "indexType": {"name": "int", "isSigned": true, "bitWidth": 8}, "isOrdered": false}},
+  {"name": "nested", "nullable": true, "type": {"name": "list"}, "children": [
+    {"name": "inner", "nullable": true, "type": {"name": "utf8"}, "children": [],
+     "dictionary": {"id": 3, "indexType": {"name": "int", "isSigned": true, "bitWidth": 32}, "isOrdered": false}}],
+   "dictionary": {"id": 9, "indexType": {"name": "int", "isSigned": true, "bitWidth": 64}, "isOrdered": false}}
+]},
+"dictionaries": [
+  {"id": 3, "data": {"count": 2, "columns": [{"name": "DICT3", "count": 2, "VALIDITY": [1, 1], "OFFSET": [0, 1, 2], "DATA": ["a", "b"]}]}},
+  {"id": 3, "isDelta": true, "data": {"count": 1, "columns": [{"name": "DICT3", "count": 1, "VALIDITY": [0], "OFFSET": [0, 0], "DATA": [""]}]}},
+  {"id": 9, "data": {"count": 2, "columns": [{"name": "DICT9", "count": 2, "VALIDITY": [1, 1], "OFFSET": [0, 2, 3], "children": [
+    {"name": "inner", "count": 3, "VALIDITY": [1, 1, 1], "DATA": [0, 1, 2]}]}]}}
+],
+"batches": [
+ {"count": 2, "columns": [
+  {"name": "d", "count": 2, "VALIDITY": [1, 0], "DATA": [2, 77]},
+  {"name": "shared", "count": 2, "VALIDITY": [1, 1], "DATA": [1, 0]},
+  {"name": "nested", "count": 2, "VALIDITY": [1, 1], "DATA": ["1", "0"]}]},
+ {"count": 1, "columns": [
+  {"name": "d", "count": 1, "VALIDITY": [1], "DATA": [0]},
+  {"name": "shared", "count": 1, "VALIDITY": [0], "DATA": [0]},
+  {"name": "nested", "count": 1, "VALIDITY": [1], "DATA": ["1"]}]}
+]}
