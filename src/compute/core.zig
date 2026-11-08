@@ -424,6 +424,11 @@ pub const StrftimeOptions = options_mod.StrftimeOptions;
 pub const StrptimeOptions = options_mod.StrptimeOptions;
 pub const AssumeTimezoneOptions = options_mod.AssumeTimezoneOptions;
 pub const Utf8NormalizeOptions = options_mod.Utf8NormalizeOptions;
+pub const ListFlattenOptions = options_mod.ListFlattenOptions;
+pub const ListSliceOptions = options_mod.ListSliceOptions;
+pub const MakeStructOptions = options_mod.MakeStructOptions;
+pub const StructFieldOptions = options_mod.StructFieldOptions;
+pub const MapLookupOptions = options_mod.MapLookupOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;

@@ -43,8 +43,8 @@ Which data types cross the C data interface is tracked per type in the C ABI col
 | View arrays carry the final buffer of variadic data-buffer sizes; on import it is not kept, so a view's buffer index must name a data buffer | `exportArray`, `importArray` | yes | `src/ffi/c_data.zig:373`, `src/ffi/c_data.zig:706` | `src/ffi/c_data.zig:"c data array import supports string_view and binary_view buffers"`, `src/ffi/c_data.zig:"c data import rejects a view whose buffer index names the variadic sizes buffer"` |
 | Dictionary-encoded fields import as dictionaries; imported indices are bounded by the dictionary | `importDataType`, `importArray` | yes | `src/ffi/c_data.zig:540`, `src/ffi/c_data.zig:706` | `src/ffi/c_data.zig:"c data dictionary field imports as dictionary and rejects indices past the dictionary"` |
 | Zig round-trip example, run in CI by `zig build examples` (`.github/workflows/ci.yml:110`) | `examples/c_abi_roundtrip.zig` | yes | `examples/c_abi_roundtrip.zig:24`, `.github/workflows/ci.yml:110` | `build.zig:"examples"` |
-| Arrow C++ smoke (`zarrow_c` <-> Arrow C++ 23.0.1) | `tools/interop/cpp/c_abi_smoke.cpp`, CI job `interop-c-abi-cpp-smoke` | partial (CI job only) | `tools/interop/cpp/c_abi_smoke.cpp:172`, `.github/workflows/ci.yml:873` | `build.zig:"c-api-lib"` (the library the job links; no Zig test runs the C++ side) |
-| arrow-rs smoke (`zarrow_c` <-> arrow-rs) | `tools/interop/arrow-rs/src/bin/c_abi_smoke.rs`, CI job `interop-c-abi-rs-smoke` | partial (CI job only) | `tools/interop/arrow-rs/src/bin/c_abi_smoke.rs:180`, `.github/workflows/ci.yml:923` | `build.zig:"c-api-lib"` (the library the job links; no Zig test runs the Rust side) |
+| Arrow C++ smoke (`zarrow_c` <-> Arrow C++: 23.0.1 in CI, the installed pyarrow's Arrow C++ locally) | `tools/interop/cpp/c_abi_smoke.cpp`, CI job `interop-c-abi-cpp-smoke`, build step `interop-c-abi-cpp-smoke` (`-Darrow-include`, `-Darrow-lib`; default pyarrow's; on Windows compiled by `zig cc -target x86_64-windows-msvc` against the MSVC standard library, pyarrow's ABI) | yes | `tools/interop/cpp/c_abi_smoke.cpp:172`, `tools/interop/c_abi_smoke.py:30`, `build.zig:94`, `.github/workflows/ci.yml:873` | `build.zig:"interop-c-abi-cpp-smoke"` (runs the program CI runs; also the CI job) |
+| arrow-rs smoke (`zarrow_c` <-> arrow-rs) | `tools/interop/arrow-rs/src/bin/c_abi_smoke.rs`, CI job `interop-c-abi-rs-smoke`, build step `interop-c-abi-rs-smoke` (needs cargo) | yes | `tools/interop/arrow-rs/src/bin/c_abi_smoke.rs:180`, `tools/interop/c_abi_smoke.py:30`, `build.zig:94`, `.github/workflows/ci.yml:923` | `build.zig:"interop-c-abi-rs-smoke"` (runs the program CI runs; also the CI job) |
 
 ## Streaming Semantics
 
@@ -68,7 +68,20 @@ For stream handles, export is one-shot: exporting again after ownership is moved
 
 ## Local Smoke Checks
 
-Run from repository root.
+Run from repository root. The two smoke programs also run as build steps, which build `zarrow_c`, compile
+the program against it and run it (`tools/interop/c_abi_smoke.py`; Python 3 on `PATH`):
+
+```bash
+zig build interop-c-abi-rs-smoke    # needs cargo
+zig build interop-c-abi-cpp-smoke   # Arrow C++ from the installed pyarrow, or:
+zig build interop-c-abi-cpp-smoke -Darrow-include=<dir> -Darrow-lib=<dir>
+```
+
+pip's pyarrow ships the Arrow C++ headers and, on Windows, `arrow.lib` / `arrow.dll` built with MSVC: the
+step compiles there with `zig cc -target x86_64-windows-msvc` and the MSVC standard library (Visual Studio
+Build Tools), in C++20 (pyarrow 26's headers need it), and puts pyarrow's library directories on `PATH`.
+Elsewhere it compiles with `$CXX` (default `c++`), the compiler Arrow C++ was built with, as the CI job
+does: Zig's libc++ cannot link the libstdc++ Arrow C++ API. The manual commands follow.
 
 ### 1) Build shared library
 
@@ -110,7 +123,7 @@ export LD_LIBRARY_PATH="$PWD/zig-out/lib:${LD_LIBRARY_PATH:-}"
 
 ## CI Lanes
 
-In `.github/workflows/ci.yml`:
+In `.github/workflows/ci.yml` (the build steps of the same names run the same programs locally):
 
 - `interop-c-abi-cpp-smoke`
 - `interop-c-abi-rs-smoke`

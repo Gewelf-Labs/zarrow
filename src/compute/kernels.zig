@@ -31,6 +31,7 @@ pub const temporal_text = @import("temporal_text.zig");
 pub const temporal_zone = @import("temporal_zone.zig");
 pub const tz = @import("tz.zig");
 pub const string_normalize = @import("string_normalize.zig");
+pub const structural = @import("structural.zig");
 
 /// Register every kernel family of this repository in `registry`.
 pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
@@ -61,4 +62,5 @@ pub fn registerAll(registry: *core.FunctionRegistry) core.KernelError!void {
     try temporal_text.register(registry);
     try temporal_zone.register(registry);
     try string_normalize.register(registry);
+    try structural.register(registry);
 }

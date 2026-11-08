@@ -11,8 +11,11 @@
 //! bytes `[start, stop)`: a negative position counts from the end, both are clamped to the row and
 //! a stop before the start inserts at the start (Arrow C++). utf8_zero_fill (`ZeroFillOptions`)
 //! left-pads to `width` code points with one padding code point, after a leading `+` or `-`.
-//! binary_join joins the items of a `list<T>` / `large_list<T>` row (T string, large_string,
-//! binary or large_binary) with a separator of type T (array or scalar).
+//! binary_join joins the items of a `list<T>`, `large_list<T>`, `list_view<T>` or
+//! `large_list_view<T>` row (T any string or binary layout, views included; Arrow registers
+//! list / large_list of string, large_string, binary and large_binary only) with a separator of
+//! type T (array or scalar). binary_replace_slice on a string layout counts bytes; a row whose
+//! result is not UTF-8 (a split code point) is `InvalidInput`, where Arrow writes the invalid row.
 //!
 //! Scope against Arrow C++: patterns are literal (the `*_regex` forms are in `string_regex.zig`);
 //! `ignore_case` of count_substring / find_substring folds through Unicode simple case folding
@@ -22,7 +25,9 @@
 //! replace_substring, split_pattern, count_substring, find_substring and binary_repeat take the
 //! string and binary layouts (string_view too, which Arrow does not register for split_pattern);
 //! the pad functions and the whitespace splits the string layouts; binary_slice and
-//! binary_reverse the binary layouts only (as in Arrow). binary_repeat takes an int64 count
+//! binary_reverse the binary layouts only (as in Arrow); binary_length, count_substring,
+//! find_substring, binary_slice and binary_replace_slice also take fixed_size_binary, as Arrow
+//! (see `registerFixed`). binary_repeat takes an int64 count
 //! (Arrow: any integer type). replace_substring and the forward splits of the offsets layouts
 //! work over the whole value window of a chunk at once (no per-row output bookkeeping).
 const std = @import("std");
@@ -32,6 +37,7 @@ const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const string = @import("string.zig");
 const string_regex = @import("string_regex.zig");
+const cast = @import("cast.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
@@ -43,6 +49,7 @@ const FunctionRegistry = core.FunctionRegistry;
 const KernelError = core.KernelError;
 const Options = core.Options;
 const OwnedBuffer = @import("../buffer.zig").OwnedBuffer;
+const FixedSizeBinaryArray = @import("../array/fixed_size_array.zig").FixedSizeBinaryArray;
 const SharedBuffer = @import("../buffer.zig").SharedBuffer;
 const TypeTag = std.meta.Tag(DataType);
 
@@ -52,7 +59,6 @@ const all_tags = string_tags ++ binary_tags;
 
 /// Pad functions, by Arrow name.
 const Pad = enum { ascii_lpad, ascii_rpad, ascii_center, utf8_lpad, utf8_rpad, utf8_center };
-const offset_tags = [_]TypeTag{ .string, .large_string, .binary, .large_binary };
 
 /// Register every function of the family for the layouts it supports.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
@@ -76,21 +82,25 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             try registry.registerScalarKernel(@tagName(p), unary(tag, padOptions(p), sameType(tag), Transform(.{ .pad = p }).exec));
         }
     }
-    // binary_join: list<T> / large_list<T> with a T separator.
-    inline for (offset_tags) |tag| {
-        inline for (.{ TypeTag.list, TypeTag.large_list }) |list_tag| {
+    // binary_join: list<T>, large_list<T>, list_view<T> or large_list_view<T> with a T separator.
+    inline for (all_tags) |tag| {
+        inline for (.{ TypeTag.list, TypeTag.large_list, TypeTag.list_view, TypeTag.large_list_view }) |list_tag| {
             try registry.registerScalarKernel("binary_join", .{
                 .signature = .{ .arity = 2, .type_check = joinArgs(list_tag, tag), .options_check = dense.noOptions, .result_type_fn = sameType(tag) },
                 .exec = joinList,
             });
         }
     }
+    inline for (string_tags) |tag| {
+        // Byte positions: a row whose result is not UTF-8 (a split code point) is InvalidInput.
+        try registry.registerScalarKernel("binary_replace_slice", unary(tag, replaceSliceOptions(true), sameType(tag), Transform(.replace_slice_bytes_text).exec));
+    }
     inline for (binary_tags) |tag| {
-        // Byte positions could split a code point, so the string layouts are not registered.
         try registry.registerScalarKernel("binary_replace_slice", unary(tag, replaceSliceOptions(false), sameType(tag), Transform(.replace_slice_bytes).exec));
         try registry.registerScalarKernel("binary_slice", unary(tag, sliceOptions, sameType(tag), Transform(.slice).exec));
         try registry.registerScalarKernel("binary_reverse", unary(tag, dense.noOptions, sameType(tag), Transform(.reverse).exec));
     }
+    try registerFixed(registry);
 }
 
 fn unary(comptime tag: TypeTag, comptime options_check: core.OptionsCheckFn, comptime result: core.ResultTypeFn, comptime exec: core.KernelExecFn) core.Kernel {
@@ -200,6 +210,7 @@ fn joinArgs(comptime list_tag: TypeTag, comptime tag: TypeTag) core.TypeCheckFn 
             if (args.len != 2 or std.meta.activeTag(args[0].dataType()) != list_tag or std.meta.activeTag(args[1].dataType()) != tag) return false;
             const item = switch (args[0].dataType()) {
                 .list, .large_list => |l| l.value_field.data_type.*,
+                .list_view, .large_list_view => |l| l.value_field.data_type.*,
                 else => return false,
             };
             return std.meta.activeTag(item) == tag;
@@ -256,7 +267,7 @@ fn mapRows(ctx: *ExecContext, value: ExecChunkValue, len: usize, out_type: DataT
 
 // ------------------------------------------------------------------------------ transforms
 
-const TransformKind = union(enum) { replace, slice, reverse, pad: Pad, replace_slice_utf8, replace_slice_bytes, zero_fill };
+const TransformKind = union(enum) { replace, slice, reverse, pad: Pad, replace_slice_utf8, replace_slice_bytes, replace_slice_bytes_text, zero_fill };
 
 fn Transform(comptime kind: TransformKind) type {
     return struct {
@@ -320,7 +331,7 @@ fn Transform(comptime kind: TransformKind) type {
                     for (src, 0..) |c, k| dst[src.len - 1 - k] = c;
                     try out.commit(src.len);
                 },
-                .replace_slice_utf8, .replace_slice_bytes => {
+                .replace_slice_utf8, .replace_slice_bytes, .replace_slice_bytes_text => {
                     const o = &s.options.replace_slice;
                     // Positions in code points (utf8) or bytes, mapped to byte offsets.
                     var n: usize = src.len;
@@ -340,6 +351,8 @@ fn Transform(comptime kind: TransformKind) type {
                     @memcpy(dst[0..lo], src[0..lo]);
                     @memcpy(dst[lo..][0..o.replacement.len], o.replacement);
                     @memcpy(dst[lo + o.replacement.len ..][0 .. src.len - hi], src[hi..]);
+                    // Arrow writes such a row; a string array must hold UTF-8.
+                    if (kind == .replace_slice_bytes_text and !std.unicode.utf8ValidateSlice(dst[0..size])) return error.InvalidInput;
                     try out.commit(size);
                 },
                 .zero_fill => {
@@ -416,16 +429,10 @@ fn joinListChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, 
     defer child_ref.release();
     const items = try dense.StringOperand.init(.{ .array = child_ref });
     const seps = try dense.StringOperand.init(values[1]);
-    return switch (ld.data_type) {
-        .list => joinListRows(i32, ctx, ld, items, seps, values[1], len, out_type),
-        .large_list => joinListRows(i64, ctx, ld, items, seps, values[1], len, out_type),
-        else => error.UnsupportedType,
-    };
+    return joinListRows(ctx, ld, try cast.ListRows.of(ld), items, seps, values[1], len, out_type);
 }
 
-fn joinListRows(comptime O: type, ctx: *ExecContext, ld: *const ArrayData, items: dense.StringOperand, seps: dense.StringOperand, sep_value: ExecChunkValue, len: usize, out_type: DataType) KernelError!ArrayRef {
-    const all = ld.buffers[1].typedSlice(O) catch return error.InvalidInput;
-    const offsets = all[ld.offset..][0 .. len + 1];
+fn joinListRows(ctx: *ExecContext, ld: *const ArrayData, rows: cast.ListRows, items: dense.StringOperand, seps: dense.StringOperand, sep_value: ExecChunkValue, len: usize, out_type: DataType) KernelError!ArrayRef {
     const child = ld.children[0].data();
     // Pass 1: the validity and the byte total of every row.
     var validity = dense.bitsBuffer(ctx.allocator, len) catch return error.OutOfMemory;
@@ -435,8 +442,9 @@ fn joinListRows(comptime O: type, ctx: *ExecContext, ld: *const ArrayData, items
     var total: usize = 0;
     for (0..len) |i| {
         if (ld.isNull(i) or sep_value.isNullAt(i)) continue;
-        const lo: usize = @intCast(offsets[i]);
-        const hi: usize = @intCast(offsets[i + 1]);
+        const sp = rows.span(i);
+        const lo = sp[0];
+        const hi = sp[0] + sp[1];
         var n: usize = 0;
         var valid = true;
         for (lo..hi) |j| {
@@ -461,8 +469,9 @@ fn joinListRows(comptime O: type, ctx: *ExecContext, ld: *const ArrayData, items
         }
         const sep = rowOf(seps, i);
         var w: usize = 0;
-        for (@as(usize, @intCast(offsets[i]))..@as(usize, @intCast(offsets[i + 1]))) |j| {
-            if (j > offsets[i]) {
+        const sp = rows.span(i);
+        for (sp[0]..sp[0] + sp[1]) |j| {
+            if (j > sp[0]) {
                 @memcpy((try out.reserve(w + sep.len))[w..], sep);
                 w += sep.len;
             }
@@ -971,4 +980,196 @@ pub fn partsList(allocator: std.mem.Allocator, data: *const ArrayData, len: usiz
         .buffers = &buffers,
         .children = &children,
     }) catch error.OutOfMemory;
+}
+
+// ------------------------------------------------------------------------------ fixed_size_binary
+
+/// binary_length, count_substring, find_substring (int32), binary_slice and binary_replace_slice
+/// (a fixed_size_binary of the width the options give a row of the input width) on
+/// fixed_size_binary, as Arrow C++: the rows are read through `FixedSizeBinaryArray` into a binary
+/// chunk and the binary kernels run on it.
+fn registerFixed(registry: *FunctionRegistry) KernelError!void {
+    const fsb = dense.argsOfType(.fixed_size_binary, 1);
+    try registry.registerScalarKernel("binary_length", .{
+        .signature = .{ .arity = 1, .type_check = fsb, .options_check = dense.noOptions, .result_type_fn = dense.resultTypeOf(.{ .int32 = {} }) },
+        .exec = fixedLength,
+    });
+    try registry.registerScalarKernel("count_substring", .{
+        .signature = .{ .arity = 1, .type_check = fsb, .options_check = matchOptions, .result_type_fn = dense.resultTypeOf(.{ .int32 = {} }) },
+        .exec = FixedVia(Search(.count).chunk, false).exec,
+    });
+    try registry.registerScalarKernel("find_substring", .{
+        .signature = .{ .arity = 1, .type_check = fsb, .options_check = matchOptions, .result_type_fn = dense.resultTypeOf(.{ .int32 = {} }) },
+        .exec = FixedVia(Search(.find).chunk, false).exec,
+    });
+    try registry.registerScalarKernel("binary_slice", .{
+        .signature = .{ .arity = 1, .type_check = fsb, .options_check = sliceOptions, .result_type_fn = fixedResultType },
+        .exec = FixedVia(Transform(.slice).chunk, true).exec,
+    });
+    try registry.registerScalarKernel("binary_replace_slice", .{
+        .signature = .{ .arity = 1, .type_check = fsb, .options_check = replaceSliceOptions(false), .result_type_fn = fixedResultType },
+        .exec = FixedVia(Transform(.replace_slice_bytes).chunk, true).exec,
+    });
+}
+
+fn fixedWidth(dt: DataType) KernelError!usize {
+    return switch (dt) {
+        .fixed_size_binary => |f| std.math.cast(usize, f.byte_width) orelse error.InvalidInput,
+        else => error.UnsupportedType,
+    };
+}
+
+/// The output width of binary_slice / binary_replace_slice on rows of `w` bytes (Arrow's
+/// computed fixed_size_binary type): a Python slice of `w` bytes, or `w` less the replaced bytes
+/// plus the replacement.
+fn fixedOutWidth(w: usize, options: Options) KernelError!usize {
+    const n: i64 = std.math.cast(i64, w) orelse return error.InvalidInput;
+    switch (options) {
+        .slice => |o| {
+            if (o.step > 0) {
+                const lo = std.math.clamp(if (o.start < 0) o.start +| n else o.start, 0, n);
+                const hi = std.math.clamp(if (o.stop < 0) o.stop +| n else o.stop, 0, n);
+                return if (hi > lo) @intCast(@divFloor(hi - lo - 1, o.step) + 1) else 0;
+            }
+            const lo = std.math.clamp(if (o.start < 0) o.start +| n else o.start, -1, n - 1);
+            const hi = std.math.clamp(if (o.stop < 0) o.stop +| n else o.stop, -1, n - 1);
+            return if (lo > hi) @intCast(@divFloor(lo - hi - 1, -o.step) + 1) else 0;
+        },
+        .replace_slice => |o| {
+            const begin = clampPosition(o.start, w);
+            const end = @max(begin, clampPosition(o.stop, w));
+            return std.math.add(usize, w - (end - begin), o.replacement.len) catch error.InvalidOptions;
+        },
+        else => return error.InvalidOptions,
+    }
+}
+
+fn fixedResultType(args: []const Datum, options: Options) KernelError!DataType {
+    const w = try fixedOutWidth(try fixedWidth(args[0].dataType()), options);
+    // zarrow has no fixed_size_binary[0] (validateLayout requires a positive width); Arrow does.
+    if (w == 0) return error.UnsupportedType;
+    return .{ .fixed_size_binary = .{ .byte_width = std.math.cast(i32, w) orelse return error.InvalidOptions } };
+}
+
+/// The rows of a fixed_size_binary chunk (array or scalar) as a binary array.
+fn fixedAsBinary(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!ArrayRef {
+    const w = try fixedWidth(v.dataType());
+    const d = switch (v) {
+        .scalar => |s| {
+            if (s.isNull()) return dense.nullArray(allocator, .{ .binary = {} }, 1);
+            const bytes = switch (s.value) {
+                .binary, .string => |b| b,
+                else => return error.InvalidInput,
+            };
+            if (bytes.len != w) return error.InvalidInput;
+            var out = try dense.VarBinaryOutput.init(allocator, .{ .binary = {} }, 1, null, w);
+            errdefer out.deinit();
+            try out.append(bytes);
+            return out.finish();
+        },
+        .array => |a| a.data(),
+    };
+    d.validateLayout() catch return error.InvalidInput;
+    const view = FixedSizeBinaryArray{ .data = d };
+    const total = std.math.mul(usize, d.length, w) catch return error.Overflow;
+    var out = try dense.VarBinaryOutput.init(allocator, .{ .binary = {} }, d.length, try dense.combinedValidity(allocator, d.length, &.{d}), total);
+    errdefer out.deinit();
+    for (0..d.length) |i| {
+        if (w == 0 or d.isNull(i)) {
+            try out.commit(0);
+            continue;
+        }
+        try out.append(view.value(i) catch return error.InvalidInput);
+    }
+    return out.finish();
+}
+
+/// Run a binary chunk function on the rows of a fixed_size_binary chunk; with `fixed` its binary
+/// result (every valid row of the computed width) becomes a fixed_size_binary array.
+fn FixedVia(comptime chunk_fn: dense.ChunkOptionsFn, comptime fixed: bool) type {
+    return struct {
+        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+            const out_type: DataType = if (fixed) try fixedResultType(args, options) else .{ .int32 = {} };
+            return dense.execElementwiseWith(ctx, args, options, out_type, true, chunk);
+        }
+
+        fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
+            var bin = try fixedAsBinary(ctx.allocator, values[0]);
+            defer bin.release();
+            const out = try chunk_fn(ctx, &.{.{ .array = bin }}, len, options);
+            if (!fixed) return out;
+            var rows = out;
+            defer rows.release();
+            const w = try fixedOutWidth(try fixedWidth(values[0].dataType()), options);
+            return toFixed(ctx.allocator, rows, w);
+        }
+    };
+}
+
+/// A binary array whose valid rows have `w` bytes as a fixed_size_binary array (null rows zeroed).
+fn toFixed(allocator: std.mem.Allocator, arr: ArrayRef, w: usize) KernelError!ArrayRef {
+    const d = arr.data();
+    const n = d.length;
+    const op = try dense.StringOperand.init(.{ .array = arr });
+    const bytes = std.math.mul(usize, n, w) catch return error.Overflow;
+    var values_buf = OwnedBuffer.init(allocator, bytes) catch return error.OutOfMemory;
+    for (0..n) |i| {
+        if (d.isNull(i)) continue;
+        const row = rowOf(op, i);
+        if (row.len != w) {
+            values_buf.deinit();
+            return error.InvalidInput;
+        }
+        @memcpy(values_buf.data[i * w ..][0..w], row);
+    }
+    const validity = dense.combinedValidity(allocator, n, &.{d}) catch |err| {
+        values_buf.deinit();
+        return err;
+    };
+    var shared = values_buf.toShared(bytes) catch {
+        values_buf.deinit();
+        if (validity) |v| {
+            var b = v;
+            b.deinit();
+        }
+        return error.OutOfMemory;
+    };
+    errdefer shared.release();
+    var validity_shared: SharedBuffer = .empty;
+    var null_count: usize = 0;
+    if (validity) |v| {
+        var b = v;
+        null_count = bitmap.countUnsetBit(b.data, n);
+        validity_shared = b.toShared(bitmap.byteLength(n)) catch {
+            b.deinit();
+            return error.OutOfMemory;
+        };
+    }
+    errdefer validity_shared.release();
+    var buffers = [2]SharedBuffer{ validity_shared, shared };
+    return ArrayRef.fromOwnedInlineBuffers(allocator, .{
+        .data_type = .{ .fixed_size_binary = .{ .byte_width = @intCast(w) } },
+        .length = n,
+        .null_count = null_count,
+        .buffers = &buffers,
+    }) catch error.OutOfMemory;
+}
+
+/// binary_length of a fixed_size_binary: its width on every valid row.
+fn fixedLength(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+    return dense.execElementwiseWith(ctx, args, options, .{ .int32 = {} }, true, fixedLengthChunk);
+}
+
+fn fixedLengthChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, _: Options) KernelError!ArrayRef {
+    const w = std.math.cast(i32, try fixedWidth(values[0].dataType())) orelse return error.InvalidInput;
+    const validity = if (values[0] == .array) try dense.combinedValidity(ctx.allocator, len, &.{values[0].array.data()}) else null;
+    var buf = OwnedBuffer.initUninit(ctx.allocator, len * 4) catch {
+        if (validity) |v| {
+            var b = v;
+            b.deinit();
+        }
+        return error.OutOfMemory;
+    };
+    @memset(buf.typedSlice(i32)[0..len], w);
+    return dense.finishFixed(ctx.allocator, .{ .int32 = {} }, len, &buf, validity);
 }

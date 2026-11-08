@@ -3637,6 +3637,132 @@ test "ipc stream roundtrip dictionary encoded string column" {
     try std.testing.expectEqualStrings("blue", try dict_view.value(1));
 }
 
+/// Write `columns` under `fields` as one IPC stream (schema, one batch, end) into `out`.
+fn writeExtensionDictionaryStream(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating, fields: []const Field, columns: []const ArrayRef) !void {
+    const schema = Schema{ .fields = fields };
+    var batch = try RecordBatch.initBorrowed(allocator, schema, columns);
+    defer batch.deinit();
+    var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    try writer.writeSchema(schema);
+    try writer.writeRecordBatch(batch);
+    try writer.writeEnd();
+}
+
+/// A dictionary array of `value_type` (an extension type) over `storage` with `indices`.
+fn extensionDictionary(allocator: std.mem.Allocator, index_type: datatype.IntType, value_type: *const DataType, storage: ArrayRef, indices: []const ?i64) !ArrayRef {
+    var ext_builder = try @import("../array/extension_array.zig").ExtensionBuilder.init(allocator, value_type.extension);
+    defer ext_builder.deinit();
+    var values = try ext_builder.finish(storage);
+    defer values.release();
+    var dict_builder = try @import("../array/dictionary_array.zig").DictionaryBuilder.init(allocator, index_type, value_type, indices.len);
+    defer dict_builder.deinit();
+    for (indices) |i| if (i) |x| try dict_builder.appendIndex(x) else try dict_builder.appendNull();
+    return dict_builder.finish(values);
+}
+
+test "ipc stream reads a dictionary of an extension type as a dictionary whose value type is the extension (arrow.uuid and a custom name)" {
+    const allocator = std.testing.allocator;
+    const fsb16 = DataType{ .fixed_size_binary = .{ .byte_width = 16 } };
+    const int32_type = DataType{ .int32 = {} };
+    const uuid_type = DataType{ .extension = .{ .name = "arrow.uuid", .storage_type = &fsb16 } };
+    const code_type = DataType{ .extension = .{ .name = "com.example.code", .storage_type = &int32_type, .metadata = "v2" } };
+    const uuid_dict = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 32, .signed = true }, .value_type = &uuid_type } };
+    const code_dict = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 8, .signed = true }, .value_type = &code_type } };
+    const owner = [_]datatype.KeyValue{.{ .key = "owner", .value = "core" }};
+    const fields = [_]Field{
+        .{ .name = "id", .data_type = &uuid_dict, .nullable = true, .metadata = &owner },
+        .{ .name = "code", .data_type = &code_dict, .nullable = true },
+    };
+
+    // dictionary<int32, arrow.uuid>: values [0x11 * 16, 0x22 * 16], rows [1, null, 0, 1];
+    // dictionary<int8, com.example.code (int32, metadata "v2")>: values [7, 9], rows [0, 1, null, 1].
+    const ones: [16]u8 = @splat(0x11);
+    const twos: [16]u8 = @splat(0x22);
+    var fsb_builder = try @import("../array/fixed_size_array.zig").FixedSizeBinaryBuilder.init(allocator, 16, 2);
+    defer fsb_builder.deinit();
+    try fsb_builder.append(&ones);
+    try fsb_builder.append(&twos);
+    var uuids = try fsb_builder.finish();
+    defer uuids.release();
+    var id_col = try extensionDictionary(allocator, .{ .bit_width = 32, .signed = true }, &uuid_type, uuids, &.{ 1, null, 0, 1 });
+    defer id_col.release();
+    var code_builder = try @import("../array/primitive_array.zig").PrimitiveBuilder(i32, int32_type).init(allocator, 2);
+    defer code_builder.deinit();
+    try code_builder.append(7);
+    try code_builder.append(9);
+    var codes = try code_builder.finish();
+    defer codes.release();
+    var code_col = try extensionDictionary(allocator, .{ .bit_width = 8, .signed = true }, &code_type, codes, &.{ 0, 1, null, 1 });
+    defer code_col.release();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try writeExtensionDictionaryStream(allocator, &out, &fields, &.{ id_col, code_col });
+
+    var stream: std.Io.Reader = .fixed(out.written());
+    var reader = StreamReader.init(allocator, &stream);
+    defer reader.deinit();
+    const schema = try reader.readSchema();
+    // The field type is the dictionary; its value type is the extension over the storage type.
+    const id_t = schema.fields[0].data_type.*;
+    try std.testing.expect(id_t == .dictionary);
+    try std.testing.expectEqual(@as(u8, 32), id_t.dictionary.index_type.bit_width);
+    try std.testing.expect(id_t.dictionary.value_type.* == .extension);
+    try std.testing.expectEqualStrings("arrow.uuid", id_t.dictionary.value_type.extension.name);
+    try std.testing.expect(id_t.dictionary.value_type.extension.storage_type.eql(fsb16));
+    try std.testing.expectEqualStrings("core", schema.fields[0].metadata.?[0].value);
+    const code_t = schema.fields[1].data_type.*;
+    try std.testing.expect(code_t == .dictionary and code_t.dictionary.value_type.* == .extension);
+    try std.testing.expectEqualStrings("com.example.code", code_t.dictionary.value_type.extension.name);
+    try std.testing.expectEqualStrings("v2", code_t.dictionary.value_type.extension.metadata.?);
+    try std.testing.expect(code_t.dictionary.value_type.extension.storage_type.* == .int32);
+
+    var batch = (try reader.nextRecordBatch()).?;
+    defer batch.deinit();
+    const DictionaryArray = @import("../array/dictionary_array.zig").DictionaryArray;
+    const ids = DictionaryArray{ .data = batch.columns[0].data() };
+    try std.testing.expectEqual(@as(usize, 4), ids.len());
+    try std.testing.expectEqual(@as(i64, 1), try ids.index(0));
+    try std.testing.expect(ids.isNull(1));
+    try std.testing.expectEqual(@as(i64, 0), try ids.index(2));
+    const id_values = (try ids.dictionaryRef()).data();
+    try std.testing.expect(id_values.data_type == .extension);
+    try std.testing.expectEqualSlices(u8, &twos, id_values.buffers[1].data[16..32]);
+    try id_values.validateFull();
+    const code_rows = DictionaryArray{ .data = batch.columns[1].data() };
+    try std.testing.expectEqual(@as(i64, 1), try code_rows.index(3));
+    try std.testing.expect(code_rows.isNull(2));
+    const code_values = @import("../array/primitive_array.zig").PrimitiveArray(i32){ .data = (try code_rows.dictionaryRef()).data() };
+    try std.testing.expectEqual(@as(i32, 9), try code_values.value(1));
+    try batch.columns[0].data().validateFull();
+    try batch.columns[1].data().validateFull();
+}
+
+test "ipc stream reader rejects a dictionary of arrow.uuid over a storage type other than fixed_size_binary(16)" {
+    const allocator = std.testing.allocator;
+    const fsb8 = DataType{ .fixed_size_binary = .{ .byte_width = 8 } };
+    const bad_uuid = DataType{ .extension = .{ .name = "arrow.uuid", .storage_type = &fsb8 } };
+    const dict_type = DataType{ .dictionary = .{ .index_type = .{ .bit_width = 32, .signed = true }, .value_type = &bad_uuid } };
+    const fields = [_]Field{.{ .name = "id", .data_type = &dict_type, .nullable = true }};
+    const threes: [8]u8 = @splat(0x33);
+    var fsb_builder = try @import("../array/fixed_size_array.zig").FixedSizeBinaryBuilder.init(allocator, 8, 1);
+    defer fsb_builder.deinit();
+    try fsb_builder.append(&threes);
+    var storage = try fsb_builder.finish();
+    defer storage.release();
+    var col = try extensionDictionary(allocator, .{ .bit_width = 32, .signed = true }, &bad_uuid, storage, &.{ 0, null });
+    defer col.release();
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    // The writer does not check canonical extensions; the reader does, at its trust boundary.
+    try writeExtensionDictionaryStream(allocator, &out, &fields, &.{col});
+    var stream: std.Io.Reader = .fixed(out.written());
+    var reader = StreamReader.init(allocator, &stream);
+    defer reader.deinit();
+    try std.testing.expectError(StreamError.InvalidMetadata, reader.readSchema());
+}
+
 test "ipc reader merges dictionary delta batches" {
     const allocator = std.testing.allocator;
 

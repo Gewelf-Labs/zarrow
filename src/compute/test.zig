@@ -35,4 +35,5 @@ test {
     _ = @import("tz.zig");
     _ = @import("test_temporal_zone.zig");
     _ = @import("test_string_normalize.zig");
+    _ = @import("test_structural.zig");
 }

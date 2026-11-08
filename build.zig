@@ -84,6 +84,24 @@ pub fn build(b: *std.Build) !void {
     const c_api_lib_step = b.step("c-api-lib", "Build and install zarrow C ABI shared library");
     c_api_lib_step.dependOn(b.getInstallStep());
 
+    // C ABI smoke lanes (docs/interop-c-abi.md): the programs of the CI jobs of the same names,
+    // built against this build's zarrow_c and run by tools/interop/c_abi_smoke.py (the Arrow C++
+    // headers and library default to pyarrow's; the Rust lane needs cargo).
+    const arrow_include = b.option([]const u8, "arrow-include", "Arrow C++ include directory for interop-c-abi-cpp-smoke (default: pyarrow's)");
+    const arrow_lib = b.option([]const u8, "arrow-lib", "Arrow C++ library directory for interop-c-abi-cpp-smoke (default: pyarrow's)");
+    const python = if (b.graph.host.result.os.tag == .windows) "python" else "python3";
+    inline for (.{ "cpp", "rs" }, .{ "interop-c-abi-cpp-smoke", "interop-c-abi-rs-smoke" }, .{ "Arrow C++", "arrow-rs" }) |lane, name, other| {
+        const smoke = b.addSystemCommand(&.{ python, "-P" });
+        smoke.addFileArg(b.path("tools/interop/c_abi_smoke.py"));
+        smoke.addArgs(&.{ lane, "--zig", b.graph.zig_exe });
+        smoke.addPrefixedFileArg("--lib=", zarrow_c_lib.getEmittedBin());
+        if (target.result.os.tag == .windows) smoke.addPrefixedFileArg("--implib=", zarrow_c_lib.getEmittedImplib());
+        if (arrow_include) |dir| smoke.addArg(b.fmt("--arrow-include={s}", .{dir}));
+        if (arrow_lib) |dir| smoke.addArg(b.fmt("--arrow-lib={s}", .{dir}));
+        smoke.has_side_effects = true;
+        b.step(name, "Run the C ABI smoke program zarrow_c <-> " ++ other).dependOn(&smoke.step);
+    }
+
     const fbz_module = b.createModule(.{
         .root_source_file = b.path("src/fbs_runtime/lib.zig"),
     });

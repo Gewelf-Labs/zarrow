@@ -105,6 +105,16 @@ pub const OptionsTag = enum {
     assume_timezone,
     /// Normalization form of utf8_normalize.
     utf8_normalize,
+    /// Recursion of list_flatten.
+    list_flatten,
+    /// Start, stop, step and result layout of list_slice.
+    list_slice,
+    /// Field names, nullability and metadata of make_struct.
+    make_struct,
+    /// Field path of struct_field.
+    struct_field,
+    /// Query key and occurrence of map_lookup.
+    map_lookup,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -567,6 +577,51 @@ pub const Utf8NormalizeOptions = struct {
     form: Form = .nfc,
 };
 
+/// Options of list_flatten (Arrow `ListFlattenOptions`).
+pub const ListFlattenOptions = struct {
+    /// Flatten until the result is no longer a list, large_list, list_view, large_list_view or
+    /// fixed_size_list (a map stops it, as Arrow).
+    recursive: bool = false,
+};
+
+/// Options of list_slice (Arrow `ListSliceOptions`; no defaults for `start`, as Arrow).
+pub const ListSliceOptions = struct {
+    /// First position of each row (>= 0).
+    start: i64,
+    /// One past the last position (null: the end of each row); not below `start`.
+    stop: ?i64 = null,
+    /// Distance between positions (>= 1).
+    step: i64 = 1,
+    /// true: a fixed_size_list of `ceil((stop - start) / step)` values per row, padded with
+    /// nulls (needs `stop`, or a fixed_size_list input); false: the input's list layout (a
+    /// fixed_size_list input gives list); null: fixed_size_list only for a fixed_size_list input.
+    return_fixed_size_list: ?bool = null,
+};
+
+/// Options of make_struct (Arrow `MakeStructOptions`). Empty slices take pyarrow's defaults:
+/// fields named "0", "1", ..., nullable, without metadata; otherwise one entry per argument.
+pub const MakeStructOptions = struct {
+    field_names: []const []const u8 = &.{},
+    field_nullability: []const bool = &.{},
+    field_metadata: []const ?[]const @import("../datatype.zig").KeyValue = &.{},
+};
+
+/// Options of struct_field (Arrow `StructFieldOptions`): the path to the field, by child indices
+/// or (when `names` is not empty) by field names, one per nesting level. An empty path selects
+/// the input itself.
+pub const StructFieldOptions = struct {
+    indices: []const i32 = &.{},
+    names: []const []const u8 = &.{},
+};
+
+/// Options of map_lookup (Arrow `MapLookupOptions`).
+pub const MapLookupOptions = struct {
+    pub const Occurrence = enum { first, last, all };
+    /// A non-null scalar of the map's key type.
+    query_key: core.Scalar,
+    occurrence: Occurrence = .first,
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -627,6 +682,11 @@ pub const Options = union(OptionsTag) {
     strptime: StrptimeOptions,
     assume_timezone: AssumeTimezoneOptions,
     utf8_normalize: Utf8NormalizeOptions,
+    list_flatten: ListFlattenOptions,
+    list_slice: ListSliceOptions,
+    make_struct: MakeStructOptions,
+    struct_field: StructFieldOptions,
+    map_lookup: MapLookupOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {
