@@ -532,13 +532,13 @@ test "registerAll registers every kernel family function name with its kind" {
     } ++ string_names ++ temporal_names ++ string_transform_names ++ string_regex_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
         "round",  "round_to_multiple", "round_binary", "ceil",            "floor",           "trunc",  "coalesce",       "if_else", "case_when", "choose",
         "random", "strftime",          "strptime",     "assume_timezone", "local_timestamp", "is_dst", "utf8_normalize",
-    };
+    } ++ [_][]const u8{ "list_value_length", "list_element", "list_slice", "make_struct", "struct_field", "map_lookup" };
     const vector_names = [_][]const u8{
         "unique",                 "value_counts",    "dictionary_encode",       "drop_null",             "fill_null_forward",   "fill_null_backward", "mode",
         "quantile",               "sort_indices",    "array_sort_indices",      "partition_nth_indices", "select_k_unstable",   "rank",               "rank_quantile",
         "rank_normal",            "search_sorted",   "replace_with_mask",       "scatter",               "inverse_permutation", "indices_nonzero",    "cumulative_sum",
         "cumulative_sum_checked", "cumulative_prod", "cumulative_prod_checked", "cumulative_min",        "cumulative_max",      "cumulative_mean",    "pairwise_diff",
-        "pairwise_diff_checked",  "winsorize",
+        "pairwise_diff_checked",  "winsorize",       "list_flatten",            "list_parent_indices",
     };
     const aggregate_names = [_][]const u8{
         "sum",                "mean",        "min",  "max",      "min_max", "count", "count_all",  "any",            "all",   "product",
@@ -587,23 +587,34 @@ test "registerAll registers every kernel family function name with its kind" {
     // non-numeric types (bool, temporal, decimal32 / decimal64, string / binary layouts).
     try std.testing.expectEqual(@as(usize, 13), registry.kernelCount("min_max", .aggregate));
     // One cast kernel for every pair; string kernels per string layout (binary_length also for the
-    // binary layouts); temporal date parts for date32 / date64 / timestamp, time parts without date32.
+    // binary layouts and fixed_size_binary); temporal date parts for date32 / date64 / timestamp, time parts without date32.
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("cast", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("utf8_upper", .scalar));
-    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("binary_length", .scalar));
+    try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("binary_length", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("year", .scalar));
     try std.testing.expectEqual(@as(usize, 4), registry.kernelCount("hour", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("subsecond", .scalar));
     try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("hours_between", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("years_between", .scalar));
-    try std.testing.expectEqual(@as(usize, 8), registry.kernelCount("binary_join", .scalar));
+    // binary_join: list, large_list, list_view, large_list_view of the six string / binary layouts.
+    try std.testing.expectEqual(@as(usize, 24), registry.kernelCount("binary_join", .scalar));
+    try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("binary_replace_slice", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("replace_substring", .scalar));
-    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("binary_slice", .scalar));
+    try std.testing.expectEqual(@as(usize, 4), registry.kernelCount("binary_slice", .scalar));
+    try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("count_substring", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("extract_regex", .scalar));
     try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("hash_sum", .hash_aggregate));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sum", .aggregate));
+    // Structural: one kernel per list layout (list, large_list, list_view, large_list_view,
+    // fixed_size_list), per record layout (struct, sparse_union, dense_union), one for map and a
+    // variadic make_struct.
+    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("list_element", .scalar));
+    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("list_flatten", .vector));
+    try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("struct_field", .scalar));
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("map_lookup", .scalar));
+    try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("make_struct", .scalar));
     // Kinds are separate namespaces: no scalar "sum".
     try std.testing.expect(!registry.containsFunction("sum", .scalar));
 }

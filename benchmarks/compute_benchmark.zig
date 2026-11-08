@@ -303,6 +303,33 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var mixed_norm = try buildNormMixed(allocator, cfg.rows, 23);
     defer mixed_norm.release();
     try timeKernelWith(io, &ctx, .scalar, "compute_utf8_normalize_nfc_mixed", "utf8_normalize", &.{.{ .array = mixed_norm }}, .none, cfg, emit_csv, meta);
+    // Structural transforms over the list<int32> rows of four values (ns per list row):
+    // list_flatten (one slice of the child), list_value_length; struct_field of a struct over
+    // the int32 rows with every tenth struct row null (validity ANDed into the child's), and
+    // map_lookup (first) of key 3 in map<int32, int32> rows of four entries with keys in [0, 8).
+    const list_cfg = BenchConfig{ .rows = cfg.rows / 4, .iterations = cfg.iterations };
+    try timeKernel(io, &ctx, .vector, "compute_list_flatten", "list_flatten", &.{.{ .array = lists }}, list_cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .scalar, "compute_list_value_length", "list_value_length", &.{.{ .array = lists }}, list_cfg, emit_csv, meta);
+    const struct_fields = [_]zarrow.Field{ .{ .name = "a", .data_type = &i32_type }, .{ .name = "an", .data_type = &i32_type } };
+    var struct_builder = zarrow.StructBuilder.init(allocator, &struct_fields);
+    defer struct_builder.deinit();
+    for (0..cfg.rows) |i| if (i % 10 == 0) try struct_builder.appendNull() else try struct_builder.appendValid();
+    var structs = try struct_builder.finish(&.{ a, an });
+    defer structs.release();
+    try timeKernelWith(io, &ctx, .scalar, "compute_struct_field", "struct_field", &.{.{ .array = structs }}, .{ .struct_field = .{ .indices = &.{1} } }, cfg, emit_csv, meta);
+    var map_keys = try buildInt32Mod(allocator, (cfg.rows / 4) * 4, 24, 8);
+    defer map_keys.release();
+    const key_field = zarrow.Field{ .name = "key", .data_type = &i32_type, .nullable = false };
+    const item_field = zarrow.Field{ .name = "value", .data_type = &i32_type };
+    var entries = try ctx.invokeScalar("make_struct", &.{ .{ .array = map_keys }, .{ .array = child } }, .{ .make_struct = .{ .field_names = &.{ "key", "value" }, .field_nullability = &.{ false, true } } });
+    defer entries.release();
+    var map_builder = try zarrow.MapBuilder.init(allocator, cfg.rows / 4, key_field, item_field, false);
+    defer map_builder.deinit();
+    for (0..cfg.rows / 4) |_| try map_builder.appendLen(4);
+    var maps = try map_builder.finish(entries.array);
+    defer maps.release();
+    const key3 = compute.Scalar.init(i32_type, .{ .i32 = 3 });
+    try timeKernelWith(io, &ctx, .scalar, "compute_map_lookup", "map_lookup", &.{.{ .array = maps }}, .{ .map_lookup = .{ .query_key = key3 } }, list_cfg, emit_csv, meta);
     // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
     try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
 }

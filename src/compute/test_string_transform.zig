@@ -569,9 +569,261 @@ test "string transform replace_slice, zero_fill and binary_join on lists (Arrow 
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_replace_slice", &.{.{ .array = s }}, replaceSlice(0, 1, "\xff")));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_zero_fill", &.{.{ .array = s }}, .{ .zero_fill = .{ .width = 3, .padding = "00" } }));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("utf8_zero_fill", &.{.{ .array = s }}, .{ .pad = .{ .width = 3 } }));
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_replace_slice", &.{.{ .array = s }}, replaceSlice(0, 1, "x")));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("binary_replace_slice", &.{.{ .array = s }}, replaceSlice(0, 1, "\xff")));
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_join", &.{ .{ .array = lists }, .{ .scalar = Scalar.init(large_string_item, .{ .string = "-" }) } }, none));
     var liar = try makeList(false, allocator, &string_item, bin_items, &boffs, null, 0);
     defer liar.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_join", &.{ .{ .array = liar }, .{ .scalar = Scalar.init(string_item, .{ .string = "-" }) } }, none));
+}
+
+test "string transform binary_join on list_view and view layouts, binary_replace_slice on the string layouts (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // binary_replace_slice counts bytes on string, large_string and string_view (pyarrow 26 on
+    // string / large_string; it has no string_view kernel). A result that splits "\u{e9}" is not
+    // UTF-8: pyarrow writes it, zarrow answers InvalidInput.
+    inline for (string_tags) |tag| {
+        var a = try common.makeStrings(tag, allocator, &.{ "h\u{e9}llo", "", null, "ab" });
+        defer a.release();
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .array = a }}, replaceSlice(1, 3, "XY"), &.{ "hXYllo", "XY", null, "aXY" });
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .array = a }}, replaceSlice(-2, -1, "Z"), &.{ "h\u{e9}lZo", "Z", null, "Zb" });
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .array = a }}, replaceSlice(0, 0, "\u{ff}"), &.{ "\u{ff}h\u{e9}llo", "\u{ff}", null, "\u{ff}ab" });
+        var tail = try a.slice(1, 3);
+        defer tail.release();
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .array = tail }}, replaceSlice(0, 1, "Q"), &.{ "Q", null, "Qb" });
+        try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_replace_slice", &.{.{ .array = a }}, replaceSlice(2, 3, "Z")));
+        try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_replace_slice", &.{.{ .array = a }}, replaceSlice(1, 2, "\u{e9}")));
+        var ch = try common.chunkedAt(allocator, a, &.{2});
+        defer ch.release();
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .chunked = ch }}, replaceSlice(1, 3, "XY"), &.{ "hXYllo", "XY", null, "aXY" });
+        try common.expectInvokeStrings(&ctx, "binary_replace_slice", &.{.{ .scalar = Scalar.init(@unionInit(DataType, @tagName(tag), {}), .{ .string = "abc" }) }}, replaceSlice(1, 2, "-"), &.{"a-c"});
+    }
+
+    // binary_join of [["a", "b"], null, [], ["x", null], ["c"]] for every item layout under
+    // list, large_list, list_view and large_list_view (Arrow registers list / large_list of the
+    // offset layouts only; the results equal pyarrow 26's list<string> ones): a null list, a
+    // null item or a null separator gives null.
+    inline for (string_tags ++ binary_tags) |tag| {
+        const item = comptime @unionInit(DataType, @tagName(tag), {});
+        const field = common.datatype.Field{ .name = "item", .data_type = &item };
+        var items = try common.makeStrings(tag, allocator, &.{ "a", "b", "x", null, "c" });
+        defer items.release();
+        var seps = try common.makeStrings(tag, allocator, &.{ "+", "+", "+", "+", null });
+        defer seps.release();
+        const text = comptime (tag == .string or tag == .large_string or tag == .string_view);
+        const dash = Scalar.init(item, if (text) .{ .string = "-" } else .{ .binary = "-" });
+        inline for (.{ common.array_mod.ListBuilder, common.array_mod.LargeListBuilder, common.array_mod.ListViewBuilder, common.array_mod.LargeListViewBuilder }) |B| {
+            var b = try B.init(allocator, 5, field);
+            defer b.deinit();
+            try b.appendLen(2);
+            try b.appendNull();
+            try b.appendLen(0);
+            try b.appendLen(2);
+            try b.appendLen(1);
+            var lists = try b.finish(items);
+            defer lists.release();
+            try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = lists }, .{ .scalar = dash } }, none, &.{ "a-b", null, "", null, "c" });
+            try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = lists }, .{ .array = seps } }, none, &.{ "a+b", null, "", null, null });
+            var tail = try lists.slice(2, 3);
+            defer tail.release();
+            var sep_tail = try seps.slice(2, 3);
+            defer sep_tail.release();
+            try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = tail }, .{ .array = sep_tail } }, none, &.{ "", null, null });
+        }
+    }
+    // list_view rows out of order and overlapping: offsets [3, 0, 1], sizes [2, 2, 3] over
+    // ["a", "b", "c", "d", "e"] join to ["d-e", "a-b", "b-c-d"].
+    var letters = try common.makeStrings(.string_view, allocator, &.{ "a", "b", "c", "d", "e" });
+    defer letters.release();
+    const sv = DataType{ .string_view = {} };
+    const offs = [_]i32{ 3, 0, 1 };
+    const sizes = [_]i32{ 2, 2, 3 };
+    const bufs = [_]common.SharedBuffer{ .empty, .fromSlice(std.mem.sliceAsBytes(&offs)), .fromSlice(std.mem.sliceAsBytes(&sizes)) };
+    var views = try ArrayRef.fromBorrowed(allocator, .{ .data_type = .{ .list_view = .{ .value_field = .{ .name = "item", .data_type = &sv } } }, .length = 3, .null_count = 0, .buffers = &bufs, .children = &.{letters} });
+    defer views.release();
+    try common.expectInvokeStrings(&ctx, "binary_join", &.{ .{ .array = views }, .{ .scalar = Scalar.init(sv, .{ .string = "-" }) } }, none, &.{ "d-e", "a-b", "b-c-d" });
+    // A separator of another layout than the items is NoMatchingKernel (as Arrow).
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_join", &.{ .{ .array = views }, .{ .scalar = Scalar.init(.{ .string = {} }, .{ .string = "-" }) } }, none));
+}
+
+/// A fixed_size_binary array of `width` bytes per row.
+fn makeFixed(allocator: std.mem.Allocator, width: usize, rows: []const ?[]const u8) !ArrayRef {
+    var b = try common.array_mod.FixedSizeBinaryBuilder.init(allocator, width, rows.len);
+    defer b.deinit();
+    for (rows) |r| if (r) |x| try b.append(x) else try b.appendNull();
+    return b.finish();
+}
+
+/// The rows of a fixed_size_binary datum (array, chunked or scalar) of width `width`; every
+/// array part must pass validateFull and have that width.
+fn fixedRows(allocator: std.mem.Allocator, datum: Datum, width: usize) ![]?[]const u8 {
+    var parts: std.ArrayList(?[]const u8) = .empty;
+    errdefer parts.deinit(allocator);
+    const arrays: []const ArrayRef = switch (datum) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        .scalar => |s| {
+            try std.testing.expectEqual(@as(i32, @intCast(width)), s.data_type.fixed_size_binary.byte_width);
+            try parts.append(allocator, if (s.isNull()) null else s.value.binary);
+            return parts.toOwnedSlice(allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    for (arrays) |a| {
+        const d = a.data();
+        try d.validateFull();
+        try std.testing.expectEqual(@as(i32, @intCast(width)), d.data_type.fixed_size_binary.byte_width);
+        const view = common.array_mod.FixedSizeBinaryArray{ .data = d };
+        for (0..d.length) |i| try parts.append(allocator, if (d.isNull(i)) null else try view.value(i));
+    }
+    return parts.toOwnedSlice(allocator);
+}
+
+fn expectFixed(ctx: *ExecContext, name: []const u8, args: []const Datum, options: Options, width: usize, expected: []const ?[]const u8) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invokeScalar(name, args, options);
+    defer out.release();
+    const rows = try fixedRows(allocator, out, width);
+    defer allocator.free(rows);
+    try common.expectStrings(expected, rows);
+}
+
+fn sliceBytes(start: i64, stop: i64, step: i64) Options {
+    return .{ .slice = .{ .start = start, .stop = stop, .step = step } };
+}
+
+test "string transform fixed_size_binary: binary_length, binary_slice, binary_replace_slice, count_substring, find_substring on nulls, sliced, chunked and scalar inputs (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // fixed_size_binary[4] [abcd, null, wxab, a\xc3\xa9b]; pyarrow 26 gives binary_slice and
+    // binary_replace_slice a fixed_size_binary of the computed width, the others int32.
+    var a = try makeFixed(allocator, 4, &.{ "abcd", null, "wxab", "a\xc3\xa9b" });
+    defer a.release();
+    const ad: Datum = .{ .array = a };
+    try common.expectInvokeWith(i32, &ctx, "binary_length", &.{ad}, none, &.{ 4, null, 4, 4 });
+    const max = std.math.maxInt(i64);
+    const S = struct { o: Options, w: usize, rows: [4]?[]const u8 };
+    const slices = [_]S{
+        .{ .o = sliceBytes(1, 3, 1), .w = 2, .rows = .{ "bc", null, "xa", "\xc3\xa9" } },
+        .{ .o = sliceBytes(0, max, 2), .w = 2, .rows = .{ "ac", null, "wa", "a\xa9" } },
+        .{ .o = sliceBytes(-2, max, 1), .w = 2, .rows = .{ "cd", null, "ab", "\xa9b" } },
+        .{ .o = sliceBytes(3, 1, -1), .w = 2, .rows = .{ "dc", null, "ba", "b\xa9" } },
+        .{ .o = sliceBytes(-10, 10, 1), .w = 4, .rows = .{ "abcd", null, "wxab", "a\xc3\xa9b" } },
+    };
+    for (slices) |c| try expectFixed(&ctx, "binary_slice", &.{ad}, c.o, c.w, &c.rows);
+    const replaces = [_]S{
+        .{ .o = replaceSlice(1, 3, "Q"), .w = 3, .rows = .{ "aQd", null, "wQb", "aQb" } },
+        .{ .o = replaceSlice(0, 0, "XY"), .w = 6, .rows = .{ "XYabcd", null, "XYwxab", "XYa\xc3\xa9b" } },
+        .{ .o = replaceSlice(-1, 4, ""), .w = 3, .rows = .{ "abc", null, "wxa", "a\xc3\xa9" } },
+        .{ .o = replaceSlice(3, 1, "Z"), .w = 5, .rows = .{ "abcZd", null, "wxaZb", "a\xc3\xa9Zb" } },
+        .{ .o = replaceSlice(10, 20, "R"), .w = 5, .rows = .{ "abcdR", null, "wxabR", "a\xc3\xa9bR" } },
+        .{ .o = replaceSlice(-10, 2, "S"), .w = 3, .rows = .{ "Scd", null, "Sab", "S\xa9b" } },
+    };
+    for (replaces) |c| try expectFixed(&ctx, "binary_replace_slice", &.{ad}, c.o, c.w, &c.rows);
+    const M = struct { o: Options, count: [4]?i32, find: [4]?i32 };
+    const matches = [_]M{
+        .{ .o = match("ab", false), .count = .{ 1, null, 1, 0 }, .find = .{ 0, null, 2, -1 } },
+        .{ .o = match("AB", true), .count = .{ 1, null, 1, 0 }, .find = .{ 0, null, 2, -1 } },
+        .{ .o = match("", false), .count = .{ 5, null, 5, 5 }, .find = .{ 0, null, 0, 0 } },
+        .{ .o = match("b", false), .count = .{ 1, null, 1, 1 }, .find = .{ 1, null, 3, 3 } },
+        .{ .o = match("\xc3\xa9", false), .count = .{ 0, null, 0, 1 }, .find = .{ -1, null, -1, 1 } },
+        .{ .o = match("\xc3\x89", true), .count = .{ 0, null, 0, 0 }, .find = .{ -1, null, -1, -1 } },
+    };
+    for (matches) |c| {
+        try common.expectInvokeWith(i32, &ctx, "count_substring", &.{ad}, c.o, &c.count);
+        try common.expectInvokeWith(i32, &ctx, "find_substring", &.{ad}, c.o, &c.find);
+    }
+
+    // Sliced, chunked (one result chunk per input chunk) and scalar inputs; a null scalar.
+    var tail = try a.slice(1, 3);
+    defer tail.release();
+    try common.expectInvokeWith(i32, &ctx, "binary_length", &.{.{ .array = tail }}, none, &.{ null, 4, 4 });
+    try expectFixed(&ctx, "binary_slice", &.{.{ .array = tail }}, sliceBytes(1, 3, 1), 2, &.{ null, "xa", "\xc3\xa9" });
+    try expectFixed(&ctx, "binary_replace_slice", &.{.{ .array = tail }}, replaceSlice(1, 3, "Q"), 3, &.{ null, "wQb", "aQb" });
+    try common.expectInvokeWith(i32, &ctx, "find_substring", &.{.{ .array = tail }}, match("b", false), &.{ null, 3, 3 });
+    var chunks = try common.chunkedAt(allocator, a, &.{ 1, 3 });
+    defer chunks.release();
+    try expectFixed(&ctx, "binary_slice", &.{.{ .chunked = chunks }}, sliceBytes(1, 3, 1), 2, &.{ "bc", null, "xa", "\xc3\xa9" });
+    try expectFixed(&ctx, "binary_replace_slice", &.{.{ .chunked = chunks }}, replaceSlice(0, 0, "XY"), 6, &.{ "XYabcd", null, "XYwxab", "XYa\xc3\xa9b" });
+    try common.expectInvokeWith(i32, &ctx, "count_substring", &.{.{ .chunked = chunks }}, match("ab", false), &.{ 1, null, 1, 0 });
+    try common.expectInvokeWith(i32, &ctx, "binary_length", &.{.{ .chunked = chunks }}, none, &.{ 4, null, 4, 4 });
+    const fsb4 = DataType{ .fixed_size_binary = .{ .byte_width = 4 } };
+    const sc: Datum = .{ .scalar = Scalar.init(fsb4, .{ .binary = "abcd" }) };
+    const null_sc: Datum = .{ .scalar = Scalar.init(fsb4, .null) };
+    try expectFixed(&ctx, "binary_slice", &.{sc}, sliceBytes(1, 3, 1), 2, &.{"bc"});
+    try expectFixed(&ctx, "binary_slice", &.{null_sc}, sliceBytes(1, 3, 1), 2, &.{null});
+    try expectFixed(&ctx, "binary_replace_slice", &.{sc}, replaceSlice(1, 3, "Q"), 3, &.{"aQd"});
+    try common.expectInvokeWith(i32, &ctx, "binary_length", &.{sc}, none, &.{4});
+    try common.expectInvokeWith(i32, &ctx, "count_substring", &.{null_sc}, match("a", false), &.{null});
+    try common.expectInvokeWith(i32, &ctx, "find_substring", &.{sc}, match("cd", false), &.{2});
+    // An empty result width: pyarrow 26 gives fixed_size_binary[0] (binary_slice(5, 9) and
+    // binary_replace_slice(0, 4, "") give [b"", null, b"", b""]); zarrow has no zero-width
+    // fixed_size_binary (validateLayout rejects it), so the call is UnsupportedType.
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("binary_slice", &.{ad}, sliceBytes(5, 9, 1)));
+    try std.testing.expectError(error.UnsupportedType, ctx.invokeScalar("binary_replace_slice", &.{ad}, replaceSlice(0, 4, "")));
+    // A step of 0 is an option error, as for the binary layouts.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("binary_slice", &.{ad}, sliceBytes(0, 1, 0)));
+
+    // Oracle: random fixed_size_binary[5] rows with nulls, sliced, against a per-row loop.
+    var prng = std.Random.DefaultPrng.init(0xf5b);
+    const rng = prng.random();
+    for (0..4) |_| {
+        const n = 100 + rng.uintLessThan(usize, 60);
+        const off = rng.uintLessThan(usize, 9);
+        const store = try allocator.alloc(u8, (n + off) * 5);
+        defer allocator.free(store);
+        for (store) |*c| c.* = "ab\xc3\xa9x"[rng.uintLessThan(usize, 5)];
+        const rows = try allocator.alloc(?[]const u8, n + off);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = if (rng.uintLessThan(u8, 5) == 0) null else store[i * 5 ..][0..5];
+        var full = try makeFixed(allocator, 5, rows);
+        defer full.release();
+        var arr = try full.slice(off, n);
+        defer arr.release();
+        const in = rows[off..];
+        const want_s = try allocator.alloc(?[]const u8, n);
+        defer allocator.free(want_s);
+        const buf = try allocator.alloc(u8, n * 8);
+        defer allocator.free(buf);
+        // binary_slice(1, 4, 2): bytes 1 and 3; binary_replace_slice(2, 4, "Q"): 4 bytes.
+        for (want_s, in, 0..) |*w, r, i| w.* = if (r) |x| blk: {
+            buf[i * 8] = x[1];
+            buf[i * 8 + 1] = x[3];
+            break :blk buf[i * 8 ..][0..2];
+        } else null;
+        try expectFixed(&ctx, "binary_slice", &.{.{ .array = arr }}, sliceBytes(1, 4, 2), 2, want_s);
+        for (want_s, in, 0..) |*w, r, i| w.* = if (r) |x| blk: {
+            @memcpy(buf[i * 8 ..][0..2], x[0..2]);
+            buf[i * 8 + 2] = 'Q';
+            buf[i * 8 + 3] = x[4];
+            break :blk buf[i * 8 ..][0..4];
+        } else null;
+        try expectFixed(&ctx, "binary_replace_slice", &.{.{ .array = arr }}, replaceSlice(2, 4, "Q"), 4, want_s);
+        const counts = try allocator.alloc(?i32, n);
+        defer allocator.free(counts);
+        const finds = try allocator.alloc(?i32, n);
+        defer allocator.free(finds);
+        const lens = try allocator.alloc(?i32, n);
+        defer allocator.free(lens);
+        for (in, counts, finds, lens) |r, *c, *f, *l| {
+            const x = r orelse {
+                c.* = null;
+                f.* = null;
+                l.* = null;
+                continue;
+            };
+            c.* = @intCast(std.mem.count(u8, x, "ab"));
+            f.* = if (std.mem.indexOf(u8, x, "\xc3\xa9")) |p| @intCast(p) else -1;
+            l.* = 5;
+        }
+        try common.expectInvokeWith(i32, &ctx, "count_substring", &.{.{ .array = arr }}, match("ab", false), counts);
+        try common.expectInvokeWith(i32, &ctx, "find_substring", &.{.{ .array = arr }}, match("\xc3\xa9", false), finds);
+        try common.expectInvokeWith(i32, &ctx, "binary_length", &.{.{ .array = arr }}, none, lens);
+    }
 }

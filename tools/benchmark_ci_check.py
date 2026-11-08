@@ -94,6 +94,10 @@ EXPECTED_BENCHES = {
     "compute_assume_timezone",
     "compute_utf8_normalize_nfc_ascii",
     "compute_utf8_normalize_nfc_mixed",
+    "compute_list_flatten",
+    "compute_list_value_length",
+    "compute_struct_field",
+    "compute_map_lookup",
 }
 
 

@@ -363,7 +363,8 @@ pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) K
             };
             return boolArray(allocator, len, values_buf, validity);
         },
-        .struct_, .list, .large_list, .fixed_size_list, .null => return (try core.datumBuildNullLikeWithAllocator(allocator, out_type, len)).array,
+        .null => return (try core.datumBuildNullLikeWithAllocator(allocator, out_type, len)).array,
+        .struct_, .list, .large_list, .fixed_size_list, .list_view, .large_list_view, .map, .sparse_union, .dense_union => return nestedNull(allocator, out_type, len),
         .extension => return error.UnsupportedType,
         // Null indices over an empty dictionary of the value type.
         .dictionary => |d| {
@@ -385,6 +386,106 @@ pub fn nullArray(allocator: std.mem.Allocator, out_type: DataType, len: usize) K
     }
 }
 
+/// An all-null nested array of `dt` (its layout: list, large_list, list_view, large_list_view,
+/// map, fixed_size_list, struct, sparse_union, dense_union) with empty or all-null children. A
+/// union row is null through its child: every row is the first child's null.
+fn nestedNull(allocator: std.mem.Allocator, dt: DataType, len: usize) KernelError!ArrayRef {
+    const layout = datatype.storageDataType(dt);
+    const kid_count: usize = switch (layout) {
+        .struct_ => |st| st.fields.len,
+        .sparse_union, .dense_union => |u| u.fields.len,
+        else => 1,
+    };
+    const kids = allocator.alloc(ArrayRef, kid_count) catch return error.OutOfMemory;
+    defer allocator.free(kids);
+    var nkids: usize = 0;
+    defer for (kids[0..nkids]) |*k| k.release();
+    var bufs: [3]SharedBuffer = .{ .empty, .empty, .empty };
+    var nbufs: usize = 1;
+    defer for (bufs[0..nbufs]) |*b| b.release();
+    const zeroed = struct {
+        fn f(a: std.mem.Allocator, bytes: usize) KernelError!SharedBuffer {
+            var b = OwnedBuffer.init(a, bytes) catch return error.OutOfMemory;
+            return b.toShared(bytes) catch {
+                b.deinit();
+                return error.OutOfMemory;
+            };
+        }
+    }.f;
+    var null_count = len;
+    switch (layout) {
+        .list, .large_list, .map, .list_view, .large_list_view => {
+            bufs[0] = try zeroed(allocator, bitmap.byteLength(len));
+            const w: usize = if (layout == .large_list or layout == .large_list_view) 8 else 4;
+            const view = layout == .list_view or layout == .large_list_view;
+            bufs[1] = try zeroed(allocator, (if (view) len else len + 1) * w);
+            nbufs = 2;
+            if (view) {
+                bufs[2] = try zeroed(allocator, len * w);
+                nbufs = 3;
+            }
+            kids[0] = switch (layout) {
+                .map => |m| if (m.entries_type) |e| try nullArray(allocator, e.*, 0) else blk: {
+                    var k = try nullArray(allocator, m.key_field.data_type.*, 0);
+                    const v = nullArray(allocator, m.item_field.data_type.*, 0) catch |err| {
+                        k.release();
+                        return err;
+                    };
+                    break :blk try structArrayFields(allocator, &.{ m.key_field, m.item_field }, &.{ k, v }, 0, null);
+                },
+                .list, .large_list => |l| try nullArray(allocator, l.value_field.data_type.*, 0),
+                .list_view, .large_list_view => |l| try nullArray(allocator, l.value_field.data_type.*, 0),
+                else => unreachable,
+            };
+            nkids = 1;
+        },
+        .fixed_size_list => |f| {
+            bufs[0] = try zeroed(allocator, bitmap.byteLength(len));
+            const size = std.math.cast(usize, f.list_size) orelse return error.InvalidInput;
+            kids[0] = try nullArray(allocator, f.value_field.data_type.*, std.math.mul(usize, len, size) catch return error.Overflow);
+            nkids = 1;
+        },
+        .struct_ => |st| {
+            bufs[0] = try zeroed(allocator, bitmap.byteLength(len));
+            for (st.fields) |f| {
+                kids[nkids] = try nullArray(allocator, f.data_type.*, len);
+                nkids += 1;
+            }
+        },
+        .sparse_union, .dense_union => |u| {
+            if (u.fields.len == 0) return error.UnsupportedType;
+            const dense_mode = layout == .dense_union;
+            var ids = OwnedBuffer.init(allocator, len) catch return error.OutOfMemory;
+            @memset(ids.data[0..len], @bitCast(u.type_ids[0]));
+            bufs[0] = ids.toShared(len) catch {
+                ids.deinit();
+                return error.OutOfMemory;
+            };
+            if (dense_mode) {
+                bufs[1] = try zeroed(allocator, len * 4);
+                nbufs = 2;
+            }
+            for (u.fields, 0..) |f, k| {
+                const rows: usize = if (!dense_mode) len else if (k == 0 and len > 0) 1 else 0;
+                kids[nkids] = try nullArray(allocator, f.data_type.*, rows);
+                nkids += 1;
+            }
+            null_count = 0;
+        },
+        else => return error.UnsupportedType,
+    }
+    const out = ArrayRef.fromOwnedInline(allocator, .{
+        .data_type = dt,
+        .length = len,
+        .null_count = null_count,
+        .buffers = bufs[0..nbufs],
+        .children = kids[0..nkids],
+    }) catch return error.OutOfMemory;
+    nkids = 0;
+    nbufs = 0;
+    return out;
+}
+
 /// Storage of the type of a struct array built by `structArray`: the field list, a copy of
 /// every child type and of the field names, shared by the array and its slices through the owner
 /// hooks (refcounted).
@@ -394,6 +495,7 @@ const StructTypeOwner = struct {
     types: []DataType,
     fields: []datatype.Field,
     names: []u8 = &.{},
+    metadata: []datatype.KeyValue = &.{},
 
     fn retain(ctx: ?*anyopaque) void {
         const self: *StructTypeOwner = @ptrCast(@alignCast(ctx.?));
@@ -406,6 +508,7 @@ const StructTypeOwner = struct {
         self.allocator.free(self.types);
         self.allocator.free(self.fields);
         self.allocator.free(self.names);
+        self.allocator.free(self.metadata);
         self.allocator.destroy(self);
     }
 };
@@ -430,16 +533,13 @@ pub fn structArray(allocator: std.mem.Allocator, names: []const []const u8, chil
 
 /// `structArray` with the fields of `template` (name, nullability and metadata copied; field
 /// `i` has the type of `children[i]`): a map's entries child, whose fields must equal the
-/// map type's key and item fields.
+/// map type's key and item fields, or the result of make_struct.
 pub fn structArrayFields(allocator: std.mem.Allocator, template: []const datatype.Field, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
-    var names: [2][]const u8 = undefined;
-    std.debug.assert(template.len <= names.len);
-    for (names[0..template.len], template) |*n, f| n.* = f.name;
-    return structArrayImpl(allocator, names[0..template.len], template, children, len, validity);
+    return structArrayImpl(allocator, null, template, children, len, validity);
 }
 
-fn structArrayImpl(allocator: std.mem.Allocator, names: []const []const u8, template: ?[]const datatype.Field, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
-    std.debug.assert(names.len == children.len);
+fn structArrayImpl(allocator: std.mem.Allocator, names_in: ?[]const []const u8, template: ?[]const datatype.Field, children: []const ArrayRef, len: usize, validity: ?OwnedBuffer) KernelError!ArrayRef {
+    std.debug.assert((if (names_in) |n| n.len else template.?.len) == children.len);
     var v = validity;
     var kids_owned = true;
     defer if (kids_owned) for (children) |c| {
@@ -452,19 +552,36 @@ fn structArrayImpl(allocator: std.mem.Allocator, names: []const []const u8, temp
     defer StructTypeOwner.release(owner);
     owner.types = allocator.alloc(DataType, children.len) catch return error.OutOfMemory;
     owner.fields = allocator.alloc(datatype.Field, children.len) catch return error.OutOfMemory;
+    // Names, then the metadata keys and values of the template, copied into one buffer.
     var name_bytes: usize = 0;
-    for (names) |n| name_bytes += n.len;
+    var kv_count: usize = 0;
+    for (0..children.len) |i| name_bytes += if (names_in) |n| n[i].len else template.?[i].name.len;
+    if (template) |tf| for (tf) |f| if (f.metadata) |md| {
+        kv_count += md.len;
+        for (md) |kv| name_bytes += kv.key.len + kv.value.len;
+    };
     owner.names = allocator.alloc(u8, name_bytes) catch return error.OutOfMemory;
+    owner.metadata = allocator.alloc(datatype.KeyValue, kv_count) catch return error.OutOfMemory;
     var name_at: usize = 0;
-    for (owner.types, owner.fields, children, names) |*t, *f, c, n| {
+    const copy = struct {
+        fn f(buf: []u8, pos: *usize, src: []const u8) []const u8 {
+            @memcpy(buf[pos.*..][0..src.len], src);
+            defer pos.* += src.len;
+            return buf[pos.*..][0..src.len];
+        }
+    }.f;
+    for (owner.types, owner.fields, children, 0..) |*t, *f, c, i| {
         t.* = c.data().data_type;
-        @memcpy(owner.names[name_at..][0..n.len], n);
-        f.* = .{ .name = owner.names[name_at..][0..n.len], .data_type = t };
-        name_at += n.len;
+        f.* = .{ .name = copy(owner.names, &name_at, if (names_in) |n| n[i] else template.?[i].name), .data_type = t };
     }
+    var kv_at: usize = 0;
     if (template) |tf| for (owner.fields, tf) |*f, src| {
         f.nullable = src.nullable;
-        f.metadata = src.metadata;
+        const md = src.metadata orelse continue;
+        const dst = owner.metadata[kv_at..][0..md.len];
+        for (dst, md) |*d, kv| d.* = .{ .key = copy(owner.names, &name_at, kv.key), .value = copy(owner.names, &name_at, kv.value) };
+        f.metadata = dst;
+        kv_at += md.len;
     };
     const kids = allocator.dupe(ArrayRef, children) catch return error.OutOfMemory;
     errdefer allocator.free(kids);

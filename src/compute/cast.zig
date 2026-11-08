@@ -758,14 +758,14 @@ fn isListLike(dt: DataType) bool {
 
 /// The rows of a list-like array (`validateLayout` passed): offsets, offsets and sizes (views)
 /// or a fixed size, the array offset applied.
-const ListRows = union(enum) {
+pub const ListRows = union(enum) {
     off32: []const i32,
     off64: []const i64,
     view32: struct { o: []const i32, s: []const i32 },
     view64: struct { o: []const i64, s: []const i64 },
     fixed: struct { size: usize, base: usize },
 
-    fn of(d: *const ArrayData) KernelError!ListRows {
+    pub fn of(d: *const ArrayData) KernelError!ListRows {
         const n = d.length;
         return switch (d.data_type) {
             .list, .map => .{ .off32 = ((d.typedBufferAt(1, i32) catch return error.InvalidInput)[d.offset..])[0 .. n + 1] },
@@ -787,7 +787,7 @@ const ListRows = union(enum) {
     }
 
     /// Start (in child rows) and length of row `i` (validateLayout bounds both).
-    inline fn span(self: ListRows, i: usize) [2]usize {
+    pub inline fn span(self: ListRows, i: usize) [2]usize {
         return switch (self) {
             inline .off32, .off64 => |o| .{ @intCast(o[i]), @intCast(o[i + 1] - o[i]) },
             inline .view32, .view64 => |v| .{ @intCast(v.o[i]), @intCast(v.s[i]) },
@@ -796,7 +796,7 @@ const ListRows = union(enum) {
     }
 
     /// The child window of all rows when they are stored back to back in row order.
-    fn contiguous(self: ListRows, n: usize) ?[2]usize {
+    pub fn contiguous(self: ListRows, n: usize) ?[2]usize {
         return switch (self) {
             inline .off32, .off64 => |o| .{ @intCast(o[0]), @intCast(o[n]) },
             .fixed => |f| .{ f.base, f.base + n * f.size },
@@ -807,7 +807,7 @@ const ListRows = union(enum) {
 
 /// The array whose validity, offsets and sizes are given, over `child` (all taken over, also
 /// on error).
-fn nestedArray(allocator: std.mem.Allocator, to: DataType, len: usize, validity: ?OwnedBuffer, extra: []const ?OwnedBuffer, extra_bytes: []const usize, child: ArrayRef) KernelError!ArrayRef {
+pub fn nestedArray(allocator: std.mem.Allocator, to: DataType, len: usize, validity: ?OwnedBuffer, extra: []const ?OwnedBuffer, extra_bytes: []const usize, child: ArrayRef) KernelError!ArrayRef {
     var kids = [1]ArrayRef{child};
     var buffers: [3]SharedBuffer = .{ .empty, .empty, .empty };
     var made: usize = 1;

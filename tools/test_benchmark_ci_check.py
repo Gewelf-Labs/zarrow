@@ -94,6 +94,10 @@ VALID_ROWS = [
     "compute_assume_timezone,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_utf8_normalize_nfc_ascii,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_utf8_normalize_nfc_mixed,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_list_flatten,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_list_value_length,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_struct_field,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_map_lookup,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
 ]
 
 

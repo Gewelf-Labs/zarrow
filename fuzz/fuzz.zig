@@ -620,7 +620,86 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
         if (zarrow.compute.kernels.hash_aggregate.isGroupKeyType(a.data().data_type)) exerciseGroupBy(&ctx, a);
         exerciseRound16(&ctx, a);
         exerciseRound18(&ctx, a);
+        exerciseRound21(&ctx, a);
     }
+}
+
+/// Round 21 structural kernels on any decoded array: make_struct of the array with itself and a
+/// scalar; list_value_length, list_element (index 0: an empty valid row is InvalidInput),
+/// list_flatten (also recursive), list_parent_indices and list_slice (as the input layout and as
+/// fixed_size_list) on the list layouts; struct_field of child 0 through structs and unions;
+/// map_lookup of a zero / "a" key in maps with an integer or string key; binary_join of the
+/// list layouts of every string / binary item layout; the fixed_size_binary string kernels. Each succeeds (or fails with a listed
+/// error) and every array output validates (one row per input row for the scalar functions).
+fn exerciseRound21(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    const one: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .int32 = {} }, .{ .i32 = 1 }) };
+    expectCall(ctx, "make_struct", .scalar, &.{ d, d, one }, .none, len, &.{});
+    switch (a.data().data_type) {
+        .list, .large_list, .list_view, .large_list_view, .fixed_size_list => {
+            expectCall(ctx, "list_value_length", .scalar, &.{d}, .none, len, &.{});
+            const zero: zarrow.compute.Datum = .{ .scalar = zarrow.compute.Scalar.init(.{ .int64 = {} }, .{ .i64 = 0 }) };
+            expectCall(ctx, "list_element", .scalar, &.{ d, zero }, .none, len, &.{error.InvalidInput});
+            expectAnyLength(ctx, "list_flatten", .vector, &.{d}, .none);
+            expectAnyLength(ctx, "list_flatten", .vector, &.{d}, .{ .list_flatten = .{ .recursive = true } });
+            expectAnyLength(ctx, "list_parent_indices", .vector, &.{d}, .none);
+            expectCall(ctx, "list_slice", .scalar, &.{d}, .{ .list_slice = .{ .start = 1, .stop = 4, .step = 2 } }, len, &.{});
+            expectCall(ctx, "list_slice", .scalar, &.{d}, .{ .list_slice = .{ .start = 0, .stop = 3, .return_fixed_size_list = true } }, len, &.{});
+            const item = switch (a.data().data_type) {
+                .list, .large_list => |l| l.value_field.data_type.*,
+                .list_view, .large_list_view => |l| l.value_field.data_type.*,
+                else => DataType{ .null = {} },
+            };
+            switch (item) {
+                inline .string, .large_string, .string_view, .binary, .large_binary, .binary_view => |_, tag| {
+                    const text = tag == .string or tag == .large_string or tag == .string_view;
+                    const sep = zarrow.compute.Scalar.init(item, if (text) .{ .string = "-" } else .{ .binary = "\x00" });
+                    expectCall(ctx, "binary_join", .scalar, &.{ d, .{ .scalar = sep } }, .none, len, &.{});
+                },
+                else => {},
+            }
+        },
+        .struct_, .sparse_union, .dense_union => {
+            const n = switch (a.data().data_type) {
+                .struct_ => |st| st.fields.len,
+                .sparse_union, .dense_union => |u| u.fields.len,
+                else => unreachable,
+            };
+            if (n > 0) expectCall(ctx, "struct_field", .scalar, &.{d}, .{ .struct_field = .{ .indices = &.{0} } }, len, &.{});
+        },
+        .map => |m| {
+            const key: ?zarrow.compute.Scalar = switch (m.key_field.data_type.*) {
+                .int32 => zarrow.compute.Scalar.init(.{ .int32 = {} }, .{ .i32 = 0 }),
+                .int64 => zarrow.compute.Scalar.init(.{ .int64 = {} }, .{ .i64 = 0 }),
+                .string => zarrow.compute.Scalar.init(.{ .string = {} }, .{ .string = "a" }),
+                else => null,
+            };
+            if (key) |k| for ([_]zarrow.compute.MapLookupOptions.Occurrence{ .first, .last, .all }) |occ| {
+                expectCall(ctx, "map_lookup", .scalar, &.{d}, .{ .map_lookup = .{ .query_key = k, .occurrence = occ } }, len, &.{});
+            };
+        },
+        .fixed_size_binary => {
+            // As the binary layouts; a zero-width result is UnsupportedType (no fixed_size_binary[0]).
+            expectCall(ctx, "binary_length", .scalar, &.{d}, .none, len, &.{});
+            expectCall(ctx, "count_substring", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\x00", .ignore_case = true } }, len, &.{});
+            expectCall(ctx, "find_substring", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "a" } }, len, &.{});
+            expectCall(ctx, "binary_slice", .scalar, &.{d}, .{ .slice = .{ .start = -3, .stop = 1, .step = -1 } }, len, &.{error.UnsupportedType});
+            expectCall(ctx, "binary_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = 1, .stop = 2, .replacement = "\xff" } }, len, &.{});
+        },
+        .string, .large_string, .string_view => {
+            // A byte slice that splits a code point is InvalidInput on a string layout.
+            expectCall(ctx, "binary_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = 1, .stop = -1, .replacement = "\u{e9}" } }, len, &.{error.InvalidInput});
+        },
+        else => {},
+    }
+}
+
+/// `name` must succeed (or fail with NoMatchingKernel) and an array output must validate.
+fn expectAnyLength(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, options: zarrow.compute.Options) void {
+    var out = ctx.invoke(name, kind, args, options) catch |e| std.debug.panic("fuzz-invariant: kernel {s} failed on a valid {s} array: {s}", .{ name, @tagName(args[0].dataType().id()), @errorName(e) });
+    defer out.release();
+    if (out.asArray()) |arr| arr.data().validateFull() catch |e| std.debug.panic("fuzz-invariant: {s} output failed validateFull: {s}", .{ name, @errorName(e) });
 }
 
 /// Round 18 kernels on any decoded array: min / max / min_max and hash_min_max of the ordered
