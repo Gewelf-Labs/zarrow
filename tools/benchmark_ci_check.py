@@ -85,6 +85,9 @@ EXPECTED_BENCHES = {
     "compute_replace_with_mask_int32",
     "compute_cast_list_int32_to_int64",
     "compute_indices_nonzero",
+    "compute_match_regex_literal",
+    "compute_match_regex_class",
+    "compute_replace_regex",
 }
 
 

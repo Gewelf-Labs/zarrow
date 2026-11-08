@@ -40,6 +40,7 @@ fn mapError(err: anyerror) c_int {
         error.InvalidOffset,
         error.InvalidNullCount,
         error.MissingDictionary,
+        error.InvalidMetadata,
         error.UnsupportedType,
         error.InvalidStream,
         error.StreamCallbackFailed,

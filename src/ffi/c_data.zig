@@ -1,5 +1,6 @@
 const std = @import("std");
 const datatype = @import("../datatype.zig");
+const canonical = @import("../extension/canonical.zig");
 const schema_mod = @import("../schema.zig");
 const array_data_mod = @import("../array/array_data.zig");
 const array_ref_mod = @import("../array/array_ref.zig");
@@ -61,6 +62,8 @@ pub const Error = error{
     MissingDictionary,
     Released,
     OutOfMemory,
+    /// A canonical extension type (`arrow.*`) with the wrong storage type or metadata.
+    InvalidMetadata,
 };
 
 const ARROW_FLAG_DICTIONARY_ORDERED: i64 = 1;
@@ -473,6 +476,17 @@ fn releaseExportedArray(raw: ?*ArrowArray) callconv(.c) void {
     arr.private_data = null;
 }
 
+/// Reject a canonical extension (`arrow.*`, plain or as a dictionary value type) whose storage
+/// type or metadata breaks its specification; other names pass through.
+fn checkCanonical(dt: DataType) Error!void {
+    const ext = switch (dt) {
+        .extension => |e| e,
+        .dictionary => |d| if (d.value_type.* == .extension) d.value_type.extension else return,
+        else => return,
+    };
+    canonical.validateType(ext) catch return error.InvalidMetadata;
+}
+
 fn importField(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!Field {
     const name = if (c_schema.name == null) "" else try allocator.dupe(u8, cString(c_schema.name).?);
     const parsed_md = try parseFieldMetadata(allocator, c_schema);
@@ -511,6 +525,7 @@ fn importField(allocator: std.mem.Allocator, c_schema: *ArrowSchema) Error!Field
         }
     }
 
+    try checkCanonical(dt_value);
     const dt = try allocator.create(DataType);
     dt.* = dt_value;
 

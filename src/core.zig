@@ -12,6 +12,8 @@ const record_batch = @import("record_batch.zig");
 const compute_mod = @import("compute/mod.zig");
 
 pub const compute = compute_mod;
+pub const regex = @import("regex/regex.zig");
+pub const canonical_extensions = @import("extension/canonical.zig");
 pub const SharedBuffer = buffer.SharedBuffer;
 pub const OwnedBuffer = buffer.OwnedBuffer;
 pub const ValidityBitmap = bitmap.ValidityBitmap;

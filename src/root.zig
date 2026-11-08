@@ -15,6 +15,10 @@ pub const c_api = @import("c_api.zig");
 const compute_mod = @import("compute/mod.zig");
 
 pub const compute = compute_mod;
+/// Linear-time regular expressions (RE2 syntax, leftmost-first), used by the regex compute kernels.
+pub const regex = @import("regex/regex.zig");
+/// Arrow canonical extension types: names, storage and metadata checks, typed accessors.
+pub const canonical_extensions = @import("extension/canonical.zig");
 pub const SharedBuffer = buffer.SharedBuffer;
 pub const OwnedBuffer = buffer.OwnedBuffer;
 pub const ValidityBitmap = bitmap.ValidityBitmap;
@@ -271,6 +275,8 @@ test {
     _ = @import("ffi/c_stream.zig");
     _ = @import("c_api.zig");
     _ = @import("compute/core.zig");
+    _ = @import("regex/regex.zig");
+    _ = @import("extension/canonical.zig");
     _ = @import("array/array.zig");
     _ = @import("array/array_data.zig");
     _ = @import("array/primitive_array.zig");

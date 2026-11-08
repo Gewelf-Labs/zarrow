@@ -33,9 +33,11 @@ pub const KeyValueT = struct {
         _ = .{__pack_opts};
         var __tmp_offsets = std.ArrayList(u32).empty;
         defer if (__pack_opts.allocator) |alloc| __tmp_offsets.deinit(alloc);
-        const key_off = if (rcv.key.len != 0) try __builder.createString(rcv.key) else 0;
+        // zarrow: always written, also when empty (Arrow C++ rejects a missing key or value, and
+        // canonical extensions carry an empty `ARROW:extension:metadata`).
+        const key_off = try __builder.createString(rcv.key);
 
-        const value_off = if (rcv.value.len != 0) try __builder.createString(rcv.value) else 0;
+        const value_off = try __builder.createString(rcv.value);
 
         try KeyValue.Start(__builder);
         try KeyValue.AddKey(__builder, key_off);

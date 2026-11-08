@@ -271,7 +271,9 @@ Compute options are type-safe and tag-based.
 - `FilterOptions`
 - `SortOptions`
 - `DayOfWeekOptions` (`count_from_zero`, `week_start`)
-- `MatchSubstringOptions` (`pattern`, `ignore_case`)
+- `MatchSubstringOptions` (`pattern`, `ignore_case`; a literal, an RE2 pattern for the `*_regex`
+  functions or a LIKE pattern for `match_like`), `ExtractRegexOptions` (`pattern`) for
+  `extract_regex` and `extract_regex_span`
 - `SliceOptions` (`start`, `stop`, `step`)
 - `JoinOptions` (`null_handling`: `emit_null | skip | replace`, `null_replacement`)
 - `TrimOptions` (`characters`)

@@ -30,4 +30,5 @@ test {
     _ = @import("test_tdigest.zig");
     _ = @import("test_pivot.zig");
     _ = @import("test_cumulative.zig");
+    _ = @import("test_string_regex.zig");
 }

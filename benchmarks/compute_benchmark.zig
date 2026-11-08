@@ -277,6 +277,11 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     var zero_one = try buildInt32Mod(allocator, cfg.rows, 20, 2);
     defer zero_one.release();
     try timeKernel(io, &ctx, .vector, "compute_indices_nonzero", "indices_nonzero", &.{.{ .array = zero_one }}, cfg, emit_csv, meta);
+    // Regex over the "key-0007123456" rows: a literal (memmem path), a class pattern (lazy
+    // DFA; about 3 rows in 16 match) and a replacement of every digit run (DFA spans).
+    try timeKernelWith(io, &ctx, .scalar, "compute_match_regex_literal", "match_substring_regex", &.{.{ .array = str_a }}, .{ .match_substring = .{ .pattern = "y-0012" } }, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .scalar, "compute_match_regex_class", "match_substring_regex", &.{.{ .array = str_a }}, .{ .match_substring = .{ .pattern = "[a-z]+-\\d{3}[1-3]\\d+$" } }, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .scalar, "compute_replace_regex", "replace_substring_regex", &.{.{ .array = str_a }}, .{ .replace_substring = .{ .pattern = "\\d+", .replacement = "#" } }, cfg, emit_csv, meta);
     // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
     try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
 }

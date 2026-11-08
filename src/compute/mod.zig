@@ -60,6 +60,7 @@ pub const CumulativeOptions = core.CumulativeOptions;
 pub const PairwiseOptions = core.PairwiseOptions;
 pub const WinsorizeOptions = core.WinsorizeOptions;
 pub const RandomOptions = core.RandomOptions;
+pub const ExtractRegexOptions = core.ExtractRegexOptions;
 pub const Options = core.Options;
 pub const ScalarValue = core.ScalarValue;
 pub const Scalar = core.Scalar;

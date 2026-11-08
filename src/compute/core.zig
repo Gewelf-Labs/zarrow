@@ -419,6 +419,7 @@ pub const CumulativeOptions = options_mod.CumulativeOptions;
 pub const PairwiseOptions = options_mod.PairwiseOptions;
 pub const WinsorizeOptions = options_mod.WinsorizeOptions;
 pub const RandomOptions = options_mod.RandomOptions;
+pub const ExtractRegexOptions = options_mod.ExtractRegexOptions;
 pub const Options = options_mod.Options;
 
 pub const OptionsCheckFn = registry_mod.OptionsCheckFn;

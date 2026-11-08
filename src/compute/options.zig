@@ -95,6 +95,8 @@ pub const OptionsTag = enum {
     winsorize,
     /// Length and seed of random.
     random,
+    /// Pattern of extract_regex / extract_regex_span.
+    extract_regex,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -166,9 +168,11 @@ pub const DayOfWeekOptions = struct {
 
 /// Options of starts_with, ends_with and match_substring (Arrow `MatchSubstringOptions`).
 pub const MatchSubstringOptions = struct {
-    /// Literal bytes to look for (no regex).
+    /// Literal bytes (starts_with, ends_with, match_substring, count_substring, find_substring),
+    /// an RE2 pattern (the `*_regex` functions) or a SQL LIKE pattern (match_like).
     pattern: []const u8,
-    /// Compare ASCII letters case-insensitively (other bytes compare exactly).
+    /// Match case-insensitively through simple case folding (Unicode for the string layouts,
+    /// Latin-1 for the binary layouts), as RE2 does for Arrow.
     ignore_case: bool = false,
 };
 
@@ -205,7 +209,8 @@ pub const TrimOptions = struct {
 
 /// Options of replace_substring (Arrow `ReplaceSubstringOptions`).
 pub const ReplaceSubstringOptions = struct {
-    /// Literal bytes to replace (no regex). Empty only with a `max_replacements` bound.
+    /// Literal bytes to replace (replace_substring; empty only with a `max_replacements` bound)
+    /// or an RE2 pattern (replace_substring_regex, whose replacement may use `\0`..`\9`).
     pattern: []const u8,
     replacement: []const u8,
     /// Replace at most this many matches per row from the left; null replaces all.
@@ -214,7 +219,8 @@ pub const ReplaceSubstringOptions = struct {
 
 /// Options of split_pattern (Arrow `SplitPatternOptions`).
 pub const SplitPatternOptions = struct {
-    /// Literal separator; must not be empty.
+    /// Literal separator (split_pattern; must not be empty) or an RE2 pattern
+    /// (split_pattern_regex).
     pattern: []const u8,
     /// Split at most this many times per row; null splits at every separator.
     max_splits: ?usize = null,
@@ -506,6 +512,13 @@ pub const WinsorizeOptions = struct {
     upper_limit: f64 = 1,
 };
 
+/// Options of extract_regex and extract_regex_span (Arrow `ExtractRegexOptions` and
+/// `ExtractRegexSpanOptions`).
+pub const ExtractRegexOptions = struct {
+    /// RE2 syntax; every group must be named, one struct field per group.
+    pattern: []const u8,
+};
+
 /// Options of random (Arrow `RandomOptions`; the length is the batch length Arrow passes).
 pub const RandomOptions = struct {
     /// Number of values.
@@ -571,6 +584,7 @@ pub const Options = union(OptionsTag) {
     pairwise: PairwiseOptions,
     winsorize: WinsorizeOptions,
     random: RandomOptions,
+    extract_regex: ExtractRegexOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {
