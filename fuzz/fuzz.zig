@@ -22,6 +22,7 @@ pub const Target = enum {
     @"array-layout",
     compute,
     @"c-abi",
+    regex,
 };
 
 /// Inputs over this size are skipped (replay) or never produced (run).
@@ -126,6 +127,7 @@ pub fn runOne(target: Target, parent: Allocator, bytes: []const u8) Feedback {
         .compute => computeTarget(gpa, bytes, &fb),
         .@"array-layout" => arrayLayout(gpa, bytes, &fb),
         .@"c-abi" => cAbi(gpa, bytes, &fb),
+        .regex => regexTarget(gpa, bytes, &fb),
     };
     result catch |e| {
         fb.err = e;
@@ -507,6 +509,17 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "binary_join_element_wise", .scalar, &binary, .none, len, &.{});
                 expectCall(&ctx, "utf8_split_whitespace", .scalar, &.{d}, .none, len, &.{});
                 expectCall(&ctx, "replace_substring", .scalar, &.{d}, .{ .replace_substring = .{ .pattern = "a", .replacement = "\u{e9}\u{e9}" } }, len, &.{});
+                // The regex kernels (src/compute/string_regex.zig) on valid UTF-8.
+                expectCall(&ctx, "match_substring_regex", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "(?i)\u{e9}|[a-z]+\\d" } }, len, &.{});
+                expectCall(&ctx, "count_substring_regex", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\\w+|$" } }, len, &.{});
+                expectCall(&ctx, "find_substring_regex", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\\pL\\b", .ignore_case = true } }, len, &.{});
+                expectCall(&ctx, "replace_substring_regex", .scalar, &.{d}, .{ .replace_substring = .{ .pattern = "(?P<a>[a-z])(\\d)?", .replacement = "<\\2\\1>" } }, len, &.{});
+                expectCall(&ctx, "replace_substring_regex", .scalar, &.{d}, .{ .replace_substring = .{ .pattern = "\\s*", .replacement = "_", .max_replacements = 3 } }, len, &.{});
+                expectCall(&ctx, "split_pattern_regex", .scalar, &.{d}, .{ .split_pattern = .{ .pattern = "[,;]+|\\s" } }, len, &.{});
+                expectCall(&ctx, "extract_regex", .scalar, &.{d}, .{ .extract_regex = .{ .pattern = "(?P<x>\\pL+)(?P<y>\\d*)" } }, len, &.{});
+                expectCall(&ctx, "extract_regex_span", .scalar, &.{d}, .{ .extract_regex = .{ .pattern = "(?P<x>.)(?P<y>.)?" } }, len, &.{});
+                expectCall(&ctx, "match_like", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "%a_\\%%", .ignore_case = true } }, len, &.{});
+                expectCall(&ctx, "match_substring", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\u{c9}A", .ignore_case = true } }, len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .large_string = {} }, true), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .binary_view = {} }, true), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int32 = {} }, true), len, &.{error.InvalidCast});
@@ -515,6 +528,10 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
             .binary, .large_binary, .binary_view => {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string = {} }, true), len, &.{ error.InvalidCast, error.Overflow });
                 expectCall(&ctx, "binary_replace_slice", .scalar, &.{d}, .{ .replace_slice = .{ .start = 1, .stop = -1, .replacement = "\xff" } }, len, &.{});
+                // Latin-1 regex: any byte is a character.
+                expectCall(&ctx, "count_substring_regex", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\\C\\x00?" } }, len, &.{});
+                expectCall(&ctx, "replace_substring_regex", .scalar, &.{d}, .{ .replace_substring = .{ .pattern = "[\\x80-\\xff]+", .replacement = "\xff" } }, len, &.{});
+                expectCall(&ctx, "extract_regex", .scalar, &.{d}, .{ .extract_regex = .{ .pattern = "(?P<hi>[^\\x00-\\x7f])" } }, len, &.{});
                 expectKernel(&ctx, "greater", .scalar, &binary, len, false);
                 expectSameAfterCast(&ctx, a, if (a.data().data_type == .binary_view) .{ .binary = {} } else .{ .binary_view = {} }, true);
             },
@@ -1058,6 +1075,65 @@ fn expectCall(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.c
     };
     defer out.release();
     if (out.asArray()) |a| expectValid(name, a, expected_len orelse std.debug.panic("fuzz-invariant: {s} returned an array", .{name}));
+}
+
+// ---------------------------------------------------------------------------------------------
+// regex: the regex compiler and matcher (src/regex/) on a pattern and a text from the input.
+//
+// Input: a flag byte (bit 0 Latin-1, bit 1 case-insensitive, bit 2 literal), the pattern length
+// (u16, little-endian), the pattern, then the text. A pattern that does not compile is a pass;
+// one that compiles must stay inside the program limits, and every search must agree between
+// the DFA path (`find`), the Pike VM and `captures`, with spans inside the text and groups
+// inside their match.
+
+/// Longest text the regex target matches (matching is O(text x program)).
+const regex_max_text = 4096;
+
+fn regexTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
+    if (bytes.len < 3) return error.EndOfStream;
+    const flags = bytes[0];
+    const plen = @min(std.mem.readInt(u16, bytes[1..3], .little), bytes.len - 3);
+    const pattern = bytes[3..][0..plen];
+    const rest = bytes[3 + plen ..];
+    const text = rest[0..@min(rest.len, regex_max_text)];
+    const Regex = zarrow.regex.Regex;
+    var diag: zarrow.regex.Diagnostic = .{};
+    const re = Regex.compile(gpa, pattern, .{ .latin1 = flags & 1 != 0, .case_insensitive = flags & 2 != 0, .literal = flags & 4 != 0 }, &diag) catch |e| {
+        if (e != error.OutOfMemory and diag.message.len == 0) std.debug.panic("fuzz-invariant: regex error {s} without a message", .{@errorName(e)});
+        fb.types = @as(u64, 1) << @intCast(@intFromError(e) % 64);
+        return e;
+    };
+    defer re.deinit();
+    if (re.forward.insts.len > zarrow.regex.prog.max_insts or re.backward.insts.len > zarrow.regex.prog.max_insts)
+        std.debug.panic("fuzz-invariant: regex program over the instruction limit", .{});
+    const groups = try gpa.alloc(?zarrow.regex.Span, re.groupCount() + 1);
+    defer gpa.free(groups);
+    var slots: [2]usize = undefined;
+    const any = try re.isMatch(text);
+    if (any != try re.pike.search(&re.forward, text, 0, false, &slots)) std.debug.panic("fuzz-invariant: regex isMatch and the Pike VM disagree", .{});
+    var pos: usize = 0;
+    var n: u32 = 0;
+    while (pos <= text.len and n < 64) : (n += 1) {
+        const m = try re.find(text, pos) orelse {
+            if (n == 0 and any) std.debug.panic("fuzz-invariant: regex isMatch without a match", .{});
+            break;
+        };
+        if (m.start < pos or m.end < m.start or m.end > text.len) std.debug.panic("fuzz-invariant: regex span out of range", .{});
+        if (!try re.pike.search(&re.forward, text, pos, false, &slots) or slots[0] != m.start or slots[1] != m.end)
+            std.debug.panic("fuzz-invariant: regex DFA span [{d}, {d}) and Pike VM span differ", .{ m.start, m.end });
+        if (!try re.captures(text, pos, groups) or groups[0].?.start != m.start or groups[0].?.end != m.end)
+            std.debug.panic("fuzz-invariant: regex captures disagree with find", .{});
+        for (groups[1..]) |g| if (g) |sp| {
+            if (sp.start > sp.end or sp.start < m.start or sp.end > m.end) std.debug.panic("fuzz-invariant: regex group outside its match", .{});
+        };
+        pos = if (m.end > pos) m.end else pos + 1;
+    }
+    fb.batches = n;
+    fb.types |= @as(u64, 1) << @intCast(re.groupCount() % 16);
+    if (re.literal != null) fb.types |= 1 << 16;
+    if (re.dfa_failures > 0) fb.types |= 1 << 17;
+    if (any) fb.types |= 1 << 18;
+    fb.types |= @as(u64, flags & 7) << 19;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1899,4 +1975,8 @@ test "fuzz array-layout" {
 
 test "fuzz c-abi" {
     try std.testing.fuzz(Target.@"c-abi", fuzzOne, .{});
+}
+
+test "fuzz regex" {
+    try std.testing.fuzz(Target.regex, fuzzOne, .{ .corpus = &.{smithSeed("corpus/regex/named-groups.bin")} });
 }

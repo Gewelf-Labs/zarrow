@@ -174,6 +174,7 @@ pub fn build(b: *std.Build) !void {
         .{ "ipc-file", "ipc-file" },
         .{ "array-layout", "array-layout" },
         .{ "c-abi", "c-abi" },
+        .{ "regex", "regex" },
     };
     for (corpus_dirs) |entry| {
         const run_replay = b.addRunArtifact(fuzz_exe);
@@ -233,6 +234,8 @@ pub fn build(b: *std.Build) !void {
     });
     configureIpcCompression(b, interop_writer_exe, &run_compression_deps_check.step);
     interop_writer_exe.root_module.addImport("zarrow", b.modules.get("zarrow").?);
+    // The pyarrow canonical extension fixture, rewritten by zarrow for `canonical-ext`.
+    interop_writer_exe.root_module.addAnonymousImport("pyarrow_canonical", .{ .root_source_file = b.path("src/extension/testdata/pyarrow_canonical.arrows") });
 
     const run_interop_writer = b.addRunArtifact(interop_writer_exe);
     addPassthru(run_interop_writer);

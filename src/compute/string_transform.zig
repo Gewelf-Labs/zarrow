@@ -14,8 +14,9 @@
 //! binary_join joins the items of a `list<T>` / `large_list<T>` row (T string, large_string,
 //! binary or large_binary) with a separator of type T (array or scalar).
 //!
-//! Scope against Arrow C++: patterns are literal (no regex); `ignore_case` folds ASCII letters
-//! only (Arrow folds through RE2). For a string layout, the pattern, replacement and padding of an
+//! Scope against Arrow C++: patterns are literal (the `*_regex` forms are in `string_regex.zig`);
+//! `ignore_case` of count_substring / find_substring folds through Unicode simple case folding
+//! (the regex engine, as Arrow uses RE2). For a string layout, the pattern, replacement and padding of an
 //! option must be valid UTF-8 (ASCII for the ascii_* pad functions), so a valid row stays valid;
 //! the utf8_* functions reject a non-null row that is not UTF-8 with `InvalidInput`. Layouts:
 //! replace_substring, split_pattern, count_substring, find_substring and binary_repeat take the
@@ -30,6 +31,7 @@ const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const string = @import("string.zig");
+const string_regex = @import("string_regex.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
@@ -642,16 +644,6 @@ fn nextSpace(h: []const u8, start: usize) usize {
     return h.len;
 }
 
-/// Position of `needle` in `haystack` at or after `start`, folding ASCII letters when `fold`.
-fn indexOf(haystack: []const u8, start: usize, needle: []const u8, fold: bool) ?usize {
-    if (!fold) return std.mem.indexOfPos(u8, haystack, start, needle);
-    if (start > haystack.len or needle.len > haystack.len - start) return null;
-    for (start..haystack.len - needle.len + 1) |i| {
-        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return i;
-    }
-    return null;
-}
-
 fn Search(comptime which: enum { count, find }) type {
     return struct {
         /// Count the non-overlapping matches (count_substring) or return the byte index of the
@@ -663,10 +655,18 @@ fn Search(comptime which: enum { count, find }) type {
         }
 
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
-            return switch (datatype.storageDataType(values[0].dataType())) {
-                .large_string, .large_binary => run(i64, ctx, values[0], len, options.match_substring),
-                else => run(i32, ctx, values[0], len, options.match_substring),
+            const o = options.match_substring;
+            const large = switch (datatype.storageDataType(values[0].dataType())) {
+                .large_string, .large_binary => true,
+                else => false,
             };
+            if (o.ignore_case) {
+                // Unicode simple case folding through the regex engine (RE2 in Arrow).
+                const re = try string_regex.compile(ctx.allocator, o.pattern, values[0].dataType(), .{ .ignore_case = true, .literal = true });
+                defer re.deinit();
+                return if (large) string_regex.searchRows(i64, ctx, values[0], len, re, which == .count) else string_regex.searchRows(i32, ctx, values[0], len, re, which == .count);
+            }
+            return if (large) run(i64, ctx, values[0], len, o) else run(i32, ctx, values[0], len, o);
         }
 
         fn run(comptime O: type, ctx: *ExecContext, value: ExecChunkValue, len: usize, o: core.MatchSubstringOptions) KernelError!ArrayRef {
@@ -678,13 +678,13 @@ fn Search(comptime which: enum { count, find }) type {
                 inline else => |r| for (out.values(), 0..) |*dst, i| {
                     const s = r.get(i);
                     if (which == .find) {
-                        dst.* = if (indexOf(s, 0, o.pattern, o.ignore_case)) |p| std.math.cast(O, p) orelse return error.Overflow else -1;
+                        dst.* = if (std.mem.indexOf(u8, s, o.pattern)) |p| std.math.cast(O, p) orelse return error.Overflow else -1;
                         continue;
                     }
                     // An empty pattern matches at every position, the end included (Arrow: len + 1).
                     var n: usize = 0;
                     var start: usize = 0;
-                    while (indexOf(s, start, o.pattern, o.ignore_case)) |p| {
+                    while (std.mem.indexOfPos(u8, s, start, o.pattern)) |p| {
                         n += 1;
                         start = p + @max(o.pattern.len, 1);
                         if (start > s.len) break;
@@ -937,32 +937,38 @@ fn Splitter(comptime kind: SplitKind) type {
                 },
             }
 
-            // The parts as an array of the input layout.
-            var child = try dense.VarBinaryOutput.init(allocator, data.data_type, parts.items.len, null, dense.totalBytes(rows, len));
-            errdefer child.deinit();
-            for (parts.items) |part| try child.append(part);
-            var values_arr = try child.finish();
-            errdefer values_arr.release();
-
-            var validity = try dense.combinedValidity(allocator, len, &.{data});
-            errdefer if (validity) |*v| v.deinit();
-            var buffers: [2]SharedBuffer = .{ .empty, .empty };
-            var null_count: usize = 0;
-            errdefer for (&buffers) |*b| b.release();
-            if (validity) |*v| {
-                null_count = bitmap.countUnsetBit(v.data, len);
-                buffers[0] = v.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
-                validity = null;
-            }
-            buffers[1] = offsets.toShared((len + 1) * 4) catch return error.OutOfMemory;
-            var children = [1]ArrayRef{values_arr};
-            return ArrayRef.fromOwnedInline(allocator, .{
-                .data_type = try listTypeFor(data.data_type),
-                .length = len,
-                .null_count = null_count,
-                .buffers = &buffers,
-                .children = &children,
-            }) catch error.OutOfMemory;
+            return partsList(allocator, data, len, &offsets, parts.items, dense.totalBytes(rows, len));
         }
     };
+}
+
+/// The `list<T>` array of `len` rows of `data` (`T` its layout) whose row `i` holds
+/// `parts[offsets[i]..offsets[i + 1]]` (i32 offsets, taken over); null rows keep the input's
+/// null bits. `capacity` is the expected byte total of the parts.
+pub fn partsList(allocator: std.mem.Allocator, data: *const ArrayData, len: usize, offsets: *OwnedBuffer, parts: []const []const u8, capacity: usize) KernelError!ArrayRef {
+    var child = try dense.VarBinaryOutput.init(allocator, data.data_type, parts.len, null, capacity);
+    errdefer child.deinit();
+    for (parts) |part| try child.append(part);
+    var values_arr = try child.finish();
+    errdefer values_arr.release();
+
+    var validity = try dense.combinedValidity(allocator, len, &.{data});
+    errdefer if (validity) |*v| v.deinit();
+    var buffers: [2]SharedBuffer = .{ .empty, .empty };
+    var null_count: usize = 0;
+    errdefer for (&buffers) |*b| b.release();
+    if (validity) |*v| {
+        null_count = bitmap.countUnsetBit(v.data, len);
+        buffers[0] = v.toShared(bitmap.byteLength(len)) catch return error.OutOfMemory;
+        validity = null;
+    }
+    buffers[1] = offsets.toShared((len + 1) * 4) catch return error.OutOfMemory;
+    var children = [1]ArrayRef{values_arr};
+    return ArrayRef.fromOwnedInline(allocator, .{
+        .data_type = try listTypeFor(data.data_type),
+        .length = len,
+        .null_count = null_count,
+        .buffers = &buffers,
+        .children = &children,
+    }) catch error.OutOfMemory;
 }

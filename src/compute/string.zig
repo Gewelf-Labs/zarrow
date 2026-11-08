@@ -15,8 +15,8 @@
 //!   utf8_is_space, utf8_*trim_whitespace and utf8_split_whitespace use Unicode White_Space plus
 //!   U+001C..U+001F (the set Arrow gets from utf8proc).
 //! - The ascii_* functions look at bytes: a byte >= 0x80 is no letter, digit, space or printable.
-//! - match_substring / starts_with / ends_with take a literal pattern; `ignore_case` folds ASCII
-//!   letters only.
+//! - match_substring / starts_with / ends_with take a literal pattern; `ignore_case` matches
+//!   through Unicode simple case folding (the regex engine, as Arrow uses RE2).
 //! The utf8_* kernels that decode code points reject a non-null row that is not valid UTF-8 with
 //! `InvalidInput`, so they never emit invalid UTF-8; utf8_length counts the bytes that do not
 //! continue a sequence, like Arrow, without validating.
@@ -26,6 +26,7 @@ const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
 const unicode = @import("unicode_tables.zig");
+const string_regex = @import("string_regex.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const ArrayRef = core.ArrayRef;
@@ -125,6 +126,12 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     }
     inline for (string_tags ++ binary_tags) |tag| {
         try registry.registerScalarKernel("binary_length", unaryKernel(tag, dense.noOptions, dense.resultTypeOf(lengthType(tag)), Lengths(.binary_length).exec));
+    }
+    // The containment tests also take the binary layouts (Arrow; Latin-1 with `ignore_case`).
+    inline for (binary_tags) |tag| {
+        inline for (.{ Predicate.starts_with, Predicate.ends_with, Predicate.match_substring }) |p| {
+            try registry.registerScalarKernel(@tagName(p), unaryKernel(tag, predicateOptions(p), dense.resultTypeOf(bool_type), Predicates(p).exec));
+        }
     }
 }
 
@@ -847,14 +854,6 @@ fn casePredicate(comptime p: Predicate, s: []const u8, comptime next: fn ([]cons
     return any_cased;
 }
 
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |i| {
-        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
-    }
-    return false;
-}
-
 fn Predicates(comptime p: Predicate) type {
     return struct {
         /// Test each row (array, chunked or scalar).
@@ -863,6 +862,21 @@ fn Predicates(comptime p: Predicate) type {
         }
 
         fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, options: Options) KernelError!ArrayRef {
+            if (comptime (p == .starts_with or p == .ends_with or p == .match_substring)) {
+                // Case-insensitive: Unicode simple case folding through the regex engine (RE2
+                // in Arrow).
+                const o = options.match_substring;
+                if (o.ignore_case) {
+                    const which: @TypeOf(.contains) = switch (p) {
+                        .starts_with => .starts,
+                        .ends_with => .ends,
+                        else => .contains,
+                    };
+                    var m = try string_regex.literalMatcher(ctx.allocator, which, o.pattern, values[0].dataType());
+                    defer m.deinit();
+                    return string_regex.boolRows(ctx, values[0], len, &m);
+                }
+            }
             var arr = try dense.chunkArray(ctx.allocator, values[0]);
             defer arr.release();
             const data = arr.data();
@@ -885,9 +899,9 @@ fn Predicates(comptime p: Predicate) type {
                 .starts_with, .ends_with, .match_substring => {
                     const o = options.match_substring;
                     return switch (p) {
-                        .starts_with => if (o.ignore_case) std.ascii.startsWithIgnoreCase(s, o.pattern) else std.mem.startsWith(u8, s, o.pattern),
-                        .ends_with => if (o.ignore_case) std.ascii.endsWithIgnoreCase(s, o.pattern) else std.mem.endsWith(u8, s, o.pattern),
-                        else => if (o.ignore_case) indexOfIgnoreCase(s, o.pattern) else std.mem.indexOf(u8, s, o.pattern) != null,
+                        .starts_with => std.mem.startsWith(u8, s, o.pattern),
+                        .ends_with => std.mem.endsWith(u8, s, o.pattern),
+                        else => std.mem.indexOf(u8, s, o.pattern) != null,
                     };
                 },
                 .string_is_ascii => return isAscii(s),

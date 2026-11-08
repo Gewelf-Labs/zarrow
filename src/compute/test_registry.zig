@@ -498,6 +498,10 @@ test "registerAll registers every kernel family function name with its kind" {
         "binary_slice",      "binary_repeat", "binary_reverse",         "utf8_replace_slice",
         "utf8_zero_fill",    "binary_join",   "binary_replace_slice",
     };
+    const string_regex_names = [_][]const u8{
+        "match_substring_regex",   "match_like",          "count_substring_regex", "find_substring_regex",
+        "replace_substring_regex", "split_pattern_regex", "extract_regex",         "extract_regex_span",
+    };
     const temporal_names = [_][]const u8{
         "year",        "month",       "day",        "day_of_week",    "day_of_year", "hour",         "minute",  "second",
         "millisecond", "microsecond", "nanosecond", "iso_year",       "iso_week",    "iso_calendar", "quarter", "is_leap_year",
@@ -525,7 +529,7 @@ test "registerAll registers every kernel family function name with its kind" {
         "or_kleene",      "is_null",        "is_valid",  "true_unless_null", "cast",             "is_in",
         "index_in",       "is_nan",         "is_finite", "is_inf",           "min_element_wise", "max_element_wise",
         "and_not_kleene", "sign",
-    } ++ string_names ++ temporal_names ++ string_transform_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
+    } ++ string_names ++ temporal_names ++ string_transform_names ++ string_regex_names ++ temporal_round_names ++ math_names ++ [_][]const u8{
         "round",  "round_to_multiple", "round_binary", "ceil", "floor", "trunc", "coalesce", "if_else", "case_when", "choose",
         "random",
     };
@@ -594,6 +598,7 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 8), registry.kernelCount("binary_join", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("replace_substring", .scalar));
     try std.testing.expectEqual(@as(usize, 3), registry.kernelCount("binary_slice", .scalar));
+    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("extract_regex", .scalar));
     try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("hash_sum", .hash_aggregate));

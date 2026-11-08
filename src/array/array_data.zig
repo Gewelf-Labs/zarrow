@@ -3,6 +3,7 @@ const bitmap = @import("../bitmap.zig");
 const buffer = @import("../buffer.zig");
 const array_ref = @import("array_ref.zig");
 const datatype = @import("../datatype.zig");
+const canonical = @import("../extension/canonical.zig");
 
 // Raw Arrow layout container with validation rules for buffers and children.
 
@@ -22,7 +23,7 @@ pub const ValidationError = error{
 };
 
 /// validateFull also checks the UTF-8 of string values.
-pub const FullValidationError = ValidationError || error{InvalidUtf8};
+pub const FullValidationError = ValidationError || error{ InvalidUtf8, InvalidExtensionValue };
 
 pub const AccessorError = ValidationError || error{
     IndexOutOfBounds,
@@ -837,6 +838,8 @@ pub const ArrayData = struct {
 
         for (self.children) |child| try child.data().validateFull();
         if (self.dictionary) |dict| try dict.data().validateFull();
+        // Value constraints of a canonical extension type (arrow.json syntax, tensor shapes, ...).
+        if (self.data_type == .extension) try canonical.validateValues(&self);
     }
 };
 

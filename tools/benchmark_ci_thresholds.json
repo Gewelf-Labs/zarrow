@@ -274,5 +274,17 @@
   "compute_indices_nonzero": {
     "min_rows_per_sec": 5000.0,
     "max_ns_per_row": 2000000.0
+  },
+  "compute_match_regex_literal": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_match_regex_class": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
+  },
+  "compute_replace_regex": {
+    "min_rows_per_sec": 5000.0,
+    "max_ns_per_row": 2000000.0
   }
 }

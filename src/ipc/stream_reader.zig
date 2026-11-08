@@ -1,5 +1,6 @@
 const std = @import("std");
 const datatype = @import("../datatype.zig");
+const canonical = @import("../extension/canonical.zig");
 const schema_mod = @import("../schema.zig");
 const record_batch = @import("../record_batch.zig");
 const buffer = @import("../buffer.zig");
@@ -1187,6 +1188,14 @@ fn buildFieldFromFlatbuf(allocator: std.mem.Allocator, field_t: fbs.FieldT) (Str
             };
         }
     }
+    // A canonical extension (`arrow.*`) must have its storage type and metadata; other names
+    // pass through.
+    const ext: ?datatype.ExtensionType = switch (dtype) {
+        .extension => |e| e,
+        .dictionary => |d| if (d.value_type.* == .extension) d.value_type.extension else null,
+        else => null,
+    };
+    if (ext) |e| canonical.validateType(e) catch return StreamError.InvalidMetadata;
     const dtype_ptr = try allocator.create(DataType);
     dtype_ptr.* = dtype;
     return .{

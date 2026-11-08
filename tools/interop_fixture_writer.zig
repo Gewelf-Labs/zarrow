@@ -9,6 +9,7 @@ const FixtureCase = enum {
     ree_int64,
     complex,
     extension,
+    canonical_ext,
     view,
     tensor,
 };
@@ -26,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next(); // exe
     const out_path = args.next() orelse {
-        std.log.err("usage: interop-fixture-writer <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|view|tensor] [stream|file]", .{});
+        std.log.err("usage: interop-fixture-writer <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|canonical-ext|view|tensor] [stream|file]", .{});
         return error.InvalidArgs;
     };
     const fixture_case: FixtureCase = blk: {
@@ -38,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, mode, "ree-int64")) break :blk .ree_int64;
         if (std.mem.eql(u8, mode, "complex")) break :blk .complex;
         if (std.mem.eql(u8, mode, "extension")) break :blk .extension;
+        if (std.mem.eql(u8, mode, "canonical-ext")) break :blk .canonical_ext;
         if (std.mem.eql(u8, mode, "view")) break :blk .view;
         if (std.mem.eql(u8, mode, "tensor")) break :blk .tensor;
         std.log.err("unknown fixture mode: {s}", .{mode});
@@ -51,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArgs;
     };
     if (args.next() != null) {
-        std.log.err("usage: interop-fixture-writer <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|view|tensor] [stream|file]", .{});
+        std.log.err("usage: interop-fixture-writer <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|canonical-ext|view|tensor] [stream|file]", .{});
         return error.InvalidArgs;
     }
     if (container_mode == .file and fixture_case == .dict_delta) {
@@ -86,9 +88,29 @@ fn writeFixture(allocator: std.mem.Allocator, writer: anytype, fixture_case: Fix
         .ree_int64 => try writeReeFixture(allocator, writer, .{ .bit_width = 64, .signed = true }),
         .complex => try writeComplexFixture(allocator, writer),
         .extension => try writeExtensionFixture(allocator, writer),
+        .canonical_ext => try writeCanonicalExtensionFixture(allocator, writer),
         .view => try writeViewFixture(allocator, writer),
         .tensor => try writeTensorFixture(allocator, writer),
     }
+}
+
+/// The pyarrow 26 canonical extension fixture (arrow.uuid, bool8, json, fixed_shape_tensor,
+/// opaque, variable_shape_tensor, timestamp_with_offset, parquet.variant) read by zarrow, with
+/// every canonical type checked on import, and written again; pyarrow reads it back
+/// (`tools/interop/pyarrow_canonical_extensions.py check`).
+fn writeCanonicalExtensionFixture(allocator: std.mem.Allocator, writer: anytype) !void {
+    var in: std.Io.Reader = .fixed(@embedFile("pyarrow_canonical"));
+    var reader = zarrow.IpcStreamReader.init(allocator, &in);
+    defer reader.deinit();
+    const schema = try reader.readSchema();
+    try writer.writeSchema(schema);
+    while (try reader.nextRecordBatch()) |b| {
+        var batch = b;
+        defer batch.deinit();
+        for (batch.columns) |c| try c.data().validateFull();
+        try writer.writeRecordBatch(batch);
+    }
+    try writer.writeEnd();
 }
 
 fn writeTensorFixture(allocator: std.mem.Allocator, writer: anytype) !void {

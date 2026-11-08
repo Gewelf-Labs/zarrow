@@ -9,6 +9,7 @@ See [docs/fuzzing.md](../../docs/fuzzing.md).
 | `ipc-file/` | `ipc-file` |
 | `array-layout/` | `array-layout` |
 | `c-abi/` | `c-abi` |
+| `regex/` | `regex` (hand-made: flag byte, u16 pattern length, pattern, text) |
 
 File names:
 

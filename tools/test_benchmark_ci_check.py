@@ -85,6 +85,9 @@ VALID_ROWS = [
     "compute_replace_with_mask_int32,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_cast_list_int32_to_int64,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_indices_nonzero,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_match_regex_literal,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_match_regex_class,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_replace_regex,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
 ]
 
 
