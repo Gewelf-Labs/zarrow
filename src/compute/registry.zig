@@ -727,6 +727,9 @@ pub const ExecConfig = struct {
     threads: usize = 1,
     /// Optional arena-like allocator used for temporary/borrowed scalar payloads.
     arena_allocator: ?std.mem.Allocator = null,
+    /// Optional I/O for kernels that read the system: timezone names from the system zoneinfo
+    /// (Linux, macOS; otherwise the bundled table) and `random` with `initializer = system`.
+    io: ?std.Io = null,
 };
 
 pub const ExecContext = struct {

@@ -54,6 +54,9 @@ defer sum.release();
 | String transforms | `string_transform.zig` | `replace_substring`, `split_pattern`, `ascii_split_whitespace`, `utf8_split_whitespace` (`list<T>` result), `ascii_lpad`, `ascii_rpad`, `ascii_center`, `utf8_lpad`, `utf8_rpad`, `utf8_center`, `utf8_zero_fill`, `utf8_replace_slice`, `count_substring`, `find_substring`, `binary_repeat` (string and binary layouts; padding, zero fill, replace_slice and whitespace splits on the string layouts), `binary_slice`, `binary_reverse`, `binary_replace_slice` (binary layouts), `binary_join` (`list<T>` / `large_list<T>` with a `T` separator) |
 | Temporal | `temporal.zig` | `year`, `month`, `day`, `day_of_week`, `day_of_year`, `iso_year`, `iso_week`, `us_week`, `us_year`, `week`, `iso_calendar`, `year_month_day`, `quarter`, `is_leap_year` (date32, date64, timestamp); `hour`, `minute`, `second`, `millisecond`, `microsecond`, `nanosecond` (date64, timestamp, time32, time64); `subsecond` (timestamp, time32, time64) |
 | Temporal rounding and differences | `temporal_round.zig` | `floor_temporal`, `ceil_temporal`, `round_temporal`; `years_between`, `quarters_between`, `month_interval_between`, `weeks_between`, `days_between` (date32, date64, timestamp); `hours_between`, `minutes_between`, `seconds_between`, `milliseconds_between`, `microseconds_between`, `nanoseconds_between`, `day_time_interval_between`, `month_day_nano_interval_between` and the rounding functions (also time32, time64) |
+| Temporal text | `temporal_text.zig` | `strftime` (`StrftimeOptions`), `strptime` (`StrptimeOptions`), and the casts between the temporal types and the string layouts (called by `cast`) |
+| Timezones | `temporal_zone.zig`, `tz.zig` | `assume_timezone` (`AssumeTimezoneOptions`), `local_timestamp`, `is_dst`; the localization every temporal function applies to a non-UTC timestamp; the TZif reader and the bundled IANA table |
+| Normalization | `string_normalize.zig` | `utf8_normalize` (`Utf8NormalizeOptions`: NFC, NFD, NFKC, NFKD) |
 | Set lookup | `set_lookup.zig` | `is_in`, `index_in` (numbers, bool, temporal, intervals, decimals, fixed_size_binary, string and binary layouts; a value set of another type is cast) |
 | Approximate quantiles | `tdigest.zig` | `tdigest` (`TDigestOptions`), `approximate_median` (`ScalarAggregateOptions`), `hash_tdigest`, `hash_approximate_median` (Arrow's merging t-digest) |
 | Pivot | `pivot.zig` | `pivot_wider`, `hash_pivot_wider` (`PivotWiderOptions`) |
@@ -262,6 +265,7 @@ Compute options are type-safe and tag-based.
 - `dictionary_encode`
 - `scatter`, `inverse_permutation`
 - `cumulative`, `pairwise`, `winsorize`, `random`
+- `strftime`, `strptime`, `assume_timezone`, `utf8_normalize`
 - `custom`
 
 ### Payload types
@@ -313,8 +317,13 @@ Compute options are type-safe and tag-based.
   max(indices, 2^24) is `InvalidOptions`
 - `CumulativeOptions` (`start`: a numeric `Scalar` cast safely to the input type, null for the identity;
   `skip_nulls` = false), `PairwiseOptions` (`period` = 1), `WinsorizeOptions` (`lower_limit` = 0,
-  `upper_limit` = 1; required, as Arrow), `RandomOptions` (`length`, `initializer`: `seed | system`,
-  `seed`; required)
+  `upper_limit` = 1; required, as Arrow), `RandomOptions` (`length`, `initializer`: `seed | system`
+  (`system` draws the seed through `ExecConfig.io`), `seed`; required)
+- `StrftimeOptions` (`format` = `%Y-%m-%dT%H:%M:%S`, `locale` = `"C"`, the only one), `StrptimeOptions`
+  (`format`, `unit`, `error_is_null` = false; required, as Arrow)
+- `AssumeTimezoneOptions` (`timezone`: an IANA name or `+HH:MM`, `ambiguous` / `nonexistent`:
+  `raise | earliest | latest`, both `raise` by default)
+- `Utf8NormalizeOptions` (`form`: `nfc | nfkc | nfd | nfkd`, `nfc` by default)
 - `CustomOptions`
 
 Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`, `week`,
@@ -415,6 +424,9 @@ Error conventions, mirroring Arrow C++ (`Status`, `Result<T>`, no exceptions acr
   `wrapping` and clamps under `saturating`
 - `threads`
 - `arena_allocator`
+- `io` (`?std.Io`, null by default): timezone names are read from the system zoneinfo
+  (`/usr/share/zoneinfo`, Linux and macOS) when set, otherwise from the bundled IANA table
+  (`src/compute/tzdata/tzdata.bin`); `random` with `initializer = system` draws its seed through it
 
 Context construction:
 

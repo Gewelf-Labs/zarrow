@@ -140,14 +140,6 @@ fn runCase(allocator: std.mem.Allocator, ctx: *ExecContext, func: []const u8, op
     }
 }
 
-/// Corpus cases where zarrow knowingly differs from pyarrow 26 (each one documented in
-/// docs/compute-support-matrix.md): patterns, any function and text.
-const known_mismatches = [_][]const u8{
-    // Unicode script classes are not implemented (no Scripts.txt tables): InvalidOptions.
-    "\\p{Greek}",
-    "\\p{Han}",
-};
-
 /// Whether a replace (hex) or split (comma-separated hex) result holds invalid UTF-8.
 fn invalidUtf8Result(allocator: std.mem.Allocator, expected: []const u8) !bool {
     if (expected.len == 1) return false;
@@ -156,13 +148,6 @@ fn invalidUtf8Result(allocator: std.mem.Allocator, expected: []const u8) !bool {
         const bytes = hexDecode(allocator, p) catch return false;
         defer allocator.free(bytes);
         if (!std.unicode.utf8ValidateSlice(bytes)) return true;
-    }
-    return false;
-}
-
-fn isKnown(pattern: []const u8) bool {
-    for (known_mismatches) |k| {
-        if (std.mem.eql(u8, k, pattern)) return true;
     }
     return false;
 }
@@ -183,7 +168,6 @@ test "string regex kernels match pyarrow 26 on the generated corpus (tools/regex
     defer got.deinit(allocator);
     var cases: usize = 0;
     var mismatches: usize = 0;
-    var scripts: usize = 0;
     var utf8_cuts: usize = 0;
     var lines = std.mem.splitScalar(u8, corpus, '\n');
     while (lines.next()) |line| {
@@ -213,19 +197,14 @@ test "string regex kernels match pyarrow 26 on the generated corpus (tools/regex
             utf8_cuts += 1;
             continue;
         }
-        if (isKnown(pattern)) {
-            scripts += 1;
-            continue;
-        }
         mismatches += 1;
         if (mismatches <= 40) std.debug.print("mismatch {s} {s} [{s}] pattern \"{s}\" text \"{s}\": got {s}, pyarrow {s}\n", .{ f0, f1, if (binary) "binary" else "string", pattern, text, got.items, f2 });
     }
     if (mismatches > 0) std.debug.print("{d} mismatches of {d} cases\n", .{ mismatches, cases });
     try std.testing.expectEqual(@as(usize, 33605), cases);
     try std.testing.expectEqual(@as(usize, 0), mismatches);
-    // The documented differences: script classes rejected, and results Arrow would emit as
-    // invalid UTF-8 (a match inside a code point) rejected.
-    try std.testing.expectEqual(@as(usize, 264), scripts);
+    // The documented difference: results Arrow would emit as invalid UTF-8 (a match inside a
+    // code point) rejected. Script classes (`\p{Greek}`, `\p{Han}`) match pyarrow 26.
     try std.testing.expectEqual(@as(usize, 8), utf8_cuts);
 }
 

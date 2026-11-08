@@ -282,6 +282,27 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     try timeKernelWith(io, &ctx, .scalar, "compute_match_regex_literal", "match_substring_regex", &.{.{ .array = str_a }}, .{ .match_substring = .{ .pattern = "y-0012" } }, cfg, emit_csv, meta);
     try timeKernelWith(io, &ctx, .scalar, "compute_match_regex_class", "match_substring_regex", &.{.{ .array = str_a }}, .{ .match_substring = .{ .pattern = "[a-z]+-\\d{3}[1-3]\\d+$" } }, cfg, emit_csv, meta);
     try timeKernelWith(io, &ctx, .scalar, "compute_replace_regex", "replace_substring_regex", &.{.{ .array = str_a }}, .{ .replace_substring = .{ .pattern = "\\d+", .replacement = "#" } }, cfg, emit_csv, meta);
+    // Temporal text over millisecond timestamps with 10% nulls: the default strftime format, the
+    // cast to string, and strptime of the ISO text that strftime printed (seconds, 19 bytes).
+    try timeKernelWith(io, &ctx, .scalar, "compute_strftime_timestamp", "strftime", &.{.{ .array = ts }}, .{ .none = {} }, cfg, emit_csv, meta);
+    try timeKernelWith(io, &ctx, .scalar, "compute_cast_timestamp_to_string", "cast", &.{.{ .array = ts }}, to_string, cfg, emit_csv, meta);
+    var iso = try ctx.invokeScalar("strftime", &.{.{ .array = ts }}, .{ .strftime = .{ .format = "%Y-%m-%dT%H:%M:%OS" } });
+    defer iso.release();
+    try timeKernelWith(io, &ctx, .scalar, "compute_strptime", "strptime", &.{iso}, .{ .strptime = .{ .format = "%Y-%m-%dT%H:%M:%S", .unit = .second } }, cfg, emit_csv, meta);
+    // assume_timezone (America/New_York, ambiguous / nonexistent earliest) over a naive
+    // millisecond series one minute apart from 2021-01-01 (it crosses the March DST gap).
+    var minutes = try zarrow.TimestampBuilder(.millisecond, null).init(allocator, cfg.rows);
+    defer minutes.deinit();
+    for (0..cfg.rows) |i| try minutes.append(1_609_459_200_000 + @as(i64, @intCast(i)) * 60_000);
+    var series = try minutes.finish();
+    defer series.release();
+    try timeKernelWith(io, &ctx, .scalar, "compute_assume_timezone", "assume_timezone", &.{.{ .array = series }}, .{ .assume_timezone = .{ .timezone = "America/New_York", .ambiguous = .earliest, .nonexistent = .earliest } }, cfg, emit_csv, meta);
+    // utf8_normalize to NFC: ASCII keys (in NFC already: the input comes back), and mixed
+    // Unicode rows of which one in four is decomposed ("cafe\u{301}") and must be composed.
+    try timeKernelWith(io, &ctx, .scalar, "compute_utf8_normalize_nfc_ascii", "utf8_normalize", &.{.{ .array = str_a }}, .none, cfg, emit_csv, meta);
+    var mixed_norm = try buildNormMixed(allocator, cfg.rows, 23);
+    defer mixed_norm.release();
+    try timeKernelWith(io, &ctx, .scalar, "compute_utf8_normalize_nfc_mixed", "utf8_normalize", &.{.{ .array = mixed_norm }}, .none, cfg, emit_csv, meta);
     // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
     try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
 }
@@ -309,6 +330,22 @@ fn buildDecimal(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.Ar
     for (0..rows) |i| {
         x = x *% 6364136223846793005 +% 1442695040888963407;
         if (i % 10 == 0) try b.appendNull() else try b.append(@as(i128, @as(i64, @bitCast(x >> 10))) >> 1);
+    }
+    return b.finish();
+}
+
+/// Utf8 rows for utf8_normalize: words in NFC ("größe", "привет", "Ångström") and in NFD
+/// ("cafe\u{301}", "A\u{30A}ngstro\u{308}m") with a number, one decomposed row in four.
+fn buildNormMixed(allocator: std.mem.Allocator, rows: usize, seed: u32) !zarrow.ArrayRef {
+    const words = [_][]const u8{ "größe", "привет", "Ångström", "naïve", "σωκράτης", "東京", "cafe\u{301}", "A\u{30A}ngstro\u{308}m" };
+    var b = try zarrow.StringBuilder.init(allocator, rows, rows * 20);
+    defer b.deinit();
+    var x: u32 = seed;
+    var buf: [32]u8 = undefined;
+    for (0..rows) |_| {
+        x = x *% 1664525 +% 1013904223;
+        const s = std.fmt.bufPrint(&buf, "{s}-{d}", .{ words[(x >> 24) % words.len], x % 1000 }) catch unreachable;
+        try b.append(s);
     }
     return b.finish();
 }

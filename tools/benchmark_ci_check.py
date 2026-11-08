@@ -88,6 +88,12 @@ EXPECTED_BENCHES = {
     "compute_match_regex_literal",
     "compute_match_regex_class",
     "compute_replace_regex",
+    "compute_strftime_timestamp",
+    "compute_cast_timestamp_to_string",
+    "compute_strptime",
+    "compute_assume_timezone",
+    "compute_utf8_normalize_nfc_ascii",
+    "compute_utf8_normalize_nfc_mixed",
 }
 
 

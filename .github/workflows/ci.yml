@@ -302,6 +302,8 @@ jobs:
           python tools/interop/pyarrow_validate.py .interop-fixtures/zarrow.arrow canonical stream
           python tools/interop/pyarrow_validate.py .interop-fixtures/zarrow_file.arrow canonical file
           python tools/interop/pyarrow_validate.py .interop-fixtures/zarrow_tensor.arrow tensor stream
+          python tools/interop/pyarrow_generate.py .interop-fixtures/pyarrow_tensor.arrow tensor stream
+          zig build interop-fixture-check -- .interop-fixtures/pyarrow_tensor.arrow tensor stream
           # Canonical extension types (needs pyarrow >= 21 for every registered type).
           if python -c "import pyarrow as pa, sys; sys.exit(0 if int(pa.__version__.split('.')[0]) >= 21 else 1)"; then
             zig build interop-fixture-writer -- .interop-fixtures/zarrow_canonical_ext.arrows canonical-ext stream

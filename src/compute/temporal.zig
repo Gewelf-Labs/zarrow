@@ -12,14 +12,15 @@
 //!
 //! Dates follow the proleptic Gregorian calendar over the whole input range (days are floored, so
 //! instants before 1970 land on the right day). Timestamps without a timezone and with a UTC
-//! timezone (`UTC`, `Etc/UTC`, `+00:00`) are read as UTC; any other timezone is `NotImplemented`
-//! (Arrow C++ converts to local time through the timezone database). millisecond, microsecond and
+//! timezone are read as UTC; any other timezone (an IANA name or a fixed offset) is read as its
+//! local time (`temporal_zone.localize`, DST-aware, as Arrow C++). millisecond, microsecond and
 //! nanosecond are the 0..999 sub-fields (of the second, millisecond and microsecond), as in Arrow.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
+const temporal_zone = @import("temporal_zone.zig");
 
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
@@ -120,19 +121,18 @@ fn weekOptions(options: Options) bool {
 }
 
 /// Return whether `tz` names UTC (a timezone-naive timestamp is read as UTC too).
-pub fn isUtc(tz: []const u8) bool {
-    for ([_][]const u8{ "UTC", "Etc/UTC", "+00:00" }) |name| if (std.mem.eql(u8, tz, name)) return true;
-    return false;
-}
+pub const isUtc = @import("tz.zig").isUtc;
 
 fn Extract(comptime f: Field) type {
     return struct {
         /// Extract the component from each row (array, chunked or scalar).
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 1) return error.InvalidArity;
-            switch (args[0].dataType()) {
-                .timestamp => |ts| if (ts.timezone) |tz| if (!isUtc(tz)) return error.NotImplemented,
-                else => {},
+            // A zoned timestamp reads as its local time.
+            if (temporal_zone.zoneName(args[0].dataType())) |name| {
+                var local = try temporal_zone.localize(ctx, args[0], name);
+                defer local.release();
+                return dense.execElementwiseWith(ctx, &.{local}, options, outType(f), true, chunk);
             }
             return dense.execElementwiseWith(ctx, args, options, outType(f), true, chunk);
         }

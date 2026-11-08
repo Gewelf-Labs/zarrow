@@ -10,6 +10,9 @@ from typing import Any
 
 
 EXPECTED_PYARROW_VERSION = "23.0.1"
+# `--write-fixture` records the expectations of this pyarrow release for the Zig test block of
+# tools/compute_compat_runner.zig (tools/compute/testdata/pyarrow_compute_compat.json).
+FIXTURE_PYARROW_VERSION = "26.0.0"
 
 
 def array(values: list[int | None]) -> dict[str, Any]:
@@ -116,6 +119,11 @@ def parse_args() -> argparse.Namespace:
         choices=["all", "numeric", "nulls", "boundary", "chunked"],
         default="all",
         help="subset of compatibility cases to run",
+    )
+    parser.add_argument(
+        "--write-fixture",
+        type=Path,
+        help="write every case with pyarrow's result to this JSON file instead of running zarrow",
     )
     return parser.parse_args()
 
@@ -256,10 +264,31 @@ def assert_alignment(cases: list[dict[str, Any]], runner_result: dict[str, Any],
             )
 
 
+def write_fixture(path: Path, pa: Any, pc: Any) -> None:
+    """Every case as the runner's input plus pyarrow's outcome (`values`, or the error name the
+    case expects), sorted keys, for the Zig test block of tools/compute_compat_runner.zig."""
+    allowed = {"name", "operation", "lhs", "rhs", "arithmetic_options", "cast_options"}
+    out = []
+    for case in CASES:
+        py_case = run_pyarrow_case(case, pa, pc)
+        expected_error = case.get("expected_error")
+        if (expected_error is None) != (py_case["status"] == "ok"):
+            raise SystemExit(f"{case['name']}: pyarrow outcome {py_case} does not match the case")
+        expected = {"status": "error", "error": expected_error} if expected_error else {"status": "ok", "values": py_case["values"]}
+        out.append({"input": {k: v for k, v in case.items() if k in allowed}, "expected": expected})
+    path.write_text(json.dumps({"pyarrow": pa.__version__, "cases": out}, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+
+
 def main() -> None:
     args = parse_args()
     import pyarrow as pa  # delayed import for clearer CLI failures
     import pyarrow.compute as pc
+
+    if args.write_fixture is not None:
+        if pa.__version__ != FIXTURE_PYARROW_VERSION:
+            raise SystemExit(f"PyArrow version must be {FIXTURE_PYARROW_VERSION} for the fixture; got {pa.__version__}")
+        write_fixture(args.write_fixture, pa, pc)
+        return
 
     if pa.__version__ != EXPECTED_PYARROW_VERSION:
         raise SystemExit(f"PyArrow version must be {EXPECTED_PYARROW_VERSION}; got {pa.__version__}")

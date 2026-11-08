@@ -1,0 +1,332 @@
+{
+ "cases": [
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     5,
+     7,
+     9
+    ]
+   },
+   "input": {
+    "lhs": {
+     "kind": "array",
+     "values": [
+      1,
+      2,
+      3
+     ]
+    },
+    "name": "numeric_add_array",
+    "operation": "add_i64",
+    "rhs": {
+     "kind": "array",
+     "values": [
+      4,
+      5,
+      6
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     4,
+     3,
+     2
+    ]
+   },
+   "input": {
+    "lhs": {
+     "kind": "array",
+     "values": [
+      8,
+      9,
+      10
+     ]
+    },
+    "name": "numeric_divide_array",
+    "operation": "divide_i64",
+    "rhs": {
+     "kind": "array",
+     "values": [
+      2,
+      3,
+      5
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     11,
+     null,
+     null
+    ]
+   },
+   "input": {
+    "lhs": {
+     "kind": "array",
+     "values": [
+      1,
+      null,
+      3
+     ]
+    },
+    "name": "nulls_add_array",
+    "operation": "add_i64",
+    "rhs": {
+     "kind": "array",
+     "values": [
+      10,
+      20,
+      null
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     4,
+     null,
+     2
+    ]
+   },
+   "input": {
+    "lhs": {
+     "kind": "array",
+     "values": [
+      8,
+      null,
+      10
+     ]
+    },
+    "name": "nulls_divide_array",
+    "operation": "divide_i64",
+    "rhs": {
+     "kind": "array",
+     "values": [
+      2,
+      3,
+      5
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "error": "DivideByZero",
+    "status": "error"
+   },
+   "input": {
+    "lhs": {
+     "kind": "array",
+     "values": [
+      1,
+      2
+     ]
+    },
+    "name": "boundary_divide_by_zero_error",
+    "operation": "divide_i64",
+    "rhs": {
+     "kind": "array",
+     "values": [
+      1,
+      0
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     2147483647,
+     -2147483648,
+     0
+    ]
+   },
+   "input": {
+    "cast_options": {
+     "safe": true
+    },
+    "lhs": {
+     "kind": "array",
+     "values": [
+      2147483647,
+      -2147483648,
+      0
+     ]
+    },
+    "name": "boundary_cast_i64_to_i32_ok",
+    "operation": "cast_i64_to_i32"
+   }
+  },
+  {
+   "expected": {
+    "error": "InvalidCast",
+    "status": "error"
+   },
+   "input": {
+    "cast_options": {
+     "safe": true
+    },
+    "lhs": {
+     "kind": "array",
+     "values": [
+      2147483648
+     ]
+    },
+    "name": "boundary_cast_i64_to_i32_invalid",
+    "operation": "cast_i64_to_i32"
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     11,
+     null,
+     null,
+     44,
+     55
+    ]
+   },
+   "input": {
+    "lhs": {
+     "chunks": [
+      2,
+      3
+     ],
+     "kind": "chunked",
+     "values": [
+      1,
+      null,
+      3,
+      4,
+      5
+     ]
+    },
+    "name": "chunked_add_misaligned",
+    "operation": "add_i64",
+    "rhs": {
+     "chunks": [
+      1,
+      4
+     ],
+     "kind": "chunked",
+     "values": [
+      10,
+      20,
+      null,
+      40,
+      50
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     6,
+     null,
+     8,
+     9
+    ]
+   },
+   "input": {
+    "lhs": {
+     "kind": "scalar",
+     "scalar": 5
+    },
+    "name": "chunked_add_scalar_broadcast",
+    "operation": "add_i64",
+    "rhs": {
+     "chunks": [
+      1,
+      3
+     ],
+     "kind": "chunked",
+     "values": [
+      1,
+      null,
+      3,
+      4
+     ]
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "lhs": {
+     "chunks": [
+      3,
+      1
+     ],
+     "kind": "chunked",
+     "values": [
+      20,
+      30,
+      40,
+      50
+     ]
+    },
+    "name": "chunked_divide_scalar_broadcast",
+    "operation": "divide_i64",
+    "rhs": {
+     "kind": "scalar",
+     "scalar": 10
+    }
+   }
+  },
+  {
+   "expected": {
+    "status": "ok",
+    "values": [
+     1,
+     2,
+     2147483647,
+     -2147483648
+    ]
+   },
+   "input": {
+    "cast_options": {
+     "safe": true
+    },
+    "lhs": {
+     "chunks": [
+      3,
+      1
+     ],
+     "kind": "chunked",
+     "values": [
+      1,
+      2,
+      2147483647,
+      -2147483648
+     ]
+    },
+    "name": "chunked_cast_i64_to_i32_ok",
+    "operation": "cast_i64_to_i32"
+   }
+  }
+ ],
+ "pyarrow": "26.0.0"
+}

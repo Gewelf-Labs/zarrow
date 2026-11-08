@@ -251,3 +251,54 @@ test "associative edge cases and errors: empty, scalars, unsupported types, opti
         try std.testing.expectError(error.InvalidInput, ctx.invokeVector(name, &.{.{ .array = malformed }}, none));
     }
 }
+
+test "float16 keys and signs: unique, value_counts, dictionary_encode, count_distinct, is_in, sorts, negate, abs and sign (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const h_nan = std.math.nan(f16);
+    const h_inf = std.math.inf(f16);
+    // [1.5, -0.0, 0.0, NaN, 1.5, NaN, inf, null], sliced off a longer array.
+    var full = try common.makeArray(f16, allocator, &.{ 9, 1.5, -0.0, 0.0, h_nan, 1.5, h_nan, h_inf, null });
+    defer full.release();
+    var a = try full.slice(1, 8);
+    defer a.release();
+    const d: Datum = .{ .array = a };
+    // NaN is one value, -0.0 and 0.0 are two (pyarrow 26: unique, value_counts, dictionary_encode).
+    var uniq = try vector(&ctx, "unique", d, none);
+    defer uniq.release();
+    const u = try common.collect(f16, allocator, .{ .array = uniq });
+    defer allocator.free(u);
+    try common.expectRows(f16, &.{ 1.5, -0.0, 0.0, h_nan, h_inf, null }, u);
+    try std.testing.expect(std.math.signbit(u[1].?) and !std.math.signbit(u[2].?));
+    var vc = try vector(&ctx, "value_counts", d, none);
+    defer vc.release();
+    const counts = try common.collect(i64, allocator, .{ .array = vc.data().children[1] });
+    defer allocator.free(counts);
+    try common.expectRows(i64, &.{ 2, 1, 1, 2, 1, 1 }, counts);
+    var enc = try vector(&ctx, "dictionary_encode", d, none);
+    defer enc.release();
+    const ix = try enc.data().buffers[1].typedSlice(i32);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 0, 3, 4 }, ix[enc.data().offset..][0..7]);
+    try std.testing.expect(enc.data().isNull(7));
+    try std.testing.expectEqual(@as(usize, 5), enc.data().dictionary.?.data().length);
+    var cd = try ctx.invokeAggregate("count_distinct", &.{d}, none);
+    defer cd.release();
+    try std.testing.expectEqual(@as(i64, 5), cd.scalar.value.i64);
+    // is_in / index_in (pyarrow 26 has no float16 kernel; zarrow's float rules: NaN matches NaN).
+    var set = try common.makeArray(f16, allocator, &.{ 1.5, h_nan });
+    defer set.release();
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{d}, .{ .set_lookup = .{ .value_set = .{ .array = set } } }, &.{ true, false, false, true, true, true, false, false });
+    // sort_indices: -0.0 equals 0.0, NaN after the values, nulls last (pyarrow 26 has no kernel).
+    var order = try vector(&ctx, "sort_indices", d, none);
+    defer order.release();
+    const o = try common.collect(u64, allocator, .{ .array = order });
+    defer allocator.free(o);
+    try common.expectRows(u64, &.{ 1, 2, 0, 4, 6, 3, 5, 7 }, o);
+    // negate, sign (pyarrow 26) and abs.
+    try common.expectInvokeWith(f16, &ctx, "negate", &.{d}, none, &.{ -1.5, 0.0, -0.0, h_nan, -1.5, h_nan, -h_inf, null });
+    try common.expectInvokeWith(f16, &ctx, "negate_checked", &.{d}, none, &.{ -1.5, 0.0, -0.0, h_nan, -1.5, h_nan, -h_inf, null });
+    try common.expectInvokeWith(f16, &ctx, "sign", &.{d}, none, &.{ 1, 0, 0, h_nan, 1, h_nan, 1, null });
+    try common.expectInvokeWith(f16, &ctx, "abs", &.{d}, none, &.{ 1.5, 0.0, 0.0, h_nan, 1.5, h_nan, h_inf, null });
+}

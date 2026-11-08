@@ -97,6 +97,14 @@ pub const OptionsTag = enum {
     random,
     /// Pattern of extract_regex / extract_regex_span.
     extract_regex,
+    /// Format and locale of strftime.
+    strftime,
+    /// Format, unit and error handling of strptime.
+    strptime,
+    /// Timezone and ambiguous / nonexistent handling of assume_timezone.
+    assume_timezone,
+    /// Normalization form of utf8_normalize.
+    utf8_normalize,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -523,10 +531,40 @@ pub const ExtractRegexOptions = struct {
 pub const RandomOptions = struct {
     /// Number of values.
     length: usize = 0,
-    /// `seed`: a deterministic generator seeded with `seed`; `system`: `NotImplemented` (the
-    /// exec context has no I/O source of randomness; draw a seed and pass it instead).
+    /// `seed`: a deterministic generator seeded with `seed`; `system`: seeded from the operating
+    /// system through `ExecConfig.io` (`NotImplemented` when the context has no I/O).
     initializer: enum { seed, system } = .seed,
     seed: u64 = 0,
+};
+
+/// Options of strftime (Arrow `StrftimeOptions`).
+pub const StrftimeOptions = struct {
+    /// C99 / C++20 chrono conversion specifiers (see `temporal_text.zig`).
+    format: []const u8 = "%Y-%m-%dT%H:%M:%S",
+    /// Only "C" (any other locale is `NotImplemented`).
+    locale: []const u8 = "C",
+};
+
+/// Options of strptime (Arrow `StrptimeOptions`; no defaults, as Arrow).
+pub const StrptimeOptions = struct {
+    format: []const u8,
+    unit: @import("../datatype.zig").TimeUnit,
+    /// A row that does not parse is null (false: `InvalidInput`).
+    error_is_null: bool = false,
+};
+
+/// Options of assume_timezone (Arrow `AssumeTimezoneOptions`).
+pub const AssumeTimezoneOptions = struct {
+    /// An IANA name or a fixed offset `+HH:MM`; borrowed for the call (the result type keeps it).
+    timezone: []const u8,
+    ambiguous: enum { raise, earliest, latest } = .raise,
+    nonexistent: enum { raise, earliest, latest } = .raise,
+};
+
+/// Options of utf8_normalize (Arrow `Utf8NormalizeOptions`).
+pub const Utf8NormalizeOptions = struct {
+    pub const Form = enum { nfc, nfkc, nfd, nfkd };
+    form: Form = .nfc,
 };
 
 /// Custom untyped options hook for downstream extension kernels.
@@ -585,6 +623,10 @@ pub const Options = union(OptionsTag) {
     winsorize: WinsorizeOptions,
     random: RandomOptions,
     extract_regex: ExtractRegexOptions,
+    strftime: StrftimeOptions,
+    strptime: StrptimeOptions,
+    assume_timezone: AssumeTimezoneOptions,
+    utf8_normalize: Utf8NormalizeOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {

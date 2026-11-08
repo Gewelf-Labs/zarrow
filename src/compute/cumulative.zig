@@ -26,8 +26,9 @@
 //!   interpolation over the valid non-NaN values (pyarrow 26 results); NaN and nulls stay.
 //! - random (`RandomOptions`: length, initializer, seed): `length` float64 values in [0, 1) from
 //!   std.Random.DefaultPrng seeded with `seed` (the sequence differs from Arrow's, which seeds
-//!   its own generator); `initializer = system` is `NotImplemented` (no I/O source of
-//!   randomness in the exec context). Nullary (no argument), as Arrow.
+//!   its own generator); `initializer = system` seeds it from the operating system through
+//!   `ExecConfig.io` (`std.Io.random`; `NotImplemented` without an I/O source). Nullary (no
+//!   argument), as Arrow.
 //!
 //! Every input chunk passes `validateLayout` before its buffers are read.
 const std = @import("std");
@@ -450,8 +451,14 @@ fn clamp(comptime T: type, allocator: std.mem.Allocator, p: ArrayRef, bounds: ?[
 fn random(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
     if (args.len != 0) return error.InvalidArity;
     const o = options.random;
-    if (o.initializer == .system) return error.NotImplemented;
-    var prng = std.Random.DefaultPrng.init(o.seed);
+    var seed = o.seed;
+    if (o.initializer == .system) {
+        const io = ctx.config.io orelse return error.NotImplemented;
+        var bytes: [8]u8 = undefined;
+        io.random(&bytes);
+        seed = std.mem.readInt(u64, &bytes, .little);
+    }
+    var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     var buf = OwnedBuffer.initUninit(ctx.allocator, o.length * @sizeOf(f64)) catch return error.OutOfMemory;
     for (buf.typedSlice(f64)[0..o.length]) |*y| y.* = rng.float(f64);

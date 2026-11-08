@@ -88,6 +88,12 @@ VALID_ROWS = [
     "compute_match_regex_literal,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_match_regex_class,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
     "compute_replace_regex,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_strftime_timestamp,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_cast_timestamp_to_string,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_strptime,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_assume_timezone,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_utf8_normalize_nfc_ascii,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
+    "compute_utf8_normalize_nfc_mixed,1000,10,1000000,1000.0,1000.0,45,abc123,1700000000",
 ]
 
 

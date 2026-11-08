@@ -249,6 +249,17 @@ test "random: seeded values in [0, 1), length, system initializer" {
     try std.testing.expectEqual(@as(usize, 100), xs.len);
     try std.testing.expectEqualSlices(f64, xs, ys);
     for (xs) |x| try std.testing.expect(x >= 0 and x < 1);
+    // The system initializer needs the context's I/O; with it, two calls draw two seeds.
     try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 1, .initializer = .system } }));
+    var sys_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .io = std.testing.io });
+    var s1 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
+    defer s1.release();
+    var s2 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
+    defer s2.release();
+    try s1.array.data().validateFull();
+    const v1 = try s1.array.data().buffers[1].typedSlice(f64);
+    const v2 = try s2.array.data().buffers[1].typedSlice(f64);
+    for (v1[0..64]) |x| try std.testing.expect(x >= 0 and x < 1);
+    try std.testing.expect(!std.mem.eql(f64, v1[0..64], v2[0..64]));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("random", &.{}, none));
 }

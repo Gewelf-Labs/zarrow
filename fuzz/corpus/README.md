@@ -10,6 +10,7 @@ See [docs/fuzzing.md](../../docs/fuzzing.md).
 | `array-layout/` | `array-layout` |
 | `c-abi/` | `c-abi` |
 | `regex/` | `regex` (hand-made: flag byte, u16 pattern length, pattern, text) |
+| `temporal/` | `temporal` (hand-made: flag byte, u16 format length, format, text) |
 
 File names:
 

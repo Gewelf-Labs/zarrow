@@ -46,6 +46,17 @@ pub fn skipPadding(reader: *std.Io.Reader, pad_len: usize) std.Io.Reader.Error!v
     try reader.discardAll(pad_len);
 }
 
+/// Skip up to `pad_len` zero bytes after a message body whose length is not a multiple of 8.
+/// pyarrow's `write_tensor` writes such a body without padding, so the next message (or the end
+/// of the stream) may start right after it; a writer that pads writes zeros.
+pub fn skipBodyPadding(reader: *std.Io.Reader, pad_len: usize) void {
+    for (0..pad_len) |_| {
+        const b = reader.peekByte() catch return;
+        if (b != 0) return;
+        reader.toss(1);
+    }
+}
+
 pub fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
     try writer.writeInt(T, value, .little);
 }

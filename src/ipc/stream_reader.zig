@@ -266,29 +266,32 @@ pub const StreamReader = struct {
 
     pub fn nextTensorLikeMessage(self: *Self) (StreamError || fbs_lite_builder.PackError || std.Io.Reader.Error || error{ EndOfStream, OutOfMemory })!?OwnedTensorLikeMessage {
         while (true) {
+            // pyarrow's write_tensor output ends without an end-of-stream marker: the end of the
+            // input at a message boundary ends the tensor messages (a partial message stays an error).
+            _ = self.reader.peekByte() catch |err| switch (err) {
+                error.EndOfStream => return null,
+                else => |e| return e,
+            };
             const maybe_msg = try readMessageOptional(self);
             if (maybe_msg == null) return null;
             var msg = maybe_msg.?;
             defer msg.deinit(self.allocator);
 
-            if (msg.body == null) {
-                if (msg.msg.header == .Tensor or msg.msg.header == .SparseTensor) return StreamError.InvalidBody;
-                continue;
-            }
-
             switch (msg.msg.header) {
                 .Tensor, .SparseTensor => {
+                    // A tensor without elements (a zero-size dimension) may have no body.
+                    const body = msg.body orelse array_data.SharedBuffer.empty;
                     var arena = std.heap.ArenaAllocator.init(self.allocator);
                     errdefer arena.deinit();
                     const meta = try decodeTensorLikeFromUnpackedMessage(
                         arena.allocator(),
                         msg.msg,
-                        msg.body.?,
+                        body,
                     );
                     return .{
                         .arena = arena,
                         .metadata = meta,
-                        .body = msg.body.?.retain(),
+                        .body = body.retain(),
                     };
                 },
                 else => continue,
@@ -386,7 +389,7 @@ fn readMessageOptional(self: *StreamReader) (StreamError || fbs_lite_builder.Pac
         body_shared = try body_buf.toShared(body_len);
         keepSpare(&self.spare_body, body_shared.?);
     }
-    try format.skipPadding(self.reader, format.padLen(body_len));
+    format.skipBodyPadding(self.reader, format.padLen(body_len));
 
     return .{ .metadata = metadata, .msg = msg_t, .body_len = body_len, .body = body_shared };
 }
@@ -881,12 +884,15 @@ fn buildTensorFromFlatbuf(
     };
     const data_buf = tensor_t.data orelse return StreamError.InvalidMetadata;
     const data = try parseBufferRegion(data_buf, body.len());
-    return .{
+    const meta: TensorMetadata = .{
         .value_type = value_type,
         .shape = shape,
         .strides = strides,
         .data = data,
     };
+    // Shape, strides and value type against the data region (Arrow's CheckTensorValidity).
+    tensor_types.validateTensor(meta, body.len()) catch return StreamError.InvalidBody;
+    return meta;
 }
 
 fn buildSparseTensorFromFlatbuf(
@@ -5609,4 +5615,125 @@ test "stream reader reuses released bodies without touching a batch the caller s
             try std.testing.expectEqual(@as(i32, @intCast(2000 + i)), try t.value(i));
         }
     }
+}
+
+fn expectTensorEqual(a: TensorMetadata, a_body: []const u8, b: TensorMetadata, b_body: []const u8) !void {
+    try std.testing.expect(a.value_type.eql(b.value_type));
+    try std.testing.expectEqual(a.shape.len, b.shape.len);
+    for (a.shape, b.shape) |x, y| {
+        try std.testing.expectEqual(x.size, y.size);
+        try std.testing.expectEqualStrings(x.name orelse "", y.name orelse "");
+    }
+    try std.testing.expectEqualSlices(i64, a.strides orelse &.{}, b.strides orelse &.{});
+    try std.testing.expectEqualSlices(u8, a.data.bytes(a_body), b.data.bytes(b_body));
+}
+
+test "ipc reader reads pyarrow 26 tensor messages and writes them back" {
+    const allocator = std.testing.allocator;
+    // tools/interop/pyarrow_tensors.py: six tensors written by pyarrow's ipc.write_tensor.
+    var in: std.Io.Reader = .fixed(@embedFile("testdata/pyarrow_tensors.bin"));
+    var reader = StreamReader.init(allocator, &in);
+    defer reader.deinit();
+    var msgs: [6]OwnedTensorLikeMessage = undefined;
+    var n: usize = 0;
+    defer for (msgs[0..n]) |*m| m.deinit();
+    while (try reader.nextTensorLikeMessage()) |m| {
+        try std.testing.expect(n < msgs.len);
+        msgs[n] = m;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), n);
+    var t: [6]TensorMetadata = undefined;
+    for (&t, msgs) |*x, m| x.* = m.metadata.tensor;
+    // int32[2, 3] row-major, named dimensions.
+    try std.testing.expect(t[0].value_type == .int32);
+    try std.testing.expectEqualStrings("rows", t[0].shape[0].name.?);
+    try std.testing.expectEqualStrings("cols", t[0].shape[1].name.?);
+    try std.testing.expectEqualSlices(i64, &.{ 12, 4 }, t[0].strides.?);
+    const ints = t[0].data.bytes(msgs[0].body.data);
+    for (0..6) |i| try std.testing.expectEqual(@as(i32, @intCast(i)), std.mem.readInt(i32, ints[i * 4 ..][0..4], .little));
+    // float64[3, 4] column-major: element (i, j) = 4i + j at byte 8i + 24j.
+    try std.testing.expect(t[1].value_type == .double);
+    try std.testing.expectEqualSlices(i64, &.{ 8, 24 }, t[1].strides.?);
+    const dbl = t[1].data.bytes(msgs[1].body.data);
+    for (0..3) |i| for (0..4) |j| {
+        const bits = std.mem.readInt(u64, dbl[i * 8 + j * 24 ..][0..8], .little);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(4 * i + j)), @as(f64, @bitCast(bits)));
+    };
+    // int16[2, 2, 2] from a strided view: pyarrow writes it contiguous.
+    try std.testing.expectEqualSlices(i64, &.{ 8, 4, 2 }, t[2].strides.?);
+    const shorts = t[2].data.bytes(msgs[2].body.data);
+    for ([_]i16{ 1, 2, 9, 10, 13, 14, 21, 22 }, 0..) |want, i| try std.testing.expectEqual(want, std.mem.readInt(i16, shorts[i * 2 ..][0..2], .little));
+    // uint8[0, 5] (no element), a 0-dimensional int64 and float16[5].
+    try std.testing.expectEqual(@as(i64, 0), t[3].shape[0].size);
+    try std.testing.expectEqual(@as(usize, 0), t[4].shape.len);
+    try std.testing.expectEqual(@as(i64, 7), std.mem.readInt(i64, t[4].data.bytes(msgs[4].body.data)[0..8], .little));
+    try std.testing.expect(t[5].value_type == .half_float);
+    // Written back by zarrow and read again: the same tensors.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = @import("stream_writer.zig").StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    for (msgs[0..n]) |m| try writer.writeTensorLikeMessage(m.metadata, m.body.data);
+    var again: std.Io.Reader = .fixed(out.written());
+    var reader2 = StreamReader.init(allocator, &again);
+    defer reader2.deinit();
+    for (msgs[0..n]) |m| {
+        var back = (try reader2.nextTensorLikeMessage()).?;
+        defer back.deinit();
+        try expectTensorEqual(m.metadata.tensor, m.body.data, back.metadata.tensor, back.body.data);
+    }
+    try std.testing.expect(try reader2.nextTensorLikeMessage() == null);
+}
+
+test "ipc tensor validation: shape, strides and data size checked without overflow on write and read" {
+    const allocator = std.testing.allocator;
+    var body: [24]u8 = undefined;
+    @memset(&body, 0);
+    const dims = [_]TensorDim{ .{ .size = 2, .name = null }, .{ .size = 3, .name = null } };
+    const ok: TensorMetadata = .{ .value_type = .{ .int32 = {} }, .shape = &dims, .strides = &.{ 12, 4 }, .data = .{ .offset = 0, .length = 24 } };
+    try tensor_types.validateTensor(ok, body.len);
+    const huge = [_]TensorDim{ .{ .size = std.math.maxInt(i64), .name = null }, .{ .size = 4, .name = null } };
+    const neg = [_]TensorDim{ .{ .size = -1, .name = null }, .{ .size = 3, .name = null } };
+    const empty = [_]TensorDim{ .{ .size = 0, .name = null }, .{ .size = 3, .name = null } };
+    const bad = [_]TensorMetadata{
+        // The last element at 1 * 12 + 2 * 8 = 28 runs past 24 bytes.
+        .{ .value_type = .{ .int32 = {} }, .shape = &dims, .strides = &.{ 12, 8 }, .data = .{ .offset = 0, .length = 24 } },
+        // Row-major int32[2, 3] needs 24 bytes.
+        .{ .value_type = .{ .int32 = {} }, .shape = &dims, .strides = null, .data = .{ .offset = 0, .length = 20 } },
+        // Negative stride, stride count, negative size, overflowing products.
+        .{ .value_type = .{ .int32 = {} }, .shape = &dims, .strides = &.{ 12, -4 }, .data = .{ .offset = 0, .length = 24 } },
+        .{ .value_type = .{ .int32 = {} }, .shape = &dims, .strides = &.{12}, .data = .{ .offset = 0, .length = 24 } },
+        .{ .value_type = .{ .int32 = {} }, .shape = &neg, .strides = null, .data = .{ .offset = 0, .length = 24 } },
+        .{ .value_type = .{ .int32 = {} }, .shape = &huge, .strides = null, .data = .{ .offset = 0, .length = 24 } },
+        .{ .value_type = .{ .int32 = {} }, .shape = &huge, .strides = &.{ std.math.maxInt(i64), 4 }, .data = .{ .offset = 0, .length = 24 } },
+        // Not a numeric type (Arrow tensors are numeric only); data past the body.
+        .{ .value_type = .{ .bool = {} }, .shape = &dims, .strides = null, .data = .{ .offset = 0, .length = 24 } },
+        .{ .value_type = .{ .int8 = {} }, .shape = &dims, .strides = null, .data = .{ .offset = 20, .length = 6 } },
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = @import("stream_writer.zig").StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    for (bad) |m| {
+        try std.testing.expectError(error.InvalidTensor, tensor_types.validateTensor(m, body.len));
+        try std.testing.expectError(error.InvalidBody, writer.writeTensorLikeMessage(.{ .tensor = m }, &body));
+    }
+    // A zero-size dimension holds no element: any strides, no data.
+    try tensor_types.validateTensor(.{ .value_type = .{ .int32 = {} }, .shape = &empty, .strides = &.{ 1, 1 }, .data = .{ .offset = 0, .length = 0 } }, 0);
+    // A message whose data region is shorter than its shape needs is InvalidBody on read: write a
+    // valid message, then shorten the data length in its flatbuffer.
+    try writer.writeTensorLikeMessage(.{ .tensor = ok }, &body);
+    const bytes = try allocator.dupe(u8, out.written());
+    defer allocator.free(bytes);
+    // The Buffer struct (offset 0, length 24): the only 16-byte run of these two i64 values.
+    var needle: [16]u8 = undefined;
+    @memset(&needle, 0);
+    needle[8] = 24;
+    const at = std.mem.indexOf(u8, bytes, &needle).?;
+    bytes[at + 8] = 16;
+    var in: std.Io.Reader = .fixed(bytes);
+    var reader = StreamReader.init(allocator, &in);
+    defer reader.deinit();
+    try std.testing.expectError(error.InvalidBody, reader.nextTensorLikeMessage());
 }

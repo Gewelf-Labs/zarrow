@@ -175,6 +175,7 @@ pub fn build(b: *std.Build) !void {
         .{ "array-layout", "array-layout" },
         .{ "c-abi", "c-abi" },
         .{ "regex", "regex" },
+        .{ "temporal", "temporal" },
     };
     for (corpus_dirs) |entry| {
         const run_replay = b.addRunArtifact(fuzz_exe);
@@ -273,6 +274,11 @@ pub fn build(b: *std.Build) !void {
     addPassthru(run_compute_compat);
     const compute_compat_step = b.step("compute-compat-check", "Run compute compatibility check cases");
     compute_compat_step.dependOn(&run_compute_compat.step);
+    // The runner's test block replays the committed pyarrow results (part of `zig build test`).
+    const compute_compat_tests = b.addTest(.{ .root_module = compute_compat_exe.root_module });
+    const run_compute_compat_tests = b.addRunArtifact(compute_compat_tests);
+    b.step("compute-compat-test", "Replay the committed pyarrow compute compat results").dependOn(&run_compute_compat_tests.step);
+    test_step.dependOn(&run_compute_compat_tests.step);
 
     // Discover benchmark files in `benchmarks` and wire dedicated run steps.
     dependOnDir(b, "benchmarks");

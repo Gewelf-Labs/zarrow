@@ -23,6 +23,7 @@ pub const Target = enum {
     compute,
     @"c-abi",
     regex,
+    temporal,
 };
 
 /// Inputs over this size are skipped (replay) or never produced (run).
@@ -128,6 +129,7 @@ pub fn runOne(target: Target, parent: Allocator, bytes: []const u8) Feedback {
         .@"array-layout" => arrayLayout(gpa, bytes, &fb),
         .@"c-abi" => cAbi(gpa, bytes, &fb),
         .regex => regexTarget(gpa, bytes, &fb),
+        .temporal => temporalTarget(gpa, bytes, &fb),
     };
     result catch |e| {
         fb.err = e;
@@ -166,7 +168,9 @@ fn ipcStream(gpa: Allocator, bytes: []const u8, zero_copy: bool, fb: *Feedback) 
         defer tensors.deinit();
         while (fb.batches < max_batches) {
             var msg = (tensors.nextTensorLikeMessage() catch break) orelse break;
-            msg.deinit();
+            defer msg.deinit();
+            // A decoded tensor holds its every element inside its body (round 20).
+            if (msg.metadata == .tensor) zarrow.validateIpcTensor(msg.metadata.tensor, msg.body.len()) catch std.debug.panic("fuzz-invariant: decoded tensor fails validateTensor", .{});
             fb.batches += 1;
         }
         return e;
@@ -190,7 +194,8 @@ fn ipcFile(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
     }
     for (0..@min(try reader.tensorCount(), max_batches)) |i| {
         var t = try reader.readTensorAt(i);
-        t.deinit();
+        defer t.deinit();
+        if (t.metadata == .tensor) zarrow.validateIpcTensor(t.metadata.tensor, t.body.len()) catch std.debug.panic("fuzz-invariant: decoded tensor fails validateTensor", .{});
     }
     for (0..@min(try reader.sparseTensorCount(), max_batches)) |i| {
         var t = try reader.readSparseTensorAt(i);
@@ -522,6 +527,8 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "match_substring", .scalar, &.{d}, .{ .match_substring = .{ .pattern = "\u{c9}A", .ignore_case = true } }, len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .large_string = {} }, true), len, &.{});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .binary_view = {} }, true), len, &.{});
+                // utf8_normalize (round 20): every form succeeds on valid UTF-8 and is idempotent.
+                for ([_]zarrow.compute.Utf8NormalizeOptions.Form{ .nfc, .nfd, .nfkc, .nfkd }) |form| expectNormalized(&ctx, d, len, form);
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .int32 = {} }, true), len, &.{error.InvalidCast});
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .double = {} }, true), len, &.{error.InvalidCast});
             },
@@ -559,8 +566,9 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 else => {},
             },
             .date32, .date64, .timestamp => {
-                // A timestamp with a non-UTC timezone is NotImplemented; casts may overflow when safe.
-                const tz_ok = [_]anyerror{error.NotImplemented};
+                // An unknown timezone name, or an ambiguous / nonexistent local result of a
+                // rounding, is InvalidInput; casts may overflow when safe.
+                const tz_ok = [_]anyerror{error.InvalidInput};
                 expectCall(&ctx, "us_year", .scalar, &.{d}, .none, len, &tz_ok);
                 expectCall(&ctx, "month_day_nano_interval_between", .scalar, &binary, .none, len, &tz_ok);
                 expectCall(&ctx, "day_time_interval_between", .scalar, &binary, .none, len, &tz_ok);
@@ -573,6 +581,9 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .date32 = {} }, false), len, &tz_ok);
                 expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .timestamp = .{ .unit = .nanosecond, .timezone = null } }, true), len, &.{error.InvalidCast});
                 if (a.data().data_type == .timestamp) expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .time64 = .{ .unit = .microsecond } }, false), len, &tz_ok);
+                // Temporal text (round 20): an unknown timezone name, or %Z without one, is InvalidInput.
+                expectCall(&ctx, "strftime", .scalar, &.{d}, .{ .strftime = .{ .format = "%c %G-W%V %j %Ez %Z %S" } }, len, &.{error.InvalidInput});
+                expectCall(&ctx, "cast", .scalar, &.{d}, cast(.{ .string_view = {} }, true), len, &.{error.InvalidInput});
                 // Against itself in a finer unit (the common unit): equal unless the cast overflows.
                 switch (a.data().data_type) {
                     .timestamp => |ts| if (ts.unit != .nanosecond) expectSameAfterCast(&ctx, a, .{ .timestamp = .{ .unit = .nanosecond, .timezone = ts.timezone } }, false),
@@ -1068,6 +1079,23 @@ fn expectKernel(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow
 
 /// Invoke `name`; an error outside `allowed` is a finding, and an array output must validate with
 /// `expected_len` rows.
+/// `utf8_normalize` of `d` in `form` must validate with `len` rows and stay the same when
+/// normalized again.
+fn expectNormalized(ctx: *zarrow.compute.ExecContext, d: zarrow.compute.Datum, len: usize, form: zarrow.compute.Utf8NormalizeOptions.Form) void {
+    const opts: zarrow.compute.Options = .{ .utf8_normalize = .{ .form = form } };
+    var once = ctx.invoke("utf8_normalize", .scalar, &.{d}, opts) catch |e| std.debug.panic("fuzz-invariant: utf8_normalize failed on valid UTF-8: {s}", .{@errorName(e)});
+    defer once.release();
+    expectValid("utf8_normalize", once.array, len);
+    var twice = ctx.invoke("utf8_normalize", .scalar, &.{once}, opts) catch |e| std.debug.panic("fuzz-invariant: utf8_normalize failed on its output: {s}", .{@errorName(e)});
+    defer twice.release();
+    for (0..len) |i| {
+        if (once.array.data().isNull(i)) continue;
+        const x = zarrow.compute.kernels.string_normalize.rowAt(once.array, i);
+        const y = zarrow.compute.kernels.string_normalize.rowAt(twice.array, i);
+        if (!std.mem.eql(u8, x, y)) std.debug.panic("fuzz-invariant: utf8_normalize is not idempotent", .{});
+    }
+}
+
 fn expectCall(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, options: zarrow.compute.Options, expected_len: ?usize, allowed: []const anyerror) void {
     var out = ctx.invoke(name, kind, args, options) catch |e| {
         for (allowed) |ok| if (e == ok) return;
@@ -1134,6 +1162,129 @@ fn regexTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
     if (re.dfa_failures > 0) fb.types |= 1 << 17;
     if (any) fb.types |= 1 << 18;
     fb.types |= @as(u64, flags & 7) << 19;
+}
+
+// ---------------------------------------------------------------------------------------------
+// temporal: strptime, strftime and the temporal <-> text casts (src/compute/temporal_text.zig)
+// on a format and a text from the input.
+//
+// Input: a flag byte (bits 0-1 unit, bit 2 string_view rows, bits 3-5 timezone, bit 6 TZif), a
+// u16 format length, the format, then the text (first 4 KiB): its lines are the strptime / cast
+// rows and its 8-byte words the timestamps. Every call must succeed or fail with its documented
+// error; every array result must pass validateFull with one row per input row, and a naive
+// timestamp cast to text and back must give its values back. The zoned timestamps also go
+// through the timezone functions (assume_timezone with every choice, local_timestamp, is_dst,
+// rounding, fields, casts). With bit 6 the text is also read as a TZif file by the timezone
+// reader (src/compute/tz.zig): it must reject it or give intervals that hold their instant.
+
+const temporal_max_text = 4096;
+const temporal_zones = [_]?[]const u8{ null, "UTC", "+05:30", "America/New_York", "Australia/Lord_Howe", "Africa/Casablanca", null, "Pacific/Apia" };
+
+fn temporalTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void {
+    if (bytes.len < 3) return error.EndOfStream;
+    const compute = zarrow.compute;
+    const flags = bytes[0];
+    const flen = @min(std.mem.readInt(u16, bytes[1..3], .little), bytes.len - 3);
+    const format = bytes[3..][0..flen];
+    const rest = bytes[3 + flen ..];
+    const text = rest[0..@min(rest.len, temporal_max_text)];
+    const unit: zarrow.TimeUnit = @enumFromInt(flags & 3);
+    const zone = temporal_zones[(flags >> 3) & 7];
+    var ctx = compute.ExecContext.init(gpa, kernelRegistry());
+
+    // Rows: the lines of the text.
+    var rows: ArrayRef = blk: {
+        var b = try zarrow.StringBuilder.init(gpa, 16, text.len);
+        defer b.deinit();
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try b.append(line);
+        var s = try b.finish();
+        if (flags & 4 == 0) break :blk s;
+        defer s.release();
+        const v = try ctx.invokeScalar("cast", &.{.{ .array = s }}, .{ .cast = .{ .to_type = .{ .string_view = {} } } });
+        break :blk v.array;
+    };
+    defer rows.release();
+    const n_rows = rows.data().length;
+    fb.batches = @intCast(n_rows);
+    const rd: compute.Datum = .{ .array = rows };
+    const fmt_ok = format.len <= compute.kernels.temporal_text.max_format_len and std.mem.indexOfScalar(u8, format, 0) == null;
+    expectCall(&ctx, "strptime", .scalar, &.{rd}, .{ .strptime = .{ .format = format, .unit = unit, .error_is_null = true } }, n_rows, if (fmt_ok) &.{} else &.{error.InvalidOptions});
+    const targets = [_]DataType{
+        .{ .timestamp = .{ .unit = unit, .timezone = null } }, .{ .timestamp = .{ .unit = unit, .timezone = "UTC" } },
+        .{ .date32 = {} },                                     .{ .date64 = {} },
+        .{ .time32 = .{ .unit = .millisecond } },              .{ .time64 = .{ .unit = .nanosecond } },
+        .{ .duration = .{ .unit = unit } },
+    };
+    for (targets) |t| expectCall(&ctx, "cast", .scalar, &.{rd}, .{ .cast = .{ .to_type = t } }, n_rows, &.{error.InvalidCast});
+
+    // Timestamps: the 8-byte words of the text.
+    const n_words = text.len / 8;
+    var words = try zarrow.Int64Builder.init(gpa, n_words);
+    defer words.deinit();
+    for (0..n_words) |i| try words.append(std.mem.readInt(i64, text[i * 8 ..][0..8], .little));
+    var ints = try words.finish();
+    defer ints.release();
+    const ts_type: DataType = .{ .timestamp = .{ .unit = unit, .timezone = zone } };
+    var ts = try ctx.invokeScalar("cast", &.{.{ .array = ints }}, .{ .cast = .{ .to_type = ts_type } });
+    defer ts.release();
+    const names_zone = std.mem.indexOf(u8, format, "%z") != null or std.mem.indexOf(u8, format, "%Z") != null;
+    const allowed: []const anyerror = if (zone == null and names_zone) &.{ error.InvalidOptions, error.InvalidInput } else &.{error.InvalidOptions};
+    expectCall(&ctx, "strftime", .scalar, &.{ts}, .{ .strftime = .{ .format = format } }, n_words, allowed);
+    expectCall(&ctx, "strftime", .scalar, &.{ts}, .none, n_words, &.{});
+    var text_out = ctx.invokeScalar("cast", &.{ts}, .{ .cast = .{ .to_type = .{ .string = {} } } }) catch |e| std.debug.panic("fuzz-invariant: timestamp cast to text failed: {s}", .{@errorName(e)});
+    defer text_out.release();
+    expectValid("cast timestamp to text", text_out.array, n_words);
+    // Text back to the timestamp (rows outside the years 0000..9999 fail: no comparison then).
+    if (zone == null) if (ctx.invokeScalar("cast", &.{text_out}, .{ .cast = .{ .to_type = ts_type } })) |back| {
+        var b = back;
+        defer b.release();
+        const before = ts.array.data().buffers[1].typedSlice(i64) catch unreachable;
+        const after = b.array.data().buffers[1].typedSlice(i64) catch unreachable;
+        if (!std.mem.eql(i64, before[0..n_words], after[0..n_words])) std.debug.panic("fuzz-invariant: timestamp text round trip changed a value", .{});
+    } else |e| if (e != error.InvalidCast) std.debug.panic("fuzz-invariant: text to timestamp failed: {s}", .{@errorName(e)});
+    // Timezone functions on the zoned timestamps and on the naive ones read as local time.
+    if (zone != null) {
+        expectCall(&ctx, "local_timestamp", .scalar, &.{ts}, .none, n_words, &.{});
+        expectCall(&ctx, "is_dst", .scalar, &.{ts}, .none, n_words, &.{});
+        expectCall(&ctx, "hour", .scalar, &.{ts}, .none, n_words, &.{});
+        expectCall(&ctx, "iso_calendar", .scalar, &.{ts}, .none, n_words, &.{});
+        expectCall(&ctx, "days_between", .scalar, &.{ ts, ts }, .none, n_words, &.{});
+        expectCall(&ctx, "cast", .scalar, &.{ts}, .{ .cast = .{ .to_type = .{ .date32 = {} }, .safe = false } }, n_words, &.{});
+        // An ambiguous or nonexistent local result of a rounding is InvalidInput (Arrow).
+        expectCall(&ctx, "floor_temporal", .scalar, &.{ts}, .{ .round_temporal = .{ .multiple = 2, .unit = .hour } }, n_words, &.{error.InvalidInput});
+        expectCall(&ctx, "round_temporal", .scalar, &.{ts}, .{ .round_temporal = .{ .unit = .day } }, n_words, &.{error.InvalidInput});
+        const naive: DataType = .{ .timestamp = .{ .unit = unit, .timezone = null } };
+        var local = try ctx.invokeScalar("cast", &.{.{ .array = ints }}, .{ .cast = .{ .to_type = naive } });
+        defer local.release();
+        const z = zone.?;
+        expectCall(&ctx, "assume_timezone", .scalar, &.{local}, .{ .assume_timezone = .{ .timezone = z, .ambiguous = .earliest, .nonexistent = .latest } }, n_words, &.{});
+        expectCall(&ctx, "assume_timezone", .scalar, &.{local}, .{ .assume_timezone = .{ .timezone = z, .ambiguous = .latest, .nonexistent = .earliest } }, n_words, &.{});
+        expectCall(&ctx, "assume_timezone", .scalar, &.{local}, .{ .assume_timezone = .{ .timezone = z } }, n_words, &.{error.InvalidInput});
+    }
+    if (flags & 64 != 0) tzif: {
+        const tz = compute.kernels.tz;
+        var rules = tz.parseTzif(gpa, rest[0..@min(rest.len, tz.max_tzif_len)]) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            break :tzif;
+        };
+        defer rules.deinit(gpa);
+        const zone_rules: tz.Zone = .{ .rules = &rules };
+        var cursor = tz.Cursor.init(&zone_rules);
+        for (0..n_words) |i| {
+            const t = std.mem.readInt(i64, text[i * 8 ..][0..8], .little) >> 4;
+            const sp = zone_rules.span(t);
+            if (t < sp.begin or t >= sp.end) std.debug.panic("fuzz-invariant: TZif interval does not hold its instant", .{});
+            if (@abs(sp.info.offset) > 93_599 or sp.info.abbr.len > tz.max_abbr_len) std.debug.panic("fuzz-invariant: TZif local time type out of range", .{});
+            if (cursor.info(t).offset != sp.info.offset) std.debug.panic("fuzz-invariant: TZif cursor and lookup disagree", .{});
+            switch (zone_rules.local(t)) {
+                .unique => |off| if (zone_rules.info(t - off).offset != off) std.debug.panic("fuzz-invariant: TZif local time does not map back", .{}),
+                .ambiguous, .gap => {},
+            }
+        }
+        fb.types |= 1 << 63;
+    }
+    fb.types |= @as(u64, 1) << @intCast(flags % 63);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1979,4 +2130,8 @@ test "fuzz c-abi" {
 
 test "fuzz regex" {
     try std.testing.fuzz(Target.regex, fuzzOne, .{ .corpus = &.{smithSeed("corpus/regex/named-groups.bin")} });
+}
+
+test "fuzz temporal" {
+    try std.testing.fuzz(Target.temporal, fuzzOne, .{ .corpus = &.{smithSeed("corpus/temporal/iso.bin")} });
 }

@@ -181,10 +181,24 @@ def generate_view(out_path: pathlib.Path, container: str) -> None:
         writer.write_batch(batch)
 
 
+def generate_tensor(out_path: pathlib.Path) -> None:
+    """Schema `id: int32` then one tensor message: int32[2, 3] = 1..6, dims rows / cols (the
+    zarrow `tensor` fixture's content, written by pyarrow's ipc.write_tensor)."""
+    import numpy as np
+
+    schema = pa.schema([pa.field("id", pa.int32(), nullable=False)])
+    tensor = pa.Tensor.from_numpy(np.arange(1, 7, dtype=np.int32).reshape(2, 3), dim_names=["rows", "cols"])
+    sink = pa.BufferOutputStream()
+    sink.write(schema.serialize())  # the schema message (a stream writer would defer it)
+    ipc.write_tensor(tensor, sink)
+    sink.write(bytes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]))  # end of stream
+    out_path.write_bytes(sink.getvalue().to_pybytes())
+
+
 def main() -> int:
     if len(sys.argv) not in (2, 3, 4):
         print(
-            "usage: pyarrow_generate.py <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|view] [stream|file]",
+            "usage: pyarrow_generate.py <out.arrow> [canonical|dict-delta|ree|ree-int16|ree-int64|complex|extension|view|tensor] [stream|file]",
             file=sys.stderr,
         )
         return 2
@@ -205,6 +219,12 @@ def main() -> int:
 
     if mode == "canonical":
         generate_canonical(out_path, container)
+        return 0
+    if mode == "tensor":
+        if container != "stream":
+            print("tensor fixture is stream-only (pyarrow writes tensor messages to streams)", file=sys.stderr)
+            return 2
+        generate_tensor(out_path)
         return 0
     if mode == "dict-delta":
         generate_dict_delta(out_path, container)
