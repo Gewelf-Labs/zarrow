@@ -13,6 +13,9 @@
 
 - Added `zarrow.c_api` export for direct C ABI surface access from package root.
 - Added `examples/c_abi_roundtrip.zig` for end-to-end stream roundtrip via C ABI.
+- IPC stream and file readers read big-endian IPC: every body buffer is byte-swapped to
+  little-endian and the schema is presented as little-endian (Arrow C++ `ensure_native_endian`);
+  all 22 `1.0.0-bigendian` gold cases now pass ([docs/integration-suite.md](integration-suite.md)).
 - Added C ABI interop guides:
   - `docs/interop-c-abi.md`
   - `docs/interop-c-abi-zh.md`
@@ -26,6 +29,8 @@
 
 ## Breaking Changes
 
+- `IpcStreamReaderOptions` / `IpcFileReader` `ReaderOptions.endianness_mode` now defaults to
+  `.normalize_to_little` (byte-swap big-endian input); pass `.strict` to keep rejecting it.
 - `zarrow_c_export_stream` now requires mutable handle:
   - from: `const zarrow_c_stream_handle*`
   - to: `zarrow_c_stream_handle*`

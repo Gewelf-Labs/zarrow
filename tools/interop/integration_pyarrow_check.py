@@ -4,7 +4,8 @@
 
   python -P tools/interop/integration_pyarrow_check.py <integration-runner exe> <arrow-testing dir> <scratch dir>
 
-For every little-endian case (minus the known rejections) it checks that
+For every case (minus the known rejections; big-endian gold files included, which pyarrow and zarrow
+both read byte-swapped to little-endian) it checks that
   1. `--json-to-arrow` of the gold JSON gives a file pyarrow reads equal to the gold arrow_file
      (schema with metadata, and data),
   2. `--arrow-to-json` of the gold arrow_file gives JSON equal to the gold JSON after a
@@ -163,8 +164,6 @@ def main():
     failures = 0
     checked = 0
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
-        if "bigendian" in d.name:
-            continue
         for gz in sorted(d.glob("*.json.gz")):
             case = gz.name[: -len(".json.gz")]
             if case in KNOWN_REJECTIONS:

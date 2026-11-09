@@ -1,5 +1,5 @@
-//! Associative transforms (Arrow C++ "Associative transforms"): unique, value_counts and
-//! dictionary_encode, vector functions over an array, chunked array or scalar of a key type
+//! Associative transforms (Arrow C++ "Associative transforms"): unique, value_counts,
+//! dictionary_encode and dictionary_decode, vector functions over an array, chunked array or scalar of a key type
 //! (numbers, bool, dates, timestamps, times, durations, intervals, decimals, fixed_size_binary
 //! and the string / binary layouts; unique and value_counts also take the null type).
 //!
@@ -15,6 +15,10 @@
 //!   entry of the dictionary. A chunked input gives a chunked output whose chunks share one
 //!   dictionary. The null type gives a dictionary of one null (pyarrow 26), every index null
 //!   (`mask`) or 0 (`encode`).
+//! - dictionary_decode: the values of a dictionary array or chunked array (the value type; a
+//!   null index and an index to a null entry give null); any other type, also an extension type
+//!   over a dictionary, comes back as is (pyarrow 26). Scalars are `NoMatchingKernel` (Arrow:
+//!   "Expected an Array or a Chunked Array").
 //!
 //! Dictionary inputs (a dictionary of a key type), as Arrow: unique and value_counts work on the
 //! indices and keep the dictionary (the result is of the input's dictionary type, unused
@@ -31,6 +35,7 @@ const core = @import("core.zig");
 const dense = @import("dense.zig");
 const hash = @import("hash_aggregate.zig");
 const concat = @import("../concat_array_refs.zig");
+const cast = @import("cast.zig");
 const bitmap = @import("../bitmap.zig");
 
 const ArrayRef = core.ArrayRef;
@@ -47,7 +52,7 @@ const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
 
 const int64_type = DataType{ .int64 = {} };
 
-/// Register unique, value_counts and dictionary_encode.
+/// Register unique, value_counts, dictionary_encode and dictionary_decode.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     try registry.registerVectorKernel("unique", .{
         .signature = .{ .arity = 1, .type_check = keyOrNull, .options_check = dense.noOptions },
@@ -61,6 +66,52 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         .signature = .{ .arity = 1, .type_check = keyOnly, .options_check = encodeOptions, .result_type_alloc_fn = dictionaryType },
         .exec = dictionaryEncode,
     });
+    try registry.registerVectorKernel("dictionary_decode", .{
+        .signature = .{ .arity = 1, .type_check = arrayOrChunked, .options_check = dense.noOptions, .result_type_fn = decodedType },
+        .exec = dictionaryDecode,
+    });
+}
+
+fn arrayOrChunked(args: []const Datum) bool {
+    return args.len == 1 and (args[0] == .array or args[0] == .chunked);
+}
+
+fn decodedType(args: []const Datum, _: Options) KernelError!DataType {
+    if (args.len != 1) return error.InvalidArity;
+    const dt = args[0].dataType();
+    return if (dt == .dictionary) dt.dictionary.value_type.* else dt;
+}
+
+/// dictionary_decode: see the file comment. Every chunk passes `validateLayout` and
+/// `validateDictionary` before its indices are read.
+pub fn dictionaryDecode(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    if (args.len != 1) return error.InvalidArity;
+    if (args[0].dataType() != .dictionary) return args[0].retain();
+    const parts: []const ArrayRef = switch (args[0]) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        else => return error.InvalidInput,
+    };
+    const outs = ctx.allocator.alloc(ArrayRef, parts.len) catch return error.OutOfMemory;
+    var made: usize = 0;
+    defer {
+        for (outs[0..made]) |*o| o.release();
+        ctx.allocator.free(outs);
+    }
+    for (parts) |p| {
+        p.data().validateLayout() catch return error.InvalidInput;
+        try hash.validateDictionary(p.data());
+        outs[made] = try cast.decode(ctx.allocator, p);
+        made += 1;
+    }
+    if (args[0] == .array) return .{ .array = outs[0].retain() };
+    // The chunks own their type (the input's value type when there is none).
+    const dt = if (made > 0) outs[0].data().data_type else args[0].dataType().dictionary.value_type.*;
+    const out = ChunkedArray.init(ctx.allocator, dt, outs[0..made]) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
+    return .{ .chunked = out };
 }
 
 fn keyOrNull(args: []const Datum) bool {

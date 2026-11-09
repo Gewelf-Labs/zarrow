@@ -106,8 +106,13 @@ pub const SparseTensorIndexMetadata = tensor_types.SparseTensorIndexMetadata;
 pub const SparseTensorMetadata = tensor_types.SparseTensorMetadata;
 pub const TensorLikeMetadata = tensor_types.TensorLikeMetadata;
 
+/// How IPC readers and writers treat a big-endian schema.
 pub const EndiannessMode = enum {
+    /// Readers reject a big-endian schema (`UnsupportedType`); writers reject `Schema.endianness == .big`.
     strict,
+    /// Readers accept big-endian IPC (Arrow C++ `ensure_native_endian`): every body buffer is
+    /// byte-swapped to little-endian while decoding and the schema is presented as little-endian.
+    /// Writers write a `.big` schema as little-endian (the batches must hold little-endian values).
     normalize_to_little,
 };
 

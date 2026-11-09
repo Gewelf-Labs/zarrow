@@ -330,6 +330,24 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, emit
     defer maps.release();
     const key3 = compute.Scalar.init(i32_type, .{ .i32 = 3 });
     try timeKernelWith(io, &ctx, .scalar, "compute_map_lookup", "map_lookup", &.{.{ .array = maps }}, .{ .map_lookup = .{ .query_key = key3 } }, list_cfg, emit_csv, meta);
+    // The registered take (int32 indices of random rows, with repeats) and filter (a predicate
+    // with 10% nulls, dropped) over int32 rows with 10% nulls; run_end_encode of int32 runs of
+    // eight rows (every 100th row null); modulo of int64 rows (10% nulls) by the scalar 7.
+    var take_b = try zarrow.Int32Builder.init(allocator, cfg.rows);
+    defer take_b.deinit();
+    for (take_idx) |t| try take_b.append(@intCast(t));
+    var take_ints = try take_b.finish();
+    defer take_ints.release();
+    try timeKernel(io, &ctx, .vector, "compute_take_int32", "take", &.{ .{ .array = an }, .{ .array = take_ints } }, cfg, emit_csv, meta);
+    try timeKernel(io, &ctx, .vector, "compute_filter_int32", "filter", &.{ .{ .array = an }, .{ .array = bool_a } }, cfg, emit_csv, meta);
+    var runs_b = try zarrow.Int32Builder.init(allocator, cfg.rows);
+    defer runs_b.deinit();
+    for (0..cfg.rows) |i| if (i % 100 == 99) try runs_b.appendNull() else try runs_b.append(@intCast(i / 8));
+    var runs = try runs_b.finish();
+    defer runs.release();
+    try timeKernel(io, &ctx, .vector, "compute_run_end_encode_int32", "run_end_encode", &.{.{ .array = runs }}, cfg, emit_csv, meta);
+    const seven = compute.Scalar.init(.{ .int64 = {} }, .{ .i64 = 7 });
+    try timeKernel(io, &ctx, .scalar, "compute_modulo_int64", "modulo", &.{ .{ .array = i64arr }, .{ .scalar = seven } }, cfg, emit_csv, meta);
     // tdigest (default options: q 0.5, delta 100, buffer_size 500) over float64 with 10% nulls.
     try timeKernel(io, &ctx, .aggregate, "compute_tdigest_float64", "tdigest", &.{.{ .array = f64arr }}, cfg, emit_csv, meta);
 }

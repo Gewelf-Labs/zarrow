@@ -546,3 +546,70 @@ test "decimal sum, mean, min and max: options, rounding, overflow modes, chunked
     defer bad.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeAggregate("sum", &.{.{ .array = bad }}, none));
 }
+
+test "decimal modulo and remainder: Arrow's scale rule, signs, nulls, sliced, chunked, integers, zero divisor (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // decimal128(5, 1) [7.5, -7.5, null] with decimal128(5, 2) [2.25, 2.25, 1.00] -> decimal128(6, 2).
+    var a = try arr128(comptime d128(5, 1), &.{ 75, -75, null });
+    defer a.release();
+    var b = try arr128(comptime d128(5, 2), &.{ 225, 225, 100 });
+    defer b.release();
+    const ab = [_]Datum{ .{ .array = a }, .{ .array = b } };
+    inline for (.{ "", "_checked" }) |suffix| {
+        try expectDec(i128, &ctx, "modulo" ++ suffix, &ab, none, d128(6, 2), &.{ 75, 150, null });
+        try expectDec(i128, &ctx, "remainder" ++ suffix, &ab, none, d128(6, 2), &.{ 75, -75, null });
+    }
+    // The sign of the divisor (modulo) or of the dividend (remainder): (5, 1) % (3, 0) -> (5, 1).
+    var p = try arr128(comptime d128(5, 1), &.{ -75, 75 });
+    defer p.release();
+    var q = try arr128(comptime d128(3, 0), &.{ 2, -2 });
+    defer q.release();
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = p }, .{ .array = q } }, none, d128(5, 1), &.{ 5, -5 });
+    try expectDec(i128, &ctx, "remainder", &.{ .{ .array = p }, .{ .array = q } }, none, d128(5, 1), &.{ -15, 15 });
+    var r = try arr128(comptime d128(3, 0), &.{1});
+    defer r.release();
+    var t = try arr128(comptime d128(5, 1), &.{30});
+    defer t.release();
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = r }, .{ .array = t } }, none, d128(5, 1), &.{10});
+    // Sliced and chunked.
+    var ps = try p.slice(1, 1);
+    defer ps.release();
+    var qs = try q.slice(1, 1);
+    defer qs.release();
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = ps }, .{ .array = qs } }, none, d128(5, 1), &.{-5});
+    var cp = try common.chunkedAt(allocator, p, &.{1});
+    defer cp.release();
+    try expectDec(i128, &ctx, "remainder_checked", &.{ .{ .chunked = cp }, .{ .array = q } }, none, d128(5, 1), &.{ -15, 15 });
+    // decimal32 operands give decimal128, decimal256 gives decimal256, an int32 is decimal(10, 0).
+    var s32 = try common.makeTyped(i32, comptime d32(5, 1), allocator, &.{75});
+    defer s32.release();
+    var t32 = try common.makeTyped(i32, comptime d32(3, 0), allocator, &.{2});
+    defer t32.release();
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = s32 }, .{ .array = t32 } }, none, d128(5, 1), &.{15});
+    var w = try common.makeTyped(i256, comptime d256(5, 1), allocator, &.{ -75, 75 });
+    defer w.release();
+    try expectDec(i256, &ctx, "modulo", &.{ .{ .array = w }, .{ .array = q } }, none, d256(5, 1), &.{ 5, -5 });
+    var i = try common.makeArray(i32, allocator, &.{7});
+    defer i.release();
+    var dd = try arr128(comptime d128(3, 1), &.{25});
+    defer dd.release();
+    try expectDec(i128, &ctx, "remainder", &.{ .{ .array = i }, .{ .array = dd } }, none, d128(11, 1), &.{20});
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = a }, .{ .scalar = Scalar.init(d128(3, 0), .{ .decimal128 = 2 }) } }, none, d128(5, 1), &.{ 15, 5, null });
+    // A zero divisor in a valid row (Arrow: "divide by zero"); the precision limit.
+    var z = try arr128(comptime d128(3, 0), &.{ 0, 1, 1 });
+    defer z.release();
+    try std.testing.expectError(error.DivideByZero, ctx.invokeScalar("modulo", &.{ .{ .array = a }, .{ .array = z } }, none));
+    try std.testing.expectError(error.DivideByZero, ctx.invokeScalar("remainder_checked", &.{ .{ .array = a }, .{ .array = z } }, none));
+    var zn = try arr128(comptime d128(3, 0), &.{ 1, 1, 0 });
+    defer zn.release();
+    try expectDec(i128, &ctx, "modulo", &.{ .{ .array = a }, .{ .array = zn } }, none, d128(5, 1), &.{ 5, 5, null });
+    var big = try arr128(comptime d128(38, 0), &.{1});
+    defer big.release();
+    var big_s = try arr128(comptime d128(38, 10), &.{3});
+    defer big_s.release();
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("modulo", &.{ .{ .array = big }, .{ .array = big_s } }, none));
+}

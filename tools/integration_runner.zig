@@ -187,10 +187,9 @@ fn runGolden(io: std.Io, gpa: Allocator, root: []const u8) !u8 {
             try cases.append(arena, try arena.dupe(u8, entry.name[0 .. entry.name.len - ".json.gz".len]));
         }
         std.mem.sort([]const u8, cases.items, {}, lessThan);
-        const big_endian = std.mem.indexOf(u8, dir_name, "bigendian") != null;
 
         for (cases.items) |case| {
-            const expect: golden.Expect = if (big_endian) .reject_big_endian else if (knownRejection(case) != null) .reject_known else .accept;
+            const expect: golden.Expect = if (knownRejection(case) != null) .reject_known else .accept;
             const row = try runCase(io, gpa, arena, dir_path, dir_name, case, expect);
             if (std.mem.startsWith(u8, row.status, "FAIL")) failures += 1;
             if (std.mem.eql(u8, row.status, "pass")) passes += 1;
@@ -203,7 +202,7 @@ fn runGolden(io: std.Io, gpa: Allocator, root: []const u8) !u8 {
     const w = &out.interface;
     try w.print("| directory | case | result | detail |\n|---|---|---|---|\n", .{});
     for (rows.items) |row| try w.print("| {s} | {s} | {s} | {s} |\n", .{ row.dir, row.case, row.status, row.detail });
-    try w.print("\n{d} cases: {d} pass, {d} FAIL, {d} rejected (big-endian as expected, or by zarrow validation as listed)\n", .{ rows.items.len, passes, failures, rows.items.len - passes - failures });
+    try w.print("\n{d} cases: {d} pass, {d} FAIL, {d} rejected (by zarrow validation as listed)\n", .{ rows.items.len, passes, failures, rows.items.len - passes - failures });
     try w.flush();
     return if (failures == 0 and rows.items.len > 0) 0 else 1;
 }
@@ -227,7 +226,6 @@ fn runCase(io: std.Io, gpa: Allocator, arena: Allocator, dir_path: []const u8, d
     const detail = try arena.dupe(u8, r.message());
     return switch (r.outcome) {
         .pass => withStatus(row, "pass", ""),
-        .rejected_as_expected => withStatus(row, "rejected-as-expected", detail),
         .rejected_known => withStatus(row, "rejected-by-validation", try std.fmt.allocPrint(arena, "{s} ({s})", .{ knownRejection(case).?, detail })),
         .fail => withStatus(row, "FAIL", detail),
     };

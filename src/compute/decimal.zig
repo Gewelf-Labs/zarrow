@@ -1,7 +1,8 @@
 //! Decimal kernels (Arrow C++ "Arithmetic functions" and "Conversions" on decimals) and the
 //! decimal helpers that the comparison and aggregate families share.
 //!
-//! Arithmetic: add, subtract, multiply, divide and their `_checked` variants take two operands
+//! Arithmetic: add, subtract, multiply, divide, modulo, remainder and their `_checked` variants
+//! take two operands
 //! that are decimal32..decimal256 or an integer (an integer is `decimal(digits, 0)`, Arrow's
 //! `MaxDecimalDigitsForInteger`: 3, 5, 10, 19 digits, 20 for uint64) with at least one decimal. The
 //! result type follows Arrow C++ (`CastBinaryDecimalArgs` and the output resolvers, Redshift's
@@ -11,6 +12,10 @@
 //! - multiply: scale `s1 + s2`, precision `p1 + p2 + 1`.
 //! - divide: the dividend is scaled up by `k = max(4, s1 + p2 - s2 + 1) + s2 - s1` digits, then
 //!   divided (truncated toward zero): scale `s1 + k - s2`, precision `p1 + k`.
+//! - modulo / remainder: both operands scaled to `max(s1, s2)`; precision
+//!   `max(p1 - s1, p2 - s2) + max(s1, s2)` (pyarrow 26); floored (modulo, the sign of the divisor)
+//!   or truncated (remainder, the sign of the dividend). The result is smaller than the divisor,
+//!   so it never overflows.
 //! A result precision past 38 (decimal128) or 76 (decimal256) is `Overflow` (Arrow: "Decimal
 //! precision out of range"); a negative scale is `NotImplemented` (as Arrow). A zero divisor in a
 //! valid row is `DivideByZero` in both variants. The unchecked functions wrap at the storage
@@ -43,6 +48,7 @@ const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
 const datatype = @import("../datatype.zig");
 const dense = @import("dense.zig");
+const arithmetic = @import("arithmetic.zig");
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 
@@ -225,10 +231,11 @@ const at = dense.at;
 
 // ------------------------------------------------------------------------------ arithmetic
 
-const Op = enum { add, subtract, multiply, divide };
+const Op = enum { add, subtract, multiply, divide, modulo, remainder };
 const UnaryOp = enum { negate, abs, sign };
 
-/// Register the decimal kernels of add, subtract, multiply, divide (+ `_checked`), negate, abs
+/// Register the decimal kernels of add, subtract, multiply, divide, modulo, remainder
+/// (+ `_checked`), negate, abs
 /// (+ `_checked`) and sign (after `arithmetic.register`, which creates the functions).
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     inline for (comptime std.meta.tags(Op)) |op| {
@@ -294,6 +301,12 @@ fn plan(op: Op, a: DataType, b: DataType) KernelError!Plan {
             kb = s - y.s;
             p = @max(x.p - x.s, y.p - y.s) + s + 1;
         },
+        .modulo, .remainder => {
+            s = @max(x.s, y.s);
+            ka = s - x.s;
+            kb = s - y.s;
+            p = @max(x.p - x.s, y.p - y.s) + s;
+        },
         .multiply => {
             s = x.s + y.s;
             p = x.p + y.p + 1;
@@ -348,6 +361,8 @@ fn Arith(comptime op: Op, comptime checked: bool) type {
                 inline else => |x| switch (b.op) {
                     inline else => |y| if (op == .divide)
                         try divide(Acc, x, y, fa, pl.precision, &out)
+                    else if (op == .modulo or op == .remainder)
+                        try modRem(Acc, x, y, fa, fb, &out)
                     else if (pl.ka == 0 and pl.kb == 0)
                         try loop(Acc, false, x, y, fa, fb, pl.precision, &out)
                     else
@@ -374,7 +389,7 @@ fn Arith(comptime op: Op, comptime checked: bool) type {
                 .add => @addWithOverflow(u, v),
                 .subtract => @subWithOverflow(u, v),
                 .multiply => @mulWithOverflow(u, v),
-                .divide => unreachable,
+                .divide, .modulo, .remainder => unreachable,
             };
             over.* = (o | r[1]) != 0 or !fits(r[0], precision);
             return r[0];
@@ -390,7 +405,7 @@ fn Arith(comptime op: Op, comptime checked: bool) type {
                         .add => u +% v,
                         .subtract => u -% v,
                         .multiply => u *% v,
-                        .divide => unreachable,
+                        .divide, .modulo, .remainder => unreachable,
                     };
                 }
                 return;
@@ -428,6 +443,20 @@ fn Arith(comptime op: Op, comptime checked: bool) type {
                 var over = false;
                 _ = divRow(Acc, at(x, i), at(y, i), fa, precision, &over);
                 if (over and out.isValid(i)) return error.Overflow;
+            };
+        }
+
+        /// modulo / remainder of the operands scaled to one scale (the scale-ups stay inside the
+        /// result precision, so they do not wrap for values within their precision).
+        fn modRem(comptime Acc: type, x: anytype, y: anytype, fa: Acc, fb: Acc, out: *dense.DenseBinaryOutput(Acc)) KernelError!void {
+            const dst = out.values();
+            var zero = false;
+            for (dst, 0..) |*d, i| {
+                zero = zero or at(y, i) == 0;
+                d.* = arithmetic.modRemValue(Acc, op == .modulo, at(x, i) *% fa, at(y, i) *% fb);
+            }
+            if (zero) for (0..dst.len) |i| {
+                if (at(y, i) == 0 and out.isValid(i)) return error.DivideByZero;
             };
         }
 

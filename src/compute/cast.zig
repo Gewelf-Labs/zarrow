@@ -208,7 +208,7 @@ fn temporalPair(from: DataType, to: DataType) bool {
 // ------------------------------------------------------------------------------ dictionary
 
 /// Return the values of a dictionary array (`datumTakeNullable` over the checked indices).
-fn decode(allocator: std.mem.Allocator, arr: ArrayRef) KernelError!ArrayRef {
+pub fn decode(allocator: std.mem.Allocator, arr: ArrayRef) KernelError!ArrayRef {
     const data = arr.data();
     const dict = data.dictionary orelse return error.InvalidInput;
     // validateLayout checks neither the dictionary nor the index values.

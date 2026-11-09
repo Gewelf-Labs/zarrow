@@ -377,3 +377,51 @@ test "math scalars, empty and all-null inputs, errors: types, options, arity and
     const bad = common.Scalar.init(.{ .double = {} }, .{ .i64 = 1 });
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("cos", &.{.{ .scalar = bad }}, none));
 }
+
+test "hypot: no intermediate overflow, infinities over NaN, integer and mixed operands, nulls, sliced, chunked, scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // pc.hypot([inf, nan, -inf, 1e308, None, nan], [nan, -inf, 1, 1e308, 1, 1])
+    var x = try common.makeArray(f64, allocator, &.{ inf, nan, -inf, 1e308, null, nan, 3 });
+    defer x.release();
+    var y = try common.makeArray(f64, allocator, &.{ nan, -inf, 1, 1e308, 1, 1, -4 });
+    defer y.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "hypot", &.{ .{ .array = x }, .{ .array = y } }, &.{ inf, inf, inf, 1.4142135623730951e308, null, nan, 5 });
+    // pc.hypot([3, 4], [4, 3]) on int64 -> [5.0, 5.0] double; int8 with float32 is double.
+    var a = try common.makeArray(i64, allocator, &.{ 3, 4 });
+    defer a.release();
+    var b = try common.makeArray(i64, allocator, &.{ 4, 3 });
+    defer b.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "hypot", &.{ .{ .array = a }, .{ .array = b } }, &.{ 5, 5 });
+    var a8 = try common.makeArray(i8, allocator, &.{3});
+    defer a8.release();
+    var f4 = try common.makeArray(f32, allocator, &.{ 4, 3 });
+    defer f4.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "hypot", &.{ .{ .array = a8 }, .{ .scalar = common.scalarOf(f32, 4) } }, &.{5});
+    try common.expectInvoke(f32, &ctx, .scalar, "hypot", &.{ .{ .array = f4 }, .{ .scalar = common.scalarOf(f32, 3) } }, &.{ 5, 4.2426405 });
+    try common.expectInvoke(f64, &ctx, .scalar, "hypot", &.{ .{ .scalar = common.scalarOf(f64, 3) }, .{ .scalar = common.scalarOf(i64, 4) } }, &.{5});
+    // Sliced and chunked operands.
+    var xs = try x.slice(5, 2);
+    defer xs.release();
+    var ys = try y.slice(5, 2);
+    defer ys.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "hypot", &.{ .{ .array = xs }, .{ .array = ys } }, &.{ nan, 5 });
+    var cx = try common.chunkedAt(allocator, x, &.{ 2, 5 });
+    defer cx.release();
+    var out = try ctx.invokeScalar("hypot", &.{ .{ .chunked = cx }, .{ .array = y } }, none);
+    defer out.release();
+    try std.testing.expect(out == .chunked);
+    const got = try common.collect(f64, allocator, out);
+    defer allocator.free(got);
+    try common.expectRows(f64, &.{ inf, inf, inf, 1.4142135623730951e308, null, nan, 5 }, got);
+    // float16 is cast to float32 as for atan2 (pyarrow 26 has no float16 kernel); no string kernel.
+    var h = try common.makeArray(f16, allocator, &.{3});
+    defer h.release();
+    try common.expectInvoke(f32, &ctx, .scalar, "hypot", &.{ .{ .array = h }, .{ .array = h } }, &.{4.2426405});
+    var s = try common.makeStrings(.string, allocator, &.{"3"});
+    defer s.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("hypot", &.{ .{ .array = s }, .{ .array = s } }, none));
+}

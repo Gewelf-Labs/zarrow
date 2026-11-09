@@ -302,3 +302,71 @@ test "float16 keys and signs: unique, value_counts, dictionary_encode, count_dis
     try common.expectInvokeWith(f16, &ctx, "sign", &.{d}, none, &.{ 1, 0, 0, h_nan, 1, h_nan, 1, null });
     try common.expectInvokeWith(f16, &ctx, "abs", &.{d}, none, &.{ 1.5, 0.0, 0.0, h_nan, 1.5, h_nan, h_inf, null });
 }
+
+test "dictionary_decode: nulls, null entries, sliced, chunked, non-dictionary and extension inputs returned as is (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // DictionaryArray.from_arrays([0, None, 1, 0], ['a', None]) -> ['a', null, null, 'a'].
+    var dict = try common.makeStrings(.string, allocator, &.{ "a", null });
+    defer dict.release();
+    var d = try common.makeDictionary(allocator, dict, .{ .bit_width = 64, .signed = true }, &.{ 0, null, 1, 0 });
+    defer d.release();
+    var out = try ctx.invokeVector("dictionary_decode", &.{.{ .array = d }}, none);
+    defer out.release();
+    try std.testing.expect(out.dataType() == .string);
+    const got = try common.collectStrings(allocator, out);
+    defer allocator.free(got);
+    try common.expectStrings(&.{ "a", null, null, "a" }, got);
+    try std.testing.expect((try registry.resolveResultType("dictionary_decode", .vector, &.{.{ .array = d }}, none)) == .string);
+
+    // Sliced and chunked (each chunk decoded on its own; the chunks may have other dictionaries).
+    var nums = try common.makeArray(i32, allocator, &.{ 10, 20, 30 });
+    defer nums.release();
+    var di = try common.makeDictionary(allocator, nums, .{ .bit_width = 8, .signed = false }, &.{ 2, 0, null, 1, 1 });
+    defer di.release();
+    var ds = try di.slice(1, 3);
+    defer ds.release();
+    try common.expectInvoke(i32, &ctx, .vector, "dictionary_decode", &.{.{ .array = ds }}, &.{ 10, null, 20 });
+    var other = try common.makeArray(i32, allocator, &.{ 7, 8, 9 });
+    defer other.release();
+    var d2 = try common.makeDictionary(allocator, other, .{ .bit_width = 8, .signed = false }, &.{ 2, 2 });
+    defer d2.release();
+    var parts = [_]ArrayRef{ di, ds, d2 };
+    var c = try common.ChunkedArray.init(allocator, di.data().data_type, &parts);
+    defer c.release();
+    var dc = try ctx.invokeVector("dictionary_decode", &.{.{ .chunked = c }}, none);
+    defer dc.release();
+    try std.testing.expectEqual(@as(usize, 3), dc.chunked.numChunks());
+    try common.expectInvoke(i32, &ctx, .vector, "dictionary_decode", &.{.{ .chunked = c }}, &.{ 30, 10, null, 20, 20, 10, null, 20, 9, 9 });
+
+    // A non-dictionary input comes back as is (the same array).
+    var plain = try ctx.invokeVector("dictionary_decode", &.{.{ .array = nums }}, none);
+    defer plain.release();
+    try std.testing.expect(plain.array.node == nums.node);
+    // An extension type over a dictionary is not a dictionary type: returned as is (pyarrow 26).
+    const ext_type = DataType{ .extension = .{ .name = "my.ext", .storage_type = &d.data().data_type } };
+    var ext_data = d.data().*;
+    ext_data.data_type = ext_type;
+    var ext = try ArrayRef.fromBorrowed(allocator, ext_data);
+    defer ext.release();
+    var eo = try ctx.invokeVector("dictionary_decode", &.{.{ .array = ext }}, none);
+    defer eo.release();
+    try std.testing.expect(eo.array.node == ext.node);
+    // Scalars: Arrow's TypeError "Expected an Array or a Chunked Array".
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("dictionary_decode", &.{.{ .scalar = common.scalarOf(i32, 1) }}, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("dictionary_decode", &.{.{ .array = d }}, .{ .take = .{} }));
+
+    // An index past the dictionary fails the dictionary check before any read.
+    var bad = try common.makeDictionary(allocator, nums, .{ .bit_width = 32, .signed = true }, &.{0});
+    defer bad.release();
+    var short = try nums.slice(0, 0);
+    defer short.release();
+    var bad_data = bad.data().*;
+    bad_data.dictionary = short;
+    var malformed = try ArrayRef.fromBorrowed(allocator, bad_data);
+    defer malformed.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("dictionary_decode", &.{.{ .array = malformed }}, none));
+}

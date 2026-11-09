@@ -35,17 +35,18 @@ defer sum.release();
 
 | Family | File | Functions |
 |---|---|---|
-| Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` and their `_checked` variants, `sign` (int8..int64, uint8..uint64, float32/64) |
+| Arithmetic | `arithmetic.zig` | `add`, `subtract`, `multiply`, `divide`, `modulo` (floored), `remainder` (truncated), `negate`, `abs` and their `_checked` variants, `sign` (int8..int64, uint8..uint64, float32/64) |
 | Decimals | `decimal.zig` | the decimal kernels of `add`, `subtract`, `multiply`, `divide` (+ `_checked`; decimal32..decimal256, also with an integer), `negate`, `abs` (+ `_checked`) and `sign` (decimal128 / decimal256); the decimal casts behind `cast`; the decimal helpers of the comparison and aggregate families |
 | Comparisons | `comparison.zig` | `equal`, `not_equal`, `less`, `less_equal`, `greater`, `greater_equal` (numeric, bool, string and binary layouts, fixed_size_binary, temporal, decimal; mixed byte layouts and mixed decimals compared in place); `min_element_wise`, `max_element_wise` (numeric, temporal, decimal, fixed_size_binary, string and binary layouts; `ElementWiseAggregateOptions`) |
 | Logical | `logical.zig` | `and`, `or`, `xor`, `and_not`, `invert`, `and_kleene`, `or_kleene`, `and_not_kleene` |
 | Aggregations | `aggregate_basic.zig` | `sum`, `mean`, `min`, `max`, `min_max`, `any`, `all` (`ScalarAggregateOptions`; sum, mean, min, max, min_max also on decimal128 / decimal256; min, max, min_max also on the null type, bool, temporal types, decimal32 / decimal64, string / binary layouts and fixed_size_binary), `count` (`CountOptions`), `count_all` (one argument or none) |
 | More aggregations | `aggregate_stats.zig` | `product`, `first`, `last`, `first_last` (`ScalarAggregateOptions`), `variance`, `stddev` (`VarianceOptions`), `skew`, `kurtosis` (`SkewOptions`; numbers and decimal32..decimal256), `count_distinct` (`CountOptions`), `index` (`IndexOptions`); vector `mode` (`ModeOptions`) and `quantile` (`QuantileOptions`) |
-| Math | `math.zig` | `sqrt`, `exp`, `expm1`, `ln`, `log10`, `log2`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` (+ `_checked` where Arrow has one), `atan2`, `logb` (+ `_checked`), `power` (+ `_checked`), `bit_wise_and`, `bit_wise_or`, `bit_wise_xor`, `bit_wise_not`, `shift_left`, `shift_right` (+ `_checked`) |
+| Math | `math.zig` | `sqrt`, `exp`, `expm1`, `ln`, `log10`, `log2`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` (+ `_checked` where Arrow has one), `atan2`, `hypot`, `logb` (+ `_checked`), `power` (+ `_checked`), `bit_wise_and`, `bit_wise_or`, `bit_wise_xor`, `bit_wise_not`, `shift_left`, `shift_right` (+ `_checked`) |
 | Rounding | `round.zig` | `round` (`RoundOptions`), `round_to_multiple` (`RoundToMultipleOptions`), `round_binary` (`RoundBinaryOptions`), `ceil`, `floor`, `trunc` (floats, integers, decimal128 / decimal256) |
 | Temporal arithmetic | `temporal_arith.zig` | the timestamp, date, time and duration kernels of `add`, `subtract`, `multiply`, `divide`, `negate`, `abs` (+ `_checked`) |
-| Associative transforms | `associative.zig` | `unique`, `value_counts`, `dictionary_encode` (`DictionaryEncodeOptions`); dictionary inputs keep their dictionary (see Dictionary inputs) |
-| Selecting and null replacement | `selection.zig` | `coalesce`, `if_else`, `case_when`, `choose` (scalar); `drop_null` (also record batches and tables), `fill_null_forward`, `fill_null_backward`, `replace_with_mask`, `scatter` (`ScatterOptions`), `inverse_permutation` (`InversePermutationOptions`), `indices_nonzero` (vector) |
+| Associative transforms | `associative.zig` | `unique`, `value_counts`, `dictionary_encode` (`DictionaryEncodeOptions`), `dictionary_decode` (a non-dictionary input comes back as is); dictionary inputs keep their dictionary (see Dictionary inputs) |
+| Run-end encoding | `run_end.zig` | `run_end_encode` (`RunEndEncodeOptions`: int16, int32 or int64 run ends), `run_end_decode` (arrays and chunked arrays, chunk by chunk; no nested types yet) |
+| Selecting and null replacement | `selection.zig` | `coalesce`, `if_else`, `case_when`, `choose` (scalar); `drop_null` (also record batches and tables), `fill_null_forward`, `fill_null_backward`, `replace_with_mask`, `scatter` (`ScatterOptions`), `inverse_permutation` (`InversePermutationOptions`), `indices_nonzero`, `take` / `array_take` (`TakeOptions`), `filter` / `array_filter` (`FilterOptions`; `take` and `filter` also on record batches and tables) (vector) |
 | Cumulative and pairwise | `cumulative.zig` | `cumulative_sum`, `cumulative_prod` (+ `_checked`), `cumulative_min`, `cumulative_max`, `cumulative_mean` (`CumulativeOptions`), `pairwise_diff` (+ `_checked`, `PairwiseOptions`), `winsorize` (`WinsorizeOptions`) (vector); `random` (`RandomOptions`, nullary scalar) |
 | Sorts and partitions | `sort.zig` | `sort_indices` (array / chunked columns, or one record batch / table by key names), `array_sort_indices` (`SortOptions`), `partition_nth_indices` (`PartitionNthOptions`), `select_k_unstable` (`SelectKOptions`; also record batches / tables), `rank` (`RankOptions`), `rank_quantile`, `rank_normal` (`RankQuantileOptions`), `search_sorted` (`SearchSortedOptions`); `sortIndicesRecordBatch`, `sortIndicesTable` |
 | Categorizations | `is_null.zig` | `is_null` (`NullOptions`), `is_valid`, `true_unless_null`, `is_nan`, `is_finite`, `is_inf` (also float16) |
@@ -267,6 +268,8 @@ Compute options are type-safe and tag-based.
 - `scatter`, `inverse_permutation`
 - `cumulative`, `pairwise`, `winsorize`, `random`
 - `strftime`, `strptime`, `assume_timezone`, `utf8_normalize`
+- `list_flatten`, `list_slice`, `make_struct`, `struct_field`, `map_lookup`
+- `take`, `run_end_encode`
 - `custom`
 
 ### Payload types
@@ -325,6 +328,8 @@ Compute options are type-safe and tag-based.
 - `AssumeTimezoneOptions` (`timezone`: an IANA name or `+HH:MM`, `ambiguous` / `nonexistent`:
   `raise | earliest | latest`, both `raise` by default)
 - `Utf8NormalizeOptions` (`form`: `nfc | nfkc | nfd | nfkd`, `nfc` by default)
+- `TakeOptions` (`boundscheck` = true; accepted for Arrow compatibility, zarrow always checks the indices)
+- `RunEndEncodeOptions` (`run_end_type`: `int16 | int32 | int64`, `int32` by default)
 - `CustomOptions`
 
 Kernels whose options are optional in Arrow (`day_of_week`, `binary_join_element_wise`, `week`,

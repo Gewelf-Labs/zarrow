@@ -523,3 +523,167 @@ test "indices_nonzero on numbers, bool, floats and decimals, sliced, chunked and
     defer s.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("indices_nonzero", &.{.{ .array = s }}, none));
 }
+
+/// Invoke vector function `name` with `options`; the result rows (array or chunked, every chunk
+/// validated) must equal `expected`, and the result must be chunked exactly when `chunked`.
+fn expectSelected(comptime T: type, ctx: *ExecContext, name: []const u8, args: []const Datum, options: common.Options, chunked: bool, expected: []const ?T) !void {
+    const allocator = std.testing.allocator;
+    var out = try ctx.invokeVector(name, args, options);
+    defer out.release();
+    switch (out) {
+        .array => |arr| try arr.data().validateFull(),
+        .chunked => |c| for (c.chunks()) |p| try p.data().validateFull(),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(chunked, out == .chunked);
+    const rows = try common.collect(T, allocator, out);
+    defer allocator.free(rows);
+    try common.expectRows(T, expected, rows);
+}
+
+test "take, array_take, filter and array_filter on nulls, sliced, chunked and every index type (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var v = try common.makeArray(i64, allocator, &.{ 1, 2, 3 });
+    defer v.release();
+    var idx = try common.makeArray(i64, allocator, &.{ 2, null, 0 });
+    defer idx.release();
+    // pc.take(pa.array([1, 2, 3]), pa.array([2, None, 0])) -> [3, null, 1]
+    try expectSelected(i64, &ctx, "take", &.{ .{ .array = v }, .{ .array = idx } }, none, false, &.{ 3, null, 1 });
+    try expectSelected(i64, &ctx, "array_take", &.{ .{ .array = v }, .{ .array = idx } }, none, false, &.{ 3, null, 1 });
+    try expectSelected(i64, &ctx, "take", &.{ .{ .array = v }, .{ .array = idx } }, .{ .take = .{ .boundscheck = false } }, false, &.{ 3, null, 1 });
+    // Every integer index type.
+    inline for (.{ i8, i16, i32, u8, u16, u32, u64 }) |I| {
+        var ix = try common.makeArray(I, allocator, &.{ 1, 1, null });
+        defer ix.release();
+        try expectSelected(i64, &ctx, "take", &.{ .{ .array = v }, .{ .array = ix } }, none, false, &.{ 2, 2, null });
+    }
+    // Sliced values and sliced indices.
+    var vs = try v.slice(1, 2);
+    defer vs.release();
+    var is = try idx.slice(1, 2);
+    defer is.release();
+    try expectSelected(i64, &ctx, "take", &.{ .{ .array = vs }, .{ .array = is } }, none, false, &.{ null, 2 });
+    // Chunked values and / or chunked indices give a chunked result.
+    var cv = try common.chunkedAt(allocator, v, &.{2});
+    defer cv.release();
+    var ci = try common.chunkedAt(allocator, idx, &.{1});
+    defer ci.release();
+    try expectSelected(i64, &ctx, "take", &.{ .{ .chunked = cv }, .{ .array = idx } }, none, true, &.{ 3, null, 1 });
+    try expectSelected(i64, &ctx, "take", &.{ .{ .chunked = cv }, .{ .chunked = ci } }, none, true, &.{ 3, null, 1 });
+    try expectSelected(i64, &ctx, "take", &.{ .{ .array = v }, .{ .chunked = ci } }, none, true, &.{ 3, null, 1 });
+    // Strings go through the same take kernels.
+    var sv = try common.makeStrings(.string_view, allocator, &.{ "a", null, "a string longer than twelve" });
+    defer sv.release();
+    var st = try ctx.invokeVector("take", &.{ .{ .array = sv }, .{ .array = idx } }, none);
+    defer st.release();
+    const srows = try common.collectStrings(allocator, st);
+    defer allocator.free(srows);
+    try common.expectStrings(&.{ "a string longer than twelve", null, "a" }, srows);
+
+    // filter: a null predicate row is dropped, or null with emit_null (drop_nulls = false).
+    var pred = try common.makeArray(bool, allocator, &.{ true, null, false });
+    defer pred.release();
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .array = v }, .{ .array = pred } }, none, false, &.{1});
+    try expectSelected(i64, &ctx, "array_filter", &.{ .{ .array = v }, .{ .array = pred } }, none, false, &.{1});
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .array = v }, .{ .array = pred } }, .{ .filter = .{ .drop_nulls = false } }, false, &.{ 1, null });
+    var p2 = try common.makeArray(bool, allocator, &.{ true, false, true });
+    defer p2.release();
+    var cp = try common.chunkedAt(allocator, p2, &.{1});
+    defer cp.release();
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .chunked = cv }, .{ .array = p2 } }, none, true, &.{ 1, 3 });
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .chunked = cv }, .{ .chunked = cp } }, none, true, &.{ 1, 3 });
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .array = v }, .{ .chunked = cp } }, none, true, &.{ 1, 3 });
+    try expectSelected(i64, &ctx, "array_filter", &.{ .{ .chunked = cv }, .{ .array = p2 } }, none, true, &.{ 1, 3 });
+    try expectSelected(i64, &ctx, "array_filter", &.{ .{ .array = v }, .{ .chunked = cp } }, none, true, &.{ 1, 3 });
+    // Sliced values and predicate.
+    var ps = try p2.slice(1, 2);
+    defer ps.release();
+    try expectSelected(i64, &ctx, "filter", &.{ .{ .array = vs }, .{ .array = ps } }, none, false, &.{3});
+    // An empty input keeps its type (fuzz finding: date64 and extension arrays).
+    var dates = try common.makeTyped(i64, .{ .date64 = {} }, allocator, &.{});
+    defer dates.release();
+    var no_pred = try p2.slice(0, 0);
+    defer no_pred.release();
+    var empty = try ctx.invokeVector("filter", &.{ .{ .array = dates }, .{ .array = no_pred } }, none);
+    defer empty.release();
+    try std.testing.expect(empty.array.data().data_type == .date64 and empty.array.data().length == 0);
+
+    // Record batch and table values (take / filter only).
+    const int64_type = DataType{ .int64 = {} };
+    const fields = [_]common.datatype.Field{.{ .name = "a", .data_type = &int64_type }};
+    var batch = try @import("../record_batch.zig").RecordBatch.initBorrowed(allocator, .{ .fields = &fields }, &.{v});
+    var rb = Datum.fromRecordBatch(allocator, batch) catch |err| {
+        batch.deinit();
+        return err;
+    };
+    defer rb.release();
+    var table = try @import("../table.zig").Table.init(allocator, try @import("../schema.zig").SchemaRef.fromBorrowed(allocator, .{ .fields = &fields }), &.{cv});
+    var tb = Datum.fromTable(allocator, table) catch |err| {
+        table.deinit();
+        return err;
+    };
+    defer tb.release();
+    inline for (.{ "take", "filter" }) |name| {
+        const is_take = comptime std.mem.eql(u8, name, "take");
+        const second: Datum = if (is_take) .{ .chunked = ci } else .{ .array = p2 };
+        const want: []const ?i64 = if (is_take) &.{ 3, null, 1 } else &.{ 1, 3 };
+        for ([_]Datum{ rb, tb }) |values| {
+            var out = try ctx.invokeVector(name, &.{ values, second }, none);
+            defer out.release();
+            try std.testing.expectEqual(std.meta.activeTag(values), std.meta.activeTag(out));
+            var col = try common.core.datumStructField(out, 0);
+            defer col.release();
+            const rows = try common.collect(i64, allocator, col);
+            defer allocator.free(rows);
+            try common.expectRows(i64, want, rows);
+        }
+    }
+    try std.testing.expectError(error.NotImplemented, ctx.invokeVector("array_take", &.{ rb, .{ .array = idx } }, none));
+    try std.testing.expectError(error.NotImplemented, ctx.invokeVector("array_filter", &.{ tb, .{ .array = p2 } }, none));
+    try std.testing.expect((try registry.resolveResultType("take", .vector, &.{ .{ .array = v }, .{ .array = idx } }, none)) == .int64);
+}
+
+test "take and filter errors: index bounds, index and predicate types, lengths, datum kinds, options" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var v = try common.makeArray(i64, allocator, &.{ 1, 2, 3 });
+    defer v.release();
+    // Arrow: IndexError "Index -1 out of bounds" / "Index 3 out of bounds", also without boundscheck.
+    inline for (.{ @as(i64, -1), @as(i64, 3) }) |bad| {
+        var bx = try common.makeArray(i64, allocator, &.{ 0, bad });
+        defer bx.release();
+        try std.testing.expectError(error.InvalidInput, ctx.invokeVector("take", &.{ .{ .array = v }, .{ .array = bx } }, none));
+        try std.testing.expectError(error.InvalidInput, ctx.invokeVector("array_take", &.{ .{ .array = v }, .{ .array = bx } }, .{ .take = .{ .boundscheck = false } }));
+    }
+    var huge = try common.makeArray(u64, allocator, &.{std.math.maxInt(u64)});
+    defer huge.release();
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("take", &.{ .{ .array = v }, .{ .array = huge } }, none));
+    // Float indices, scalar values or indices, chunked arguments to array_take.
+    var fx = try common.makeArray(f64, allocator, &.{1.0});
+    defer fx.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("take", &.{ .{ .array = v }, .{ .array = fx } }, none));
+    var ix = try common.makeArray(i32, allocator, &.{0});
+    defer ix.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("take", &.{ .{ .array = v }, .{ .scalar = common.scalarOf(i32, 0) } }, none));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("take", &.{ .{ .scalar = common.scalarOf(i64, 1) }, .{ .array = ix } }, none));
+    var cv = try common.chunkedAt(allocator, v, &.{1});
+    defer cv.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("array_take", &.{ .{ .chunked = cv }, .{ .array = ix } }, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("take", &.{ .{ .array = v }, .{ .array = ix } }, .{ .filter = .{} }));
+    // Arrow: "Filter argument must be boolean type", "Filter should be array-like", unequal lengths.
+    var pred = try common.makeArray(bool, allocator, &.{ true, false });
+    defer pred.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("filter", &.{ .{ .array = v }, .{ .array = v } }, none));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("filter", &.{ .{ .array = v }, .{ .scalar = common.scalarOf(bool, true) } }, none));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("filter", &.{ .{ .array = v }, .{ .array = pred } }, none));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("array_filter", &.{ .{ .chunked = cv }, .{ .array = pred } }, none));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("filter", &.{ .{ .array = pred }, .{ .array = pred } }, .{ .take = .{} }));
+    try std.testing.expectError(error.InvalidArity, ctx.invokeVector("take", &.{.{ .array = v }}, none));
+}
