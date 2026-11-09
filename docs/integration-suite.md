@@ -208,6 +208,7 @@ was in the corpus already).
 - **Big-endian IPC** (`1.0.0-bigendian`, 22 cases): zarrow's IPC readers accept little-endian data only
   (`UnsupportedType`); the runner reports these cases as `rejected-as-expected`. The JSON side of these
   cases reads fine.
-- **A record batch without columns but with rows** (Arrow allows it; no gold case has one): zarrow's
-  IPC reader rejects a batch whose length differs from its columns' (`InvalidMetadata`), including the
-  column-less case. The JSON reader keeps such a batch's row count.
+- **A record batch without columns but with rows** (Arrow allows it; no gold case has one) is accepted:
+  the readers take the row count from the message when there are no columns
+  (`src/ipc/stream_reader.zig:"ipc stream and file readers keep the row count of a record batch without columns"`);
+  with columns, a length that differs from theirs is still `InvalidMetadata`.
