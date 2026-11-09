@@ -17,6 +17,13 @@ A claim with no test is not "yes"; downgrade it to "partial" and say that the te
 `yes` / `partial` row in `docs/compute-support-matrix.md` carries both kinds; CI runs it. Update the
 references when code moves.
 
+The compute docs nest in three levels: the overview `docs/compute-support-matrix.md` (one row per
+Arrow category), `docs/compute/<group>/matrix.md` (one row per function, generated: rerun
+`python -I tools/gen_compute_docs.py` after adding or moving a function or test; CI runs it with
+`--check`), and `docs/compute/<group>/notes.md` (hand-written per-function notes: arity, types,
+options, null handling, deviations, each section ending with evidence). A new function goes into
+`GROUPS` in the generator and gets a `## name` section in its group's notes.
+
 ## Repository scope
 
 Core and compute are one repository. Compute kernels belong in `src/compute/` (one file per family) with
