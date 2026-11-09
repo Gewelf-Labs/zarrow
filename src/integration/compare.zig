@@ -126,6 +126,12 @@ pub fn arraysEqual(a: *const ArrayData, b: *const ArrayData, why: ?*Mismatch) bo
     return c.range(a, 0, b, 0, a.length);
 }
 
+/// Logical row `i` of `a` equals logical row `j` of `b` (run_end_encode of nested types).
+pub fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool {
+    var c: Cmp = .{ .why = null };
+    return c.range(a, i, b, j, 1);
+}
+
 /// `a` equals the first `a.length` rows of `b`.
 pub fn arrayIsPrefix(a: *const ArrayData, b: *const ArrayData, why: ?*Mismatch) bool {
     var c: Cmp = .{ .why = why };

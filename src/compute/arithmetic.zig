@@ -15,8 +15,12 @@
 //! (Arrow's implicit casts, `registry.commonNumericType`: int32 + int64 is int64, int + float32 is
 //! float32, uint32 + int32 is int64; a value the cast cannot represent is `InvalidCast`).
 //!
-//! sign: -1, 0 or 1 as int8 for integers (Arrow C++), as the input type for floats (NaN stays
-//! NaN, both zeros give 0.0). Decimal kernels live in decimal.zig.
+//! sign: -1, 0 or 1 as int8 for integers and durations (Arrow C++), as the input type for floats
+//! (NaN stays NaN, both zeros give 0.0). Decimal kernels live in decimal.zig.
+//!
+//! Every function here (with its `_checked` variant) also takes arguments that are all of the
+//! null type: the result is a null-type array of their length (`FunctionRegistry.
+//! setNullTypeResult`, Arrow's null kernels: `add(null, null)` is null).
 const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
@@ -48,22 +52,27 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             try registry.setImplicitCast(@tagName(op), .scalar, .numeric);
             try registry.setImplicitCast(@tagName(op) ++ "_checked", .scalar, .numeric);
         }
+        try registry.setNullTypeResult(@tagName(op), .scalar);
+        try registry.setNullTypeResult(@tagName(op) ++ "_checked", .scalar);
     }
-    inline for (dense.numeric_types) |T| try registry.registerScalarKernel("sign", signKernel(T));
+    inline for (dense.numeric_types) |T| try registry.registerScalarKernel("sign", signKernel(T, std.meta.activeTag(dense.dataTypeOf(T))));
+    // duration: -1, 0 or 1 as int8 (Arrow C++).
+    try registry.registerScalarKernel("sign", signKernel(i64, .duration));
+    try registry.setNullTypeResult("sign", .scalar);
     // float16: negate, abs and sign keep the type (pyarrow 26 has negate and sign; abs is ours).
     inline for (.{ Op.negate, Op.abs }) |op| {
         try registry.registerScalarKernel(@tagName(op), kernel(f16, op, false));
         try registry.registerScalarKernel(@tagName(op) ++ "_checked", kernel(f16, op, true));
     }
-    try registry.registerScalarKernel("sign", signKernel(f16));
+    try registry.registerScalarKernel("sign", signKernel(f16, .half_float));
 }
 
-fn signKernel(comptime T: type) Kernel {
+fn signKernel(comptime T: type, comptime tag: std.meta.Tag(core.DataType)) Kernel {
     const Out = if (@typeInfo(T) == .float) T else i8;
     return .{
         .signature = .{
             .arity = 1,
-            .type_check = dense.argsOfType(std.meta.activeTag(dense.dataTypeOf(T)), 1),
+            .type_check = dense.argsOfType(tag, 1),
             .options_check = dense.noOptions,
             .result_type_fn = dense.resultTypeOf(dense.dataTypeOf(Out)),
         },
@@ -75,7 +84,11 @@ fn signKernel(comptime T: type) Kernel {
             fn chunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize) KernelError!ArrayRef {
                 var out = try dense.DenseBinaryOutput(Out).initValidity(ctx.allocator, len, dense.arrayData(values[0]), null, dense.dataTypeOf(Out));
                 errdefer out.deinit();
-                switch (try dense.operand(T, values[0])) {
+                const xs: dense.Operand(T) = if (tag == .duration and values[0] == .scalar)
+                    .{ .scalar = values[0].scalar.value.duration }
+                else
+                    try dense.operand(T, values[0]);
+                switch (xs) {
                     inline else => |a| for (out.values(), 0..) |*d, i| {
                         const x = dense.at(a, i);
                         d.* = if (Out == i8)

@@ -9,7 +9,8 @@
 //!   least one key, else `InvalidOptions`, as Arrow). Each `SortKey` has its order and null
 //!   placement; without keys every column uses `order` and nulls go last. `SortOptions.
 //!   null_placement`, when set, overrides every key's (Arrow 26). array_sort_indices takes one
-//!   column. Both are stable: equal rows keep their input order.
+//!   column. Both are stable: equal rows keep their input order. A null-type column ties every
+//!   row (one alone gives 0 .. n-1, as pyarrow 26).
 //! - Value order (Arrow C++): numbers, dates, timestamps, times, durations and decimals by value
 //!   (-0.0 equals 0.0), bool false before true, string / binary layouts and fixed_size_binary by
 //!   bytes; dictionaries by their decoded values; a struct by its fields in order (Arrow flattens
@@ -71,11 +72,11 @@ const float64_type = DataType{ .double = {} };
 /// rank_quantile, rank_normal and search_sorted.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     try registry.registerVectorKernel("sort_indices", .{
-        .signature = .{ .arity = 1, .variadic = true, .type_check = sortable, .options_check = sortOptions, .result_type_fn = dense.resultTypeOf(uint64_type), .tabular = true },
+        .signature = .{ .arity = 1, .variadic = true, .type_check = sortableOrNull, .options_check = sortOptions, .result_type_fn = dense.resultTypeOf(uint64_type), .tabular = true },
         .exec = sortIndicesExec,
     });
     try registry.registerVectorKernel("array_sort_indices", .{
-        .signature = .{ .arity = 1, .type_check = sortable, .options_check = sortOptions, .result_type_fn = dense.resultTypeOf(uint64_type) },
+        .signature = .{ .arity = 1, .type_check = sortableOrNull, .options_check = sortOptions, .result_type_fn = dense.resultTypeOf(uint64_type) },
         .exec = sortIndicesExec,
     });
     try registry.registerVectorKernel("partition_nth_indices", .{
@@ -144,6 +145,15 @@ fn sortable(args: []const Datum) bool {
     // A record batch or table: its key columns are checked when the keys are resolved.
     if (args.len == 1 and args[0].isTabular()) return true;
     for (args) |a| if (a == .scalar or a.isTabular() or !isSortable(a.dataType())) return false;
+    return true;
+}
+
+/// `sortable`, also with null-type columns (sort_indices / array_sort_indices: every row of one
+/// ties, as pyarrow 26).
+fn sortableOrNull(args: []const Datum) bool {
+    if (args.len == 0) return false;
+    if (args.len == 1 and args[0].isTabular()) return true;
+    for (args) |a| if (a == .scalar or a.isTabular() or !(a.dataType() == .null or isSortable(a.dataType()))) return false;
     return true;
 }
 
@@ -359,6 +369,12 @@ const Columns = struct {
             defer owned.release();
             return addColumns(ctx, cols, try asArray(ctx, .{ .array = arr }), key, len, parent_valid);
         }
+        if (data.data_type == .null) {
+            // Every row is null: the column ties everywhere and adds no sort column.
+            defer owned.release();
+            if (data.length != len) return error.InvalidInput;
+            return;
+        }
         if (data.data_type != .struct_) {
             errdefer owned.release();
             if (data.length != len) return error.InvalidInput;
@@ -415,6 +431,7 @@ const Columns = struct {
         const idx = self.allocator.alloc(u32, self.len) catch return error.OutOfMemory;
         errdefer self.allocator.free(idx);
         for (idx, 0..) |*d, i| d.* = @intCast(i);
+        if (self.cols.len == 0) return idx;
         if (self.cols.len == 1 and try radixSort(self.allocator, &self.cols[0], idx)) return idx;
         std.mem.sort(u32, idx, self, lessThan);
         return idx;

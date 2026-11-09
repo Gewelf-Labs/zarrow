@@ -18,10 +18,13 @@
 //!   the value is kept; a result past the precision is `Overflow`.
 //! - round_to_multiple casts its multiple to the input type (safe: a lost fraction is
 //!   `InvalidCast`); a null, zero, negative or NaN multiple is `InvalidOptions`.
-//! - round_binary takes its digits per row (any integer type, cast to int32); a row whose digits
-//!   are out of range for an integer or decimal input is `InvalidInput`.
+//! - round_binary takes its digits per row (any integer type, cast to int32; for a decimal128 /
+//!   decimal256 input also a decimal of any width and scale or a float, cast safely to int32 as
+//!   pyarrow 26: a fraction is `InvalidCast`); a row whose digits are out of range for an integer
+//!   or decimal input is `InvalidInput`.
 //!
-//! Errors are only raised for valid rows. Null handling is intersection.
+//! Errors are only raised for valid rows. Null handling is intersection. Arguments that are all
+//! of the null type give a null-type result of their length (Arrow's null kernels).
 const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
@@ -53,6 +56,8 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         }
     }
     inline for (.{ "ceil", "floor", "trunc" }) |name| try registry.setImplicitCast(name, .scalar, .integer_to_float);
+    // Null-type arguments give a null-type result (Arrow's null kernels).
+    inline for (comptime std.meta.tags(Func)) |f| try registry.setNullTypeResult(@tagName(f), .scalar);
 }
 
 fn storageTag(comptime T: type) std.meta.Tag(DataType) {
@@ -70,6 +75,18 @@ fn isIntegerTag(tag: std.meta.Tag(DataType)) bool {
     };
 }
 
+/// The digits of round_binary on decimal128 / decimal256 `tag`: an integer, or a decimal of any
+/// width or a float (cast to int32 like the integers; a fraction or a value past int32 fails the
+/// cast, as pyarrow 26).
+fn digitsOk(tag: std.meta.Tag(DataType), digits: std.meta.Tag(DataType)) bool {
+    if (isIntegerTag(digits)) return true;
+    if (tag != .decimal128 and tag != .decimal256) return false;
+    return switch (digits) {
+        .decimal32, .decimal64, .decimal128, .decimal256, .half_float, .float, .double => true,
+        else => false,
+    };
+}
+
 fn kernel(comptime T: type, comptime f: Func) Kernel {
     const tag = comptime storageTag(T);
     return .{
@@ -77,7 +94,7 @@ fn kernel(comptime T: type, comptime f: Func) Kernel {
             .arity = if (f == .round_binary) 2 else 1,
             .type_check = struct {
                 fn check(args: []const Datum) bool {
-                    if (f == .round_binary) return args.len == 2 and std.meta.activeTag(args[0].dataType()) == tag and isIntegerTag(std.meta.activeTag(args[1].dataType()));
+                    if (f == .round_binary) return args.len == 2 and std.meta.activeTag(args[0].dataType()) == tag and digitsOk(tag, std.meta.activeTag(args[1].dataType()));
                     return args.len == 1 and std.meta.activeTag(args[0].dataType()) == tag;
                 }
             }.check,

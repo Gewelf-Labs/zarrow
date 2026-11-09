@@ -766,3 +766,65 @@ test "min and max of byte rows across scan blocks: 3000 rows, extremes in later 
         try expectBytesMinMax(&ctx, .{ .array = sliced }, none, want_lo, want_hi);
     }
 }
+
+test "sum and mean of bool and of the null type: nulls, options, sliced, chunked, scalars and lifecycle (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    var b = try common.makeArray(bool, allocator, &.{ true, false, null, true, true });
+    defer b.release();
+    const db: Datum = .{ .array = b };
+    try std.testing.expectEqual(@as(?u64, 3), try aggWith(u64, &ctx, "sum", &.{db}, none));
+    try std.testing.expectEqual(@as(?f64, 0.75), try aggWith(f64, &ctx, "mean", &.{db}, none));
+    try std.testing.expectEqual(@as(?u64, null), try aggWith(u64, &ctx, "sum", &.{db}, aggOptions(false, 0)));
+    try std.testing.expectEqual(@as(?f64, null), try aggWith(f64, &ctx, "mean", &.{db}, aggOptions(false, 0)));
+    try std.testing.expectEqual(@as(?u64, null), try aggWith(u64, &ctx, "sum", &.{db}, aggOptions(true, 5)));
+    var mid = try b.slice(1, 3);
+    defer mid.release();
+    try std.testing.expectEqual(@as(?u64, 1), try aggWith(u64, &ctx, "sum", &.{.{ .array = mid }}, none));
+    try std.testing.expectEqual(@as(?f64, 0.5), try aggWith(f64, &ctx, "mean", &.{.{ .array = mid }}, none));
+    var cb = try common.chunkedAt(allocator, b, &.{ 1, 3 });
+    defer cb.release();
+    try std.testing.expectEqual(@as(?u64, 3), try aggWith(u64, &ctx, "sum", &.{.{ .chunked = cb }}, none));
+    try std.testing.expectEqual(@as(?f64, 0.75), try aggWith(f64, &ctx, "mean", &.{.{ .chunked = cb }}, none));
+    var empty = try b.slice(0, 0);
+    defer empty.release();
+    try std.testing.expectEqual(@as(?u64, 0), try aggWith(u64, &ctx, "sum", &.{.{ .array = empty }}, aggOptions(true, 0)));
+    try std.testing.expect(std.math.isNan((try aggWith(f64, &ctx, "mean", &.{.{ .array = empty }}, aggOptions(true, 0))).?));
+    try std.testing.expectEqual(@as(?u64, 1), try aggWith(u64, &ctx, "sum", &.{.{ .scalar = common.scalarOf(bool, true) }}, none));
+    try std.testing.expect((try registry.resolveResultType("sum", .aggregate, &.{db}, none)) == .uint64);
+    try std.testing.expect((try registry.resolveResultType("mean", .aggregate, &.{db}, none)) == .double);
+    // Lifecycle: two updates and a merge equal the whole.
+    var s1 = try ctx.beginAggregate("sum", &.{db}, none);
+    defer s1.deinit();
+    var s2 = try ctx.beginAggregate("sum", &.{db}, none);
+    defer s2.deinit();
+    try s1.update(&.{.{ .array = mid }});
+    try s2.update(&.{db});
+    try s1.merge(&s2);
+    var total = try s1.finalize();
+    defer total.release();
+    try std.testing.expectEqual(@as(u64, 4), total.scalar.value.u64);
+
+    // The null type: int64 sum / float64 mean, null unless min_count is 0 (and nulls skipped).
+    var n = try dense.nullArray(allocator, .{ .null = {} }, 5);
+    defer n.release();
+    const dn: Datum = .{ .array = n };
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{dn}, none));
+    try std.testing.expectEqual(@as(?f64, null), try aggWith(f64, &ctx, "mean", &.{dn}, none));
+    try std.testing.expectEqual(@as(?i64, 0), try aggWith(i64, &ctx, "sum", &.{dn}, aggOptions(true, 0)));
+    try std.testing.expectEqual(@as(?f64, 0.0), try aggWith(f64, &ctx, "mean", &.{dn}, aggOptions(true, 0)));
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{dn}, aggOptions(false, 0)));
+    var n0 = try n.slice(2, 0);
+    defer n0.release();
+    try std.testing.expectEqual(@as(?i64, 0), try aggWith(i64, &ctx, "sum", &.{.{ .array = n0 }}, aggOptions(false, 0)));
+    var cn = try common.chunkedAt(allocator, n, &.{2});
+    defer cn.release();
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{.{ .chunked = cn }}, none));
+    try std.testing.expectEqual(@as(?i64, 0), try aggWith(i64, &ctx, "sum", &.{.{ .chunked = cn }}, aggOptions(true, 0)));
+    try std.testing.expectEqual(@as(?i64, null), try aggWith(i64, &ctx, "sum", &.{.{ .scalar = common.Scalar.init(.{ .null = {} }, .null) }}, none));
+    try std.testing.expect((try registry.resolveResultType("sum", .aggregate, &.{dn}, none)) == .int64);
+    try std.testing.expect((try registry.resolveResultType("mean", .aggregate, &.{dn}, none)) == .double);
+}

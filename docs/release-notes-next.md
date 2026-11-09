@@ -16,6 +16,20 @@
 - IPC stream and file readers read big-endian IPC: every body buffer is byte-swapped to
   little-endian and the schema is presented as little-endian (Arrow C++ `ensure_native_endian`);
   all 22 `1.0.0-bigendian` gold cases now pass ([docs/integration-suite.md](integration-suite.md)).
+- Compute, closing the per-type gaps against pyarrow 26
+  ([docs/compute-support-matrix.md](compute-support-matrix.md)):
+  - every arithmetic, math, bit-wise and rounding function (and `_checked` variant) and
+    `pairwise_diff` take null-type arguments and return a null-type result of their length
+    (`FunctionRegistry.setNullTypeResult`); `sum` / `product` / `mean` of the null type give int64 /
+    int64 / float64; `sort_indices` / `array_sort_indices` of the null type give 0 .. n-1;
+  - `is_null`, `is_valid`, `true_unless_null` and `count` take unions and run-end encoded arrays, with
+    Arrow's logical nulls (`is_null.logicalValidity`);
+  - `first`, `last`, `first_last` on fixed_size_binary; `sum`, `mean`, `product` on bool;
+  - `floor_temporal`, `ceil_temporal`, `round_temporal`, `is_finite`, `is_inf`, `is_nan` and `sign` on
+    duration;
+  - `round_binary` on decimal128 / decimal256 with decimal (or float) digits;
+  - `run_end_encode` / `run_end_decode` on list, large_list, list_view, large_list_view,
+    fixed_size_list, struct and map (rows compared by `integration/compare.zig`'s `rowsEqual`).
 - Added C ABI interop guides:
   - `docs/interop-c-abi.md`
   - `docs/interop-c-abi-zh.md`

@@ -3,7 +3,9 @@
 //! - product (`ScalarAggregateOptions`): int -> int64, uint -> uint64, float -> float64; an empty
 //!   product is 1 with `min_count = 0`, null otherwise. Integer overflow follows
 //!   `ExecConfig.overflow_mode` like sum (`checked`: `Overflow`, `wrapping`: the low 64 bits as
-//!   Arrow C++, `saturating`: clamped with the sign of the exact product).
+//!   Arrow C++, `saturating`: clamped with the sign of the exact product). bool gives uint64 (0
+//!   when a valid row is false, else 1) and the null type int64 (null, or 1 with `min_count = 0`),
+//!   as pyarrow 26 (`aggregate_basic.BoolOrNull`).
 //! - variance, stddev (`VarianceOptions`: ddof, skip_nulls, min_count) and skew, kurtosis
 //!   (`SkewOptions`: skip_nulls, biased, min_count) on numbers and decimal128 / decimal256, as
 //!   float64: count, mean and central moments per chunk (two passes), merged across chunks and
@@ -13,8 +15,8 @@
 //!   skew and kurtosis (0 / 0), as Arrow.
 //! - first, last, first_last (`ScalarAggregateOptions`): the first / last non-null value (with
 //!   `skip_nulls = false` the first / last row, which may be null); null with fewer valid rows
-//!   than `min_count`. Numbers, bool, dates, timestamps, times, durations, decimals and the
-//!   string / binary layouts. first_last is `struct<first, last>`.
+//!   than `min_count`. Numbers, bool, dates, timestamps, times, durations, decimals,
+//!   fixed_size_binary and the string / binary layouts. first_last is `struct<first, last>`.
 //! - count_distinct (`CountOptions`): distinct values of a key type (hash_aggregate.zig); a null
 //!   is one value (`only_null` counts 1 when there is one, `all` adds it).
 //! - index (`IndexOptions`): int64 position of the first row equal to the value (cast to the
@@ -66,6 +68,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         const check = comptime dense.argsOfType(if (T == i128) .decimal128 else .decimal256, 1);
         try basic.add(registry, "product", 1, check, basic.scalarAggregateOptions, ProductDecimal(T));
     }
+    inline for (.{ .bool, .null }) |tag| try basic.add(registry, "product", 1, dense.argsOfType(tag, 1), basic.scalarAggregateOptions, basic.BoolOrNull(tag, .product));
     inline for (moment_types) |pair| {
         const T = pair[0];
         const check = comptime dense.argsOfType(pair[1], 1);
@@ -148,7 +151,7 @@ fn isDecimal(dt: DataType) bool {
 fn firstLastArg(args: []const Datum) bool {
     if (args.len != 1) return false;
     return switch (args[0].dataType()) {
-        .fixed_size_binary, .interval_months, .interval_day_time, .interval_month_day_nano => false,
+        .interval_months, .interval_day_time, .interval_month_day_nano => false,
         else => |dt| hash.isKeyType(dt),
     };
 }

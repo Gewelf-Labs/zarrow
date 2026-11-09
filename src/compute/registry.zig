@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const signature_mod = @import("signature.zig");
+const dense = @import("dense.zig");
 
 const TimeUnit = @import("../datatype.zig").TimeUnit;
 const Field = @import("../datatype.zig").Field;
@@ -70,6 +71,35 @@ pub const AggregateSession = struct {
     }
 };
 
+/// The kernel a function with `Function.null_type_result` resolves to when every argument is of
+/// the null type: a null-type result as long as the arguments (array, chunked like a chunked
+/// argument, or a scalar when every argument is one), as Arrow's null kernels.
+pub const null_type_kernel: Kernel = .{
+    .signature = .{ .arity = 1, .variadic = true, .type_check = allNullType, .result_type_fn = nullTypeResult },
+    .exec = execNullType,
+};
+
+fn allNullType(args: []const Datum) bool {
+    if (args.len == 0) return false;
+    for (args) |a| if (a.isTabular() or a.dataType() != .null) return false;
+    return true;
+}
+
+fn nullTypeResult(_: []const Datum, _: Options) KernelError!DataType {
+    return .{ .null = {} };
+}
+
+fn execNullType(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    for (args) |a| {
+        if (a != .scalar) return dense.execElementwise(ctx, args, .{ .null = {} }, true, nullChunk);
+    }
+    return .{ .scalar = core.Scalar.init(.{ .null = {} }, .null) };
+}
+
+fn nullChunk(ctx: *ExecContext, _: []const core.ExecChunkValue, len: usize) KernelError!core.ArrayRef {
+    return dense.nullArray(ctx.allocator, .{ .null = {} }, len);
+}
+
 const function_kind_count = std.enums.values(FunctionKind).len;
 
 /// The type of every argument after the implicit casts: one common type, or one per argument
@@ -120,6 +150,10 @@ pub const Function = struct {
     kind: FunctionKind,
     kernels: std.ArrayList(Kernel),
     implicit_cast: ImplicitCast = .none,
+    /// Whether a call whose arguments are all of the null type resolves to `null_type_kernel`
+    /// when no registered kernel matches (Arrow's null kernels of the arithmetic, math, rounding
+    /// and bit-wise functions: `add(null, null)` is null).
+    null_type_result: bool = false,
 
     pub fn kernelCount(self: *const Function) usize {
         return self.kernels.items.len;
@@ -208,6 +242,14 @@ pub const FunctionRegistry = struct {
         self.functions.items[idx].implicit_cast = mode;
     }
 
+    /// Let a registered function take arguments that are all of the null type: it then resolves
+    /// to `null_type_kernel` (a null-type result of the arguments' length) when the options suit
+    /// one of its kernels of that arity.
+    pub fn setNullTypeResult(self: *FunctionRegistry, name: []const u8, kind: FunctionKind) KernelError!void {
+        const idx = self.findFunctionIndex(name, kind) orelse return error.FunctionNotFound;
+        self.functions.items[idx].null_type_result = true;
+    }
+
     pub fn containsFunction(self: *const FunctionRegistry, name: []const u8, kind: FunctionKind) bool {
         return self.findFunction(name, kind) != null;
     }
@@ -243,11 +285,13 @@ pub const FunctionRegistry = struct {
 
         var saw_matching_arity = false;
         var saw_matching_type = false;
+        var saw_matching_options = false;
         var best_kernel: ?*const Kernel = null;
         var best_specificity: u8 = 0;
         for (function.kernels.items) |*kernel| {
             if (!kernel.signature.matchesArity(args.len)) continue;
             saw_matching_arity = true;
+            if (kernel.signature.matchesOptions(options)) saw_matching_options = true;
             if (!kernel.signature.matches(args)) continue;
             saw_matching_type = true;
             if (!kernel.signature.matchesOptions(options)) continue;
@@ -259,6 +303,9 @@ pub const FunctionRegistry = struct {
             }
         }
         if (best_kernel) |kernel| return kernel;
+        if (function.null_type_result and saw_matching_arity and allNullType(args)) {
+            return if (saw_matching_options) &null_type_kernel else error.InvalidOptions;
+        }
         if (!saw_matching_arity) return error.InvalidArity;
         // A record batch or table argument to a function without a tabular kernel (Arrow:
         // "Unsupported types" / non-array input); no implicit cast applies.
@@ -280,6 +327,7 @@ pub const FunctionRegistry = struct {
 
         var saw_matching_arity = false;
         var saw_matching_type = false;
+        var saw_matching_options = false;
         var best_specificity: u8 = 0;
         var saw_matching_kernel = false;
         var has_exact = false;
@@ -300,6 +348,7 @@ pub const FunctionRegistry = struct {
 
             if (!kernel.signature.matchesArity(args.len)) continue;
             saw_matching_arity = true;
+            if (kernel.signature.matchesOptions(options)) saw_matching_options = true;
             if (!kernel.signature.matches(args)) continue;
             saw_matching_type = true;
             if (!kernel.signature.matchesOptions(options)) continue;
@@ -310,6 +359,9 @@ pub const FunctionRegistry = struct {
             }
         }
         if (saw_matching_kernel) return "kernel resolution should succeed";
+        if (function.null_type_result and saw_matching_arity and allNullType(args)) {
+            return if (saw_matching_options) "kernel resolution should succeed: null-type arguments give a null-type result" else "null-type arguments but options were invalid";
+        }
         if (!saw_matching_arity) {
             if (has_at_least and any_min_gt_arg) return "no kernel matched minimum arity";
             if (has_range and any_range_excludes_arg) return "no kernel matched arity range";

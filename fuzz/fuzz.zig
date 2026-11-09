@@ -2258,10 +2258,62 @@ test "fuzz temporal" {
     try std.testing.fuzz(Target.temporal, fuzzOne, .{ .corpus = &.{smithSeed("corpus/temporal/iso.bin")} });
 }
 
-/// The decoded-array kernels of rounds 21 and 23.
+/// The decoded-array kernels of rounds 21, 23 and 24.
 fn exerciseRounds21To23(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
     exerciseRound21(ctx, a);
     exerciseRound23(ctx, a);
+    exerciseRound24(ctx, a);
+}
+
+/// Round 24 kernels on any decoded array: is_null, is_valid and true_unless_null (logical nulls,
+/// also of unions and run-end encoded arrays) and count in every mode, which must agree with
+/// is_null; and the arithmetic / math / rounding smoke on null-type arguments (the array itself
+/// when it is of the null type, and a null-type array of its length): a null-type result of the
+/// same length. Nothing may fail.
+fn exerciseRound24(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    expectCall(ctx, "is_valid", .scalar, &.{d}, .none, len, &.{});
+    expectCall(ctx, "true_unless_null", .scalar, &.{d}, .none, len, &.{});
+    var nulls: usize = 0;
+    if (ctx.invoke("is_null", .scalar, &.{d}, .none)) |out| {
+        var o = out;
+        defer o.release();
+        expectValid("is_null", o.array, len);
+        const bits = o.array.data();
+        for (0..len) |i| nulls += @intFromBool((zarrow.BooleanArray{ .data = bits }).value(i) catch false);
+    } else |err| std.debug.panic("fuzz-invariant: is_null failed on a valid {s} array: {s}", .{ @tagName(a.data().data_type.id()), @errorName(err) });
+    for ([_]zarrow.compute.CountMode{ .only_valid, .only_null, .all }) |mode| {
+        var out = ctx.invoke("count", .aggregate, &.{d}, .{ .count = .{ .mode = mode } }) catch |err|
+            std.debug.panic("fuzz-invariant: count failed on a valid {s} array: {s}", .{ @tagName(a.data().data_type.id()), @errorName(err) });
+        defer out.release();
+        const want: usize = switch (mode) {
+            .only_valid => len - nulls,
+            .only_null => nulls,
+            .all => len,
+        };
+        if (out.scalar.value.i64 != @as(i64, @intCast(want))) std.debug.panic("fuzz-invariant: count {s} is {d}, is_null says {d}", .{ @tagName(mode), out.scalar.value.i64, want });
+    }
+    var made = zarrow.compute.datumBuildNullLikeWithAllocator(std.heap.page_allocator, .{ .null = {} }, len) catch return;
+    defer made.release();
+    const inputs = [_]zarrow.compute.Datum{ made, d };
+    for (inputs[0..if (a.data().data_type == .null) 2 else 1]) |n| {
+        inline for (.{ "add", "subtract_checked", "divide", "power", "atan2", "shift_left", "bit_wise_and", "round_binary" }) |name| {
+            expectNullResult(ctx, name, .scalar, &.{ n, n }, len);
+        }
+        inline for (.{ "abs", "negate_checked", "sign", "sqrt", "ln_checked", "ceil", "round", "bit_wise_not" }) |name| {
+            expectNullResult(ctx, name, .scalar, &.{n}, len);
+        }
+        expectNullResult(ctx, "pairwise_diff", .vector, &.{n}, len);
+    }
+}
+
+/// `name` on null-type arguments returns a valid null-type array of `len` rows.
+fn expectNullResult(ctx: *zarrow.compute.ExecContext, name: []const u8, kind: zarrow.compute.FunctionKind, args: []const zarrow.compute.Datum, len: usize) void {
+    var out = ctx.invoke(name, kind, args, .none) catch |err| std.debug.panic("fuzz-invariant: {s} failed on null-type arguments: {s}", .{ name, @errorName(err) });
+    defer out.release();
+    if (out.dataType() != .null) std.debug.panic("fuzz-invariant: {s} of null-type arguments is not of the null type", .{name});
+    expectValid(name, out.array, len);
 }
 
 /// Round 23 kernels on any decoded array: take of the reversed rows with every third index null,

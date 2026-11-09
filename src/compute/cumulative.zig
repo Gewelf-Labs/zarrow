@@ -19,7 +19,7 @@
 //!   are subtract's (numbers keep their type, temporal types give durations, decimal128(p, s)
 //!   gives decimal128(p + 1, s)); the first `period` rows (the last `-period` for a negative
 //!   period) are null. A chunked input is concatenated first (Arrow rejects it) and gives a
-//!   chunked result of one chunk.
+//!   chunked result of one chunk. A null-type input gives a null-type result of its length.
 //! - winsorize (`WinsorizeOptions`, required as in Arrow: 0 <= lower_limit <= upper_limit <= 1,
 //!   else `InvalidOptions`) on numbers and decimals: values below the `lower_limit` quantile or
 //!   above the `upper_limit` quantile are replaced by it; the quantiles are quantile's `nearest`
@@ -75,6 +75,8 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             .signature = .{ .arity = 1, .type_check = pairwiseArg, .options_check = pairwiseOptions },
             .exec = Pairwise(std.mem.endsWith(u8, name, "_checked")).exec,
         });
+        // A null-type input gives a null-type result of its length (Arrow's null kernel).
+        try registry.setNullTypeResult(name, .vector);
     }
     try registry.registerVectorKernel("winsorize", .{
         .signature = .{ .arity = 1, .type_check = winsorizeArg, .options_check = winsorizeOptions, .result_type_fn = sameType },

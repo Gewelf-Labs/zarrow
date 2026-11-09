@@ -160,19 +160,11 @@ test "is_null family on empty and all-null inputs" {
     try common.expectInvoke(bool, &ctx, .scalar, "true_unless_null", &.{.{ .array = nulls }}, &all_null);
 }
 
-test "is_null family errors: unions and run-end encoded inputs, arity and options" {
+test "is_null family errors: arity and options" {
     const allocator = std.testing.allocator;
     var registry = try common.kernelRegistry(allocator);
     defer registry.deinit();
     var ctx = ExecContext.init(allocator, &registry);
-    const int_type = DataType{ .int32 = {} };
-    const fields = [_]common.datatype.Field{.{ .name = "a", .data_type = &int_type }};
-    const union_type = DataType{ .sparse_union = .{ .type_ids = &.{0}, .fields = &fields, .mode = .sparse } };
-    const ree_type = DataType{ .run_end_encoded = .{ .run_end_type = .{ .bit_width = 32, .signed = true }, .value_type = &int_type } };
-    for ([_]DataType{ union_type, ree_type }) |dt| {
-        try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("is_null", &.{.{ .scalar = Scalar.init(dt, .null) }}, none));
-        try std.testing.expectError(error.NoMatchingKernel, ctx.invokeAggregate("count", &.{.{ .scalar = Scalar.init(dt, .null) }}, none));
-    }
     var a = try common.makeArray(i32, allocator, &.{1});
     defer a.release();
     try std.testing.expectError(error.InvalidArity, ctx.invokeScalar("is_valid", &.{ .{ .array = a }, .{ .array = a } }, none));
@@ -248,4 +240,114 @@ test "is_nan, is_finite, is_inf and is_null with nan_is_null on floats, integers
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("is_nan", &.{.{ .array = flags }}, none));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_nan", &fa, nan_null));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_valid", &fa, nan_null));
+}
+
+/// The count aggregate of `d` with `mode`.
+fn countOf(ctx: *ExecContext, d: Datum, mode: common.core.CountMode) !i64 {
+    var out = try ctx.invokeAggregate("count", &.{d}, .{ .count = .{ .mode = mode } });
+    defer out.release();
+    return out.scalar.value.i64;
+}
+
+/// is_null / is_valid / true_unless_null of `d` follow `nulls`, and count agrees.
+fn expectLogicalNulls(ctx: *ExecContext, d: Datum, nulls: []const bool) !void {
+    const allocator = std.testing.allocator;
+    const expected = try allocator.alloc(?bool, nulls.len);
+    defer allocator.free(expected);
+    var n: i64 = 0;
+    inline for (ops) |op| {
+        for (expected, nulls) |*e, is_null| e.* = reference(op, is_null);
+        try common.expectInvoke(bool, ctx, .scalar, op, &.{d}, expected);
+    }
+    for (nulls) |x| n += @intFromBool(x);
+    try std.testing.expectEqual(@as(i64, @intCast(nulls.len)) - n, try countOf(ctx, d, .only_valid));
+    try std.testing.expectEqual(n, try countOf(ctx, d, .only_null));
+    try std.testing.expectEqual(@as(i64, @intCast(nulls.len)), try countOf(ctx, d, .all));
+}
+
+test "is_null, is_valid, true_unless_null and count on run-end encoded and union arrays use the children's nulls: sliced, chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // run_end_encode(int32 [1, 1, null, 4, 4]): is_null [F, F, T, F, F], count 4.
+    var ints = try common.makeArray(i32, allocator, &.{ 1, 1, null, 4, 4 });
+    defer ints.release();
+    var ree = try ctx.invoke("run_end_encode", .vector, &.{.{ .array = ints }}, none);
+    defer ree.release();
+    try expectLogicalNulls(&ctx, ree, &.{ false, false, true, false, false });
+    var ree_mid = try ree.array.slice(1, 3);
+    defer ree_mid.release();
+    try expectLogicalNulls(&ctx, .{ .array = ree_mid }, &.{ false, true, false });
+    var ree_chunked = try common.chunkedAt(allocator, ree.array, &.{ 2, 3 });
+    defer ree_chunked.release();
+    try expectLogicalNulls(&ctx, .{ .chunked = ree_chunked }, &.{ false, false, true, false, false });
+
+    // sparse_union<int32, string> type ids [0, 1, 0, 1] over [1, null, null, 4] and
+    // ["a", "b", null, null]: rows 2 and 3 select a null.
+    const int_type = DataType{ .int32 = {} };
+    const string_type = DataType{ .string = {} };
+    const fields = [_]common.datatype.Field{ .{ .name = "0", .data_type = &int_type }, .{ .name = "1", .data_type = &string_type } };
+    const ids = [_]i8{ 0, 1 };
+    var si = try common.makeArray(i32, allocator, &.{ 1, null, null, 4 });
+    defer si.release();
+    var ss = try common.makeStrings(.string, allocator, &.{ "a", "b", null, null });
+    defer ss.release();
+    var sb = try common.array_mod.SparseUnionBuilder.init(allocator, .{ .type_ids = &ids, .fields = &fields, .mode = .sparse }, 4);
+    defer sb.deinit();
+    for ([_]i8{ 0, 1, 0, 1 }) |t| try sb.appendTypeId(t);
+    var su = try sb.finish(&.{ si, ss });
+    defer su.release();
+    try expectLogicalNulls(&ctx, .{ .array = su }, &.{ false, false, true, true });
+    var su_tail = try su.slice(1, 3);
+    defer su_tail.release();
+    try expectLogicalNulls(&ctx, .{ .array = su_tail }, &.{ false, true, true });
+    var su_chunked = try common.chunkedAt(allocator, su, &.{1});
+    defer su_chunked.release();
+    try expectLogicalNulls(&ctx, .{ .chunked = su_chunked }, &.{ false, false, true, true });
+
+    // dense_union, offsets [0, 0, 1, 1] over [1, null] and ["a", null].
+    var di = try common.makeArray(i32, allocator, &.{ 1, null });
+    defer di.release();
+    var ds = try common.makeStrings(.string, allocator, &.{ "a", null });
+    defer ds.release();
+    var dbld = try common.array_mod.DenseUnionBuilder.init(allocator, .{ .type_ids = &ids, .fields = &fields, .mode = .dense }, 4);
+    defer dbld.deinit();
+    for ([_]i8{ 0, 1, 0, 1 }, [_]i32{ 0, 0, 1, 1 }) |t, o| try dbld.append(t, o);
+    var du = try dbld.finish(&.{ di, ds });
+    defer du.release();
+    try expectLogicalNulls(&ctx, .{ .array = du }, &.{ false, false, true, true });
+    var du_tail = try du.slice(2, 2);
+    defer du_tail.release();
+    try expectLogicalNulls(&ctx, .{ .array = du_tail }, &.{ true, true });
+
+    // A run-end encoded array over a dense union: the run's selected child decides.
+    var ends_b = try common.array_mod.RunEndEncodedBuilder.init(allocator, .{ .bit_width = 32, .signed = true }, &du.data().data_type, 4);
+    defer ends_b.deinit();
+    for ([_]i64{ 2, 3, 4, 6 }) |e| try ends_b.appendRunEnd(e);
+    var nested = try ends_b.finish(du);
+    defer nested.release();
+    try expectLogicalNulls(&ctx, .{ .array = nested }, &.{ false, false, false, true, true, true });
+
+    // Scalars keep their own null flag.
+    try common.expectInvoke(bool, &ctx, .scalar, "is_null", &.{.{ .scalar = Scalar.init(su.data().data_type, .null) }}, &.{true});
+}
+
+test "is_finite, is_inf and is_nan on duration: finite, nulls kept, sliced and chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var d = try common.makeTyped(i64, .{ .duration = .{ .unit = .millisecond } }, allocator, &.{ 1, 2, 4, null, -5 });
+    defer d.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_finite", &.{.{ .array = d }}, &.{ true, true, true, null, true });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_inf", &.{.{ .array = d }}, &.{ false, false, false, null, false });
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .array = d }}, &.{ false, false, false, null, false });
+    var tail = try d.slice(3, 2);
+    defer tail.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_finite", &.{.{ .array = tail }}, &.{ null, true });
+    var c = try common.chunkedAt(allocator, d, &.{2});
+    defer c.release();
+    try common.expectInvoke(bool, &ctx, .scalar, "is_nan", &.{.{ .chunked = c }}, &.{ false, false, false, null, false });
 }

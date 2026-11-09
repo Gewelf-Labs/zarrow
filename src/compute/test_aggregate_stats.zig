@@ -739,3 +739,98 @@ test "variance, stddev, skew and kurtosis and their hash_ forms on decimal32 / d
     const s: Datum = .{ .scalar = Scalar.init(.{ .decimal32 = .{ .precision = 5, .scale = 2 } }, .{ .decimal32 = 150 }) };
     try expectF64(&ctx, "variance", s, none, 0.0);
 }
+
+fn expectU64(ctx: *ExecContext, name: []const u8, arg: Datum, options: Options, expected: ?u64) !void {
+    var out = try agg(ctx, name, arg, options);
+    defer out.release();
+    try std.testing.expect(out.scalar.data_type == .uint64);
+    if (expected) |e| try std.testing.expectEqual(e, out.scalar.value.u64) else try std.testing.expect(out.scalar.isNull());
+}
+
+test "product of bool (uint64) and of the null type (int64): nulls, options, sliced, chunked and scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var b = try common.makeArray(bool, allocator, &.{ true, false, null, true, true });
+    defer b.release();
+    try expectU64(&ctx, "product", .{ .array = b }, none, 0);
+    try expectU64(&ctx, "product", .{ .array = b }, scalarAgg(false, 0), null);
+    var tail = try b.slice(3, 2);
+    defer tail.release();
+    try expectU64(&ctx, "product", .{ .array = tail }, none, 1);
+    var nulls_tail = try b.slice(2, 3);
+    defer nulls_tail.release();
+    try expectU64(&ctx, "product", .{ .array = nulls_tail }, none, 1);
+    try expectU64(&ctx, "product", .{ .array = nulls_tail }, scalarAgg(true, 3), null);
+    var c = try common.chunkedAt(allocator, b, &.{2});
+    defer c.release();
+    try expectU64(&ctx, "product", .{ .chunked = c }, none, 0);
+    var empty = try b.slice(0, 0);
+    defer empty.release();
+    try expectU64(&ctx, "product", .{ .array = empty }, scalarAgg(true, 0), 1);
+    try expectU64(&ctx, "product", .{ .scalar = common.scalarOf(bool, false) }, none, 0);
+
+    var n = try common.dense.nullArray(allocator, .{ .null = {} }, 4);
+    defer n.release();
+    try expectI64(&ctx, "product", .{ .array = n }, none, null);
+    try expectI64(&ctx, "product", .{ .array = n }, scalarAgg(true, 0), 1);
+    try expectI64(&ctx, "product", .{ .array = n }, scalarAgg(false, 0), null);
+    var cn = try common.chunkedAt(allocator, n, &.{1});
+    defer cn.release();
+    try expectI64(&ctx, "product", .{ .chunked = cn }, scalarAgg(true, 0), 1);
+    try std.testing.expect((try registry.resolveResultType("product", .aggregate, &.{.{ .array = n }}, none)) == .int64);
+}
+
+test "first, last and first_last on fixed_size_binary: nulls, skip_nulls, sliced and chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var fb = try common.array_mod.FixedSizeBinaryBuilder.init(allocator, 4, 5);
+    defer fb.deinit();
+    try fb.appendNull();
+    try fb.append("abcd");
+    try fb.append("abcd");
+    try fb.appendNull();
+    try fb.append("wxyz");
+    var a = try fb.finish();
+    defer a.release();
+    const dt = a.data().data_type;
+    var first = try agg(&ctx, "first", .{ .array = a }, none);
+    defer first.release();
+    try std.testing.expect(first.scalar.data_type.eql(dt));
+    try std.testing.expectEqualStrings("abcd", first.scalar.value.binary);
+    var last = try agg(&ctx, "last", .{ .array = a }, none);
+    defer last.release();
+    try std.testing.expectEqualStrings("wxyz", last.scalar.value.binary);
+    var lead = try agg(&ctx, "first", .{ .array = a }, scalarAgg(false, 1));
+    defer lead.release();
+    try std.testing.expect(lead.scalar.isNull() and lead.scalar.data_type.eql(dt));
+    var mid = try a.slice(2, 2);
+    defer mid.release();
+    var ml = try agg(&ctx, "last", .{ .array = mid }, none);
+    defer ml.release();
+    try std.testing.expectEqualStrings("abcd", ml.scalar.value.binary);
+    var c = try common.chunkedAt(allocator, a, &.{ 1, 3 });
+    defer c.release();
+    var cf = try agg(&ctx, "first", .{ .chunked = c }, none);
+    defer cf.release();
+    try std.testing.expectEqualStrings("abcd", cf.scalar.value.binary);
+    var fl = try agg(&ctx, "first_last", .{ .chunked = c }, none);
+    defer fl.release();
+    const payload = fl.scalar.payload.?.data();
+    try payload.validateFull();
+    try std.testing.expect(payload.children[0].data().data_type.eql(dt));
+    const fixed = common.array_mod.FixedSizeBinaryArray;
+    try std.testing.expectEqualStrings("abcd", try (fixed{ .data = payload.children[0].data() }).value(0));
+    try std.testing.expectEqualStrings("wxyz", try (fixed{ .data = payload.children[1].data() }).value(0));
+    // Fewer valid rows than min_count: a null of the input type in both fields.
+    var none_fl = try agg(&ctx, "first_last", .{ .array = a }, scalarAgg(true, 4));
+    defer none_fl.release();
+    try std.testing.expect(none_fl.scalar.payload.?.data().children[0].data().isNull(0));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rt = try registry.resolveResultTypeAlloc(arena.allocator(), "first_last", .aggregate, &.{.{ .array = a }}, none);
+    try std.testing.expect(rt.struct_.fields[1].data_type.eql(dt));
+}

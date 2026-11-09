@@ -573,10 +573,10 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 17), registry.kernelCount("add", .scalar));
     // float16 adds negate_checked and sign (round 20).
     try std.testing.expectEqual(@as(usize, 10), registry.kernelCount("negate_checked", .scalar));
-    try std.testing.expectEqual(@as(usize, 13), registry.kernelCount("sign", .scalar));
+    try std.testing.expectEqual(@as(usize, 14), registry.kernelCount("sign", .scalar));
     try std.testing.expectEqual(@as(usize, 30), registry.kernelCount("less", .scalar));
     try std.testing.expectEqual(@as(usize, 27), registry.kernelCount("min_element_wise", .scalar));
-    try std.testing.expectEqual(@as(usize, 16), registry.kernelCount("is_nan", .scalar));
+    try std.testing.expectEqual(@as(usize, 17), registry.kernelCount("is_nan", .scalar));
     try std.testing.expectEqual(@as(usize, 2), registry.kernelCount("count_all", .aggregate));
     // Implicit numeric casts: binary arithmetic and the comparisons, not negate / abs.
     try std.testing.expectEqual(common.core.ImplicitCast.numeric, registry.findFunction("add_checked", .scalar).?.implicit_cast);
@@ -604,10 +604,10 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 4), registry.kernelCount("binary_slice", .scalar));
     try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("count_substring", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("extract_regex", .scalar));
-    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("floor_temporal", .scalar));
+    try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("hash_sum", .hash_aggregate));
-    try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("sum", .aggregate));
+    try std.testing.expectEqual(@as(usize, 14), registry.kernelCount("sum", .aggregate));
     // Structural: one kernel per list layout (list, large_list, list_view, large_list_view,
     // fixed_size_list), per record layout (struct, sparse_union, dense_union), one for map and a
     // variadic make_struct.

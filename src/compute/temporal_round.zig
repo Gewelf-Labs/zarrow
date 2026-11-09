@@ -8,7 +8,9 @@
 //! apart, then the difference of the days of the month and of the nanoseconds of the day), as in
 //! Arrow C++. Inputs are date32, date64 and timestamp (both operands of a difference of the same
 //! type), and time32 / time64 for the rounding functions, hours_between .. nanoseconds_between and
-//! the two interval differences (a time is a timestamp of its unit on 1970-01-01, as in Arrow);
+//! the two interval differences (a time is a timestamp of its unit on 1970-01-01, as in Arrow),
+//! and duration for the rounding functions (multiples of nanosecond .. week counted from zero, as
+//! pyarrow 26: the default one day ceils 1 ms to 1 day and floors it to 0);
 //! a timestamp in another timezone is rounded (or compared) in its local time, a rounded local
 //! time mapped back to UTC (ambiguous or nonexistent: `InvalidInput`, as Arrow). Null handling is
 //! intersection.
@@ -74,9 +76,16 @@ fn betweenType(comptime b: Between) DataType {
     };
 }
 
-/// Register the rounding and difference functions for date32, date64, timestamp, time32 and time64.
+/// Register the rounding and difference functions for date32, date64, timestamp, time32 and time64,
+/// and the rounding functions for duration.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
     @setEvalBranchQuota(10_000);
+    inline for (comptime std.meta.tags(RoundOp)) |op| {
+        try registry.registerScalarKernel(@tagName(op), .{
+            .signature = .{ .arity = 1, .type_check = dense.argsOfType(.duration, 1), .options_check = roundOptions, .result_type_fn = firstType },
+            .exec = Round(op).exec,
+        });
+    }
     inline for (temporal_tags) |tag| {
         inline for (comptime std.meta.tags(RoundOp)) |op| {
             try registry.registerScalarKernel(@tagName(op), .{
@@ -139,6 +148,7 @@ fn nsPerTick(dt: DataType) i64 {
         .date64 => return 1_000_000,
         .timestamp => |ts| ts.unit,
         .time32, .time64 => |t| t.unit,
+        .duration => |d| d.unit,
         else => unreachable,
     };
     return switch (unit) {
@@ -282,13 +292,27 @@ const Plan = struct {
     }
 };
 
+/// The rounding plan of `o` for values of `dt`. A duration counts multiples from zero (a week is
+/// seven days from zero, no weekday shift) and takes only the units nanosecond .. week, without
+/// `calendar_based_origin` (`InvalidOptions`; Arrow: "Duration values can only be rounded using
+/// units from nanoseconds through weeks", "calendar_based_origin is not supported for duration
+/// inputs").
+fn planFor(o: RoundTemporalOptions, dt: DataType) KernelError!Plan {
+    var p = try Plan.init(o, nsPerTick(dt));
+    if (dt == .duration) {
+        if (!p.fixed() or o.calendar_based_origin) return error.InvalidOptions;
+        p.shift = 0;
+    }
+    return p;
+}
+
 fn Round(comptime op: RoundOp) type {
     return struct {
         /// Round each row (array, chunked or scalar) to a multiple of the unit.
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 1) return error.InvalidArity;
             const o: RoundTemporalOptions = if (options == .round_temporal) options.round_temporal else .{};
-            _ = try Plan.init(o, nsPerTick(args[0].dataType()));
+            _ = try planFor(o, args[0].dataType());
             // A zoned timestamp rounds its local time; the result maps back to UTC (an ambiguous
             // or nonexistent local result is InvalidInput, as Arrow).
             if (temporal_zone.zoneName(args[0].dataType())) |name| {
@@ -319,7 +343,7 @@ fn Round(comptime op: RoundOp) type {
             defer arr.release();
             const data = arr.data();
             const o: RoundTemporalOptions = if (options == .round_temporal) options.round_temporal else .{};
-            const p = try Plan.init(o, nsPerTick(data.data_type));
+            const p = try planFor(o, data.data_type);
             return switch (data.data_type) {
                 .date32, .time32 => run(i32, ctx, data, len, p),
                 else => run(i64, ctx, data, len, p),
