@@ -519,3 +519,34 @@ test "round_binary on decimal128 / decimal256 with decimal digits of any width a
     defer fd.release();
     try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .array = a }, .{ .array = fd } }, none, &.{ 120, -360, null, 12340, 0 });
 }
+
+test "round_binary with bool digits (cast to int32 0 / 1): nulls, sliced, chunked and scalar (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var x = try common.makeArray(f64, allocator, &.{ 1.25, 2.5, null, 1.35 });
+    defer x.release();
+    var b = try common.makeArray(bool, allocator, &.{ true, false, true, null });
+    defer b.release();
+    // round_binary([1.25, 2.5, null, 1.35], [True, False, True, null]) -> [1.2, 2.0, null, null].
+    try common.expectInvokeWith(f64, &ctx, "round_binary", &.{ .{ .array = x }, .{ .array = b } }, none, &.{ 1.2, 2.0, null, null });
+    var xs = try x.slice(1, 3);
+    defer xs.release();
+    var bs = try b.slice(1, 3);
+    defer bs.release();
+    try common.expectInvokeWith(f64, &ctx, "round_binary", &.{ .{ .array = xs }, .{ .array = bs } }, none, &.{ 2.0, null, null });
+    var bc = try common.chunkedAt(allocator, b, &.{2});
+    defer bc.release();
+    var out = try ctx.invokeScalar("round_binary", &.{ .{ .array = x }, .{ .chunked = bc } }, none);
+    defer out.release();
+    try std.testing.expectEqual(@as(usize, 2), out.chunked.numChunks());
+    try common.expectInvokeWith(f64, &ctx, "round_binary", &.{ .{ .array = x }, .{ .chunked = bc } }, none, &.{ 1.2, 2.0, null, null });
+    try common.expectInvokeWith(f64, &ctx, "round_binary", &.{ .{ .array = x }, .{ .scalar = common.scalarOf(bool, true) } }, none, &.{ 1.2, 2.5, null, 1.4 });
+    // An integer input with 0 / 1 digits keeps its values (round_binary(int32 [15, 25], [T, F])).
+    var ints = try common.makeArray(i32, allocator, &.{ 15, 25 });
+    defer ints.release();
+    var tf = try common.makeArray(bool, allocator, &.{ true, false });
+    defer tf.release();
+    try common.expectInvokeWith(i32, &ctx, "round_binary", &.{ .{ .array = ints }, .{ .array = tf } }, none, &.{ 15, 25 });
+}

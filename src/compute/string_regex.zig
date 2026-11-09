@@ -31,7 +31,8 @@
 //!   escapes the next one; case-sensitive patterns of the forms `%x%`, `x%`, `%x` are plain
 //!   substring / prefix / suffix tests, as Arrow, so a backslash there is literal).
 //! Layouts: string, large_string, binary, large_binary as Arrow, plus string_view and binary_view
-//! (not registered by Arrow). Null handling is intersection. Every input chunk passes
+//! (not registered by Arrow); count_substring_regex and find_substring_regex also take
+//! fixed_size_binary (as Arrow, int32 results). Null handling is intersection. Every input chunk passes
 //! `validateLayout`; a pattern that does not compile is `InvalidOptions`.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
@@ -73,6 +74,13 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
                 .exec = Extractor(which).exec,
             });
         }
+    }
+    // fixed_size_binary rows as Latin-1 binary rows (Arrow), int32 results.
+    inline for (.{ "count_substring_regex", "find_substring_regex" }, .{ Search(.count), Search(.find) }) |name, S| {
+        try registry.registerScalarKernel(name, .{
+            .signature = .{ .arity = 1, .type_check = dense.argsOfType(.fixed_size_binary, 1), .options_check = matchOptions, .result_type_fn = dense.resultTypeOf(.{ .int32 = {} }) },
+            .exec = string_transform.FixedVia(S.chunk, false).exec,
+        });
     }
 }
 

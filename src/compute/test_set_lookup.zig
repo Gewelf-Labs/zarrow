@@ -219,7 +219,8 @@ test "set lookup errors: options, value set type, unsupported types and malforme
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("index_in", &args, lookup(fsb, .match)));
     var n = try common.datumBuildNullLike(.{ .null = {} }, 2);
     defer n.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("is_in", &.{n}, lookup(n, .match)));
+    // The null type is all null rows (see the null-type test).
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{n}, lookup(n, .match), &.{ true, true });
     try std.testing.expectError(error.InvalidArity, ctx.invokeScalar("is_in", &.{ args[0], args[0] }, lookup(args[0], .match)));
     const short = [_]i32{1};
     const bufs = [_]common.SharedBuffer{ .empty, .fromSlice(std.mem.sliceAsBytes(&short)) };
@@ -302,4 +303,58 @@ test "set lookup casts a value set of another type and takes decimal, fixed_size
     var ivs = try common.makeTyped(i128, mdn, allocator, &.{7});
     defer ivs.release();
     try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = iv }}, lookup(.{ .array = ivs }, .match), &.{ false, true });
+}
+
+test "is_in and index_in on a null-type input: every null matching behavior, null-type and typed value sets, sliced, chunked and scalar (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const null_type = DataType{ .null = {} };
+    var n = try common.dense.nullArray(allocator, null_type, 3);
+    defer n.release();
+    var set_nulls = try common.dense.nullArray(allocator, null_type, 2);
+    defer set_nulls.release();
+    var set_empty = try common.dense.nullArray(allocator, null_type, 0);
+    defer set_empty.release();
+    var set_typed = try common.makeArray(i64, allocator, &.{ 1, null });
+    defer set_typed.release();
+    const args = [_]Datum{.{ .array = n }};
+    const nulls: Datum = .{ .array = set_nulls };
+    // is_in(nulls(3), value_set=nulls(2)) -> [true, true, true]; index_in -> int32 [0, 0, 0];
+    // skip_nulls=True (skip) -> false / null; an empty value set -> false / null.
+    try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(nulls, .match), &.{ true, true, true });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(nulls, .match), &.{ 0, 0, 0 });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(nulls, .skip), &.{ false, false, false });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(nulls, .skip), &.{ null, null, null });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(.{ .array = set_empty }, .match), &.{ false, false, false });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(.{ .array = set_empty }, .match), &.{ null, null, null });
+    // emit_null and inconclusive: a null row gives null, as for any type (Arrow C++).
+    inline for (.{ NullMatchingBehavior.emit_null, NullMatchingBehavior.inconclusive }) |b| {
+        try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(nulls, b), &.{ null, null, null });
+        try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(nulls, b), &.{ null, null, null });
+    }
+    // A typed value set: is_in(nulls(3), value_set=[1, null]) -> all true, index_in -> 1.
+    try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(.{ .array = set_typed }, .match), &.{ true, true, true });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(.{ .array = set_typed }, .match), &.{ 1, 1, 1 });
+    // Sliced, chunked (input and value set) and scalar inputs.
+    var tail = try n.slice(1, 2);
+    defer tail.release();
+    try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = tail }}, lookup(nulls, .match), &.{ 0, 0 });
+    var chunks = try common.chunkedAt(allocator, n, &.{2});
+    defer chunks.release();
+    var set_chunks = try common.chunkedAt(allocator, set_nulls, &.{1});
+    defer set_chunks.release();
+    var out = try ctx.invokeScalar("is_in", &.{.{ .chunked = chunks }}, lookup(.{ .chunked = set_chunks }, .match));
+    defer out.release();
+    try std.testing.expectEqual(@as(usize, 2), out.chunked.numChunks());
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .chunked = chunks }}, lookup(.{ .chunked = set_chunks }, .match), &.{ true, true, true });
+    var sc = try ctx.invokeScalar("index_in", &.{.{ .scalar = Scalar.init(null_type, .null) }}, lookup(nulls, .match));
+    defer sc.release();
+    try std.testing.expectEqual(@as(i32, 0), sc.scalar.value.i32);
+    // A value set of a type that is no key is still rejected.
+    const item = DataType{ .int64 = {} };
+    var lists = try common.datumBuildNullLike(.{ .list = .{ .value_field = .{ .name = "item", .data_type = &item } } }, 1);
+    defer lists.release();
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("is_in", &args, lookup(lists, .match)));
 }

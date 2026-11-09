@@ -18,7 +18,7 @@
 //!   the nulls in both orders: `at_end` gives values, NaNs, nulls; `at_start` nulls, NaNs,
 //!   values. Arrow 26 has no separate NaN placement, so neither do the options.
 //! - partition_nth_indices (`PartitionNthOptions`: pivot <= length, else `InvalidOptions`;
-//!   `null_placement`): the row a stable ascending sort puts at `pivot` is there, every row
+//!   `null_placement`; a null-type column gives 0 .. n-1 for any pivot, as pyarrow 26): the row a stable ascending sort puts at `pivot` is there, every row
 //!   before it sorts before it and every row after it after it (rows are ordered with ties
 //!   broken by row index, so that row is unique). One radix column: an MSD radix selection over
 //!   packed (key, row) integers and one partition pass, O(n); other columns: quickselect
@@ -80,7 +80,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         .exec = sortIndicesExec,
     });
     try registry.registerVectorKernel("partition_nth_indices", .{
-        .signature = .{ .arity = 1, .type_check = sortable, .options_check = partitionOptions, .result_type_fn = dense.resultTypeOf(uint64_type) },
+        .signature = .{ .arity = 1, .type_check = sortableOrNull, .options_check = partitionOptions, .result_type_fn = dense.resultTypeOf(uint64_type) },
         .exec = partitionExec,
     });
     try registry.registerVectorKernel("select_k_unstable", .{
@@ -148,8 +148,8 @@ fn sortable(args: []const Datum) bool {
     return true;
 }
 
-/// `sortable`, also with null-type columns (sort_indices / array_sort_indices: every row of one
-/// ties, as pyarrow 26).
+/// `sortable`, also with null-type columns (sort_indices / array_sort_indices /
+/// partition_nth_indices: every row of one ties, as pyarrow 26).
 fn sortableOrNull(args: []const Datum) bool {
     if (args.len == 0) return false;
     if (args.len == 1 and args[0].isTabular()) return true;
@@ -925,10 +925,14 @@ fn partitionExec(ctx: *ExecContext, args: []const Datum, options: Options) Kerne
     const o = options.partition_nth;
     var cols = try Columns.init(ctx, &.{.{ .datum = args[0], .placement = o.null_placement }});
     defer cols.deinit();
-    if (o.pivot > cols.len) return error.InvalidOptions;
+    // A null-type column adds no sort column: every row ties, 0 .. n-1 for any pivot (pyarrow 26).
+    const ties = cols.cols.len == 0;
+    if (!ties and o.pivot > cols.len) return error.InvalidOptions;
     const idx = ctx.allocator.alloc(u32, cols.len) catch return error.OutOfMemory;
     defer ctx.allocator.free(idx);
-    if (!(cols.cols.len == 1 and try partitionRadix(ctx.allocator, &cols.cols[0], idx, o.pivot))) {
+    if (ties) {
+        for (idx, 0..) |*d, i| d.* = @intCast(i);
+    } else if (!(cols.cols.len == 1 and try partitionRadix(ctx.allocator, &cols.cols[0], idx, o.pivot))) {
         for (idx, 0..) |*d, i| d.* = @intCast(i);
         if (o.pivot < idx.len) nthElement(u32, idx, o.pivot, &cols, Columns.lessThan);
     }

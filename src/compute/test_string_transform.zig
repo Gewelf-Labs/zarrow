@@ -459,9 +459,9 @@ test "string transform errors: options, invalid UTF-8 rows, negative and huge re
     var masked = try common.borrowedArray(i64, allocator, &masked_counts, &no_bits);
     defer masked.release();
     try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ sargs[0], .{ .array = masked } }, none, &.{null});
-    var i32s = try common.makeArray(i32, allocator, &.{2});
-    defer i32s.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_repeat", &.{ sargs[0], .{ .array = i32s } }, none));
+    var f64s = try common.makeArray(f64, allocator, &.{2});
+    defer f64s.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_repeat", &.{ sargs[0], .{ .array = f64s } }, none));
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_slice", &sargs, .{ .slice = .{ .start = 0 } }));
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_reverse", &sargs, none));
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("ascii_lpad", &.{.{ .array = b }}, pad(3, " ")));
@@ -826,4 +826,68 @@ test "string transform fixed_size_binary: binary_length, binary_slice, binary_re
         try common.expectInvokeWith(i32, &ctx, "find_substring", &.{.{ .array = arr }}, match("\xc3\xa9", false), finds);
         try common.expectInvokeWith(i32, &ctx, "binary_length", &.{.{ .array = arr }}, none, lens);
     }
+}
+
+test "binary_repeat with counts of every integer type: nulls, negative counts, sliced, chunked, scalars and dictionaries (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    inline for (.{ TypeTag.string, TypeTag.large_string, TypeTag.binary, TypeTag.large_binary }) |tag| {
+        const dt = @unionInit(DataType, @tagName(tag), {});
+        var v = try common.makeStrings(tag, allocator, &.{ "ab", null, "ba", "c" });
+        defer v.release();
+        inline for (.{ i8, i16, i32, u8, u16, u32, u64 }) |T| {
+            // binary_repeat(["ab", null, "ba", "c"], [2, 1, null, 0]) -> ["abab", null, null, ""].
+            var n = try common.makeArray(T, allocator, &.{ 2, 1, null, 0 });
+            defer n.release();
+            try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = v }, .{ .array = n } }, none, &.{ "abab", null, null, "" });
+            try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = v }, .{ .scalar = common.scalarOf(T, 3) } }, none, &.{ "ababab", null, "bababa", "ccc" });
+            var out = try ctx.invokeScalar("binary_repeat", &.{ .{ .array = v }, .{ .array = n } }, none);
+            defer out.release();
+            try std.testing.expect(out.dataType().eql(dt));
+            // Sliced values and counts (rows 1..4).
+            var sv = try v.slice(1, 3);
+            defer sv.release();
+            var sn = try n.slice(1, 3);
+            defer sn.release();
+            try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = sv }, .{ .array = sn } }, none, &.{ null, null, "" });
+            // Chunked counts: a chunked result.
+            var cn = try common.chunkedAt(allocator, n, &.{1});
+            defer cn.release();
+            var chunked = try ctx.invokeScalar("binary_repeat", &.{ .{ .array = v }, .{ .chunked = cn } }, none);
+            defer chunked.release();
+            try std.testing.expectEqual(@as(usize, 2), chunked.chunked.numChunks());
+            const rows = try common.collectStrings(allocator, chunked);
+            defer allocator.free(rows);
+            try common.expectStrings(&.{ "abab", null, null, "" }, rows);
+        }
+        // A negative count in a valid row is InvalidInput ("Repeat count must be a non-negative
+        // integer"); in a null row it is not looked at.
+        var neg = try common.makeArray(i8, allocator, &.{ 2, 1, -1, 1 });
+        defer neg.release();
+        try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("binary_repeat", &.{ .{ .array = v }, .{ .array = neg } }, none));
+        var neg_null_row = try common.makeArray(i16, allocator, &.{ 2, -1, 1, 1 });
+        defer neg_null_row.release();
+        var masked_v = try common.makeStrings(tag, allocator, &.{ "ab", null, null, null });
+        defer masked_v.release();
+        try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = masked_v }, .{ .array = neg_null_row } }, none, &.{ "abab", null, null, null });
+    }
+    // A uint64 count past int64 fails the cast (pyarrow 26: "Integer value ... not in range").
+    var s = try common.makeStrings(.string, allocator, &.{"ab"});
+    defer s.release();
+    var big = try common.makeArray(u64, allocator, &.{std.math.maxInt(u64)});
+    defer big.release();
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("binary_repeat", &.{ .{ .array = s }, .{ .array = big } }, none));
+    // dictionary<string> decodes first: binary_repeat(dict ["ab", null, "ba"], int32 [2, 1, null]).
+    var dict = try common.makeStrings(.string, allocator, &.{ "ab", "ba" });
+    defer dict.release();
+    var d = try common.makeDictionary(allocator, dict, .{ .bit_width = 8, .signed = true }, &.{ 0, null, 1 });
+    defer d.release();
+    var counts = try common.makeArray(i32, allocator, &.{ 2, 1, null });
+    defer counts.release();
+    var dout = try ctx.invokeScalar("binary_repeat", &.{ .{ .array = d }, .{ .array = counts } }, none);
+    defer dout.release();
+    try std.testing.expect(dout.dataType() == .string);
+    try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = d }, .{ .array = counts } }, none, &.{ "abab", null, null });
 }

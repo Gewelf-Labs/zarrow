@@ -29,7 +29,15 @@
     duration;
   - `round_binary` on decimal128 / decimal256 with decimal (or float) digits;
   - `run_end_encode` / `run_end_decode` on list, large_list, list_view, large_list_view,
-    fixed_size_list, struct and map (rows compared by `integration/compare.zig`'s `rowsEqual`).
+    fixed_size_list, struct and map (rows compared by `integration/compare.zig`'s `rowsEqual`);
+  - `binary_join_element_wise` on binary and large_binary (any `null_replacement` bytes);
+  - `binary_repeat` with counts of any integer type (array or scalar) and on dictionary<string>
+    (decoded first, string result);
+  - null-type arguments in `if_else`, `choose` (null-type result), `is_in` / `index_in` (all null
+    rows: `is_in(null, value_set = nulls)` is all true, `index_in` all 0) and
+    `partition_nth_indices` (0 .. n-1 for any pivot); `choose` takes a bool index as 0 / 1;
+  - `count_substring_regex` / `find_substring_regex` on fixed_size_binary;
+  - `round_binary` with bool digits (cast to int32).
 - Added C ABI interop guides:
   - `docs/interop-c-abi.md`
   - `docs/interop-c-abi-zh.md`

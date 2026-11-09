@@ -694,3 +694,56 @@ test "string errors: invalid UTF-8 rows, options, types, arity and malformed inp
     defer broken.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("utf8_upper", &.{.{ .array = broken }}, none));
 }
+
+test "binary_join_element_wise on binary and large_binary: nulls, null handling, sliced, chunked and scalar separators (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    inline for (.{ TypeTag.binary, TypeTag.large_binary }) |tag| {
+        const dt = @unionInit(DataType, @tagName(tag), {});
+        var a = try common.makeStrings(tag, allocator, &.{ "x", "a", null, "\xff" });
+        defer a.release();
+        var b = try common.makeStrings(tag, allocator, &.{ "y", "b", "c", "\x00" });
+        defer b.release();
+        var sep = try common.makeStrings(tag, allocator, &.{ "+", "-", "-", null });
+        defer sep.release();
+        const args = [_]Datum{ .{ .array = a }, .{ .array = b }, .{ .array = sep } };
+        // binary_join_element_wise([b"a", null], [b"b", b"c"], [b"-", b"-"]) -> [b"a-b", null].
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &args, none, &.{ "x+y", "a-b", null, null });
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &args, .{ .join = .{ .null_handling = .skip } }, &.{ "x+y", "a-b", "c", null });
+        // Any replacement bytes on the binary layouts (the string layouts require UTF-8).
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &args, .{ .join = .{ .null_handling = .replace, .null_replacement = "\xfe" } }, &.{ "x+y", "a-b", "\xfe-c", null });
+        var out = try ctx.invokeScalar("binary_join_element_wise", &args, none);
+        defer out.release();
+        try std.testing.expect(out.dataType().eql(dt));
+        // One and two arguments: the separator alone gives "", one value is itself.
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &.{.{ .array = sep }}, none, &.{ "", "", "", null });
+        const dash: Datum = .{ .scalar = Scalar.init(dt, .{ .binary = "-" }) };
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &.{ .{ .array = a }, dash }, none, &.{ "x", "a", null, "\xff" });
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &.{ .{ .array = a }, .{ .array = b }, dash }, none, &.{ "x-y", "a-b", null, "\xff-\x00" });
+        // Sliced inputs (rows 1..4).
+        var sa = try a.slice(1, 3);
+        defer sa.release();
+        var sb = try b.slice(1, 3);
+        defer sb.release();
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &.{ .{ .array = sa }, .{ .array = sb }, dash }, none, &.{ "a-b", null, "\xff-\x00" });
+        // Chunked against an array: a chunked result cut where the input is.
+        var chunks = try common.chunkedAt(allocator, a, &.{2});
+        defer chunks.release();
+        var joined = try ctx.invokeScalar("binary_join_element_wise", &.{ .{ .chunked = chunks }, .{ .array = b }, dash }, none);
+        defer joined.release();
+        try std.testing.expectEqual(@as(usize, 2), joined.chunked.numChunks());
+        const rows = try common.collectStrings(allocator, joined);
+        defer allocator.free(rows);
+        try common.expectStrings(&.{ "x-y", "a-b", null, "\xff-\x00" }, rows);
+        // A null scalar separator: every row null.
+        try common.expectInvokeStrings(&ctx, "binary_join_element_wise", &.{ .{ .array = a }, .{ .scalar = Scalar.init(dt, .null) } }, none, &.{ null, null, null, null });
+    }
+    // Layouts do not mix (Arrow: no kernel for binary with large_binary or string).
+    var bin = try common.makeStrings(.binary, allocator, &.{"a"});
+    defer bin.release();
+    var str = try common.makeStrings(.string, allocator, &.{"a"});
+    defer str.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_join_element_wise", &.{ .{ .array = bin }, .{ .array = str } }, none));
+}

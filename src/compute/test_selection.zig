@@ -687,3 +687,84 @@ test "take and filter errors: index bounds, index and predicate types, lengths, 
     try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("filter", &.{ .{ .array = pred }, .{ .array = pred } }, .{ .take = .{} }));
     try std.testing.expectError(error.InvalidArity, ctx.invokeVector("take", &.{.{ .array = v }}, none));
 }
+
+/// Invoke scalar `name` and expect a null-type result of `len` rows (`chunks` result chunks, 0
+/// for an array, null for a scalar).
+fn expectNullType(ctx: *ExecContext, name: []const u8, args: []const Datum, len: usize, chunks: ?usize) !void {
+    var out = try ctx.invokeScalar(name, args, none);
+    defer out.release();
+    try std.testing.expect(out.dataType() == .null);
+    try std.testing.expect((try ctx.registry.resolveResultType(name, .scalar, args, none)) == .null);
+    switch (out) {
+        .scalar => try std.testing.expect(chunks == null),
+        .array => |a| {
+            try std.testing.expectEqual(@as(?usize, 0), chunks);
+            try a.data().validateFull();
+            try std.testing.expectEqual(len, a.data().length);
+        },
+        .chunked => |c| {
+            try std.testing.expectEqual(chunks, c.numChunks());
+            try std.testing.expectEqual(len, c.len());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "if_else and choose with null-type arguments and bool indices: nulls, sliced, chunked and scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const null_type = DataType{ .null = {} };
+    var n = try common.dense.nullArray(allocator, null_type, 3);
+    defer n.release();
+    var b = try common.makeArray(bool, allocator, &.{ true, false, null });
+    defer b.release();
+    const nd: Datum = .{ .array = n };
+    const ns: Datum = .{ .scalar = Scalar.init(null_type, .null) };
+    // if_else(bool, null, null) -> null; choose(null, null, null) and choose(null, null) -> null.
+    try expectNullType(&ctx, "if_else", &.{ .{ .array = b }, nd, nd }, 3, 0);
+    try expectNullType(&ctx, "if_else", &.{ nd, nd, nd }, 3, 0);
+    try expectNullType(&ctx, "choose", &.{ nd, nd, nd }, 3, 0);
+    try expectNullType(&ctx, "choose", &.{ nd, nd }, 3, 0);
+    try expectNullType(&ctx, "if_else", &.{ .{ .scalar = common.scalarOf(bool, true) }, ns, ns }, 1, null);
+    // Null-type values: no index is checked (choose([5], null, null) -> [null]).
+    var oob = try common.makeArray(i64, allocator, &.{ 5, -1, 0 });
+    defer oob.release();
+    try expectNullType(&ctx, "choose", &.{ .{ .array = oob }, nd, nd }, 3, 0);
+    // Sliced and chunked.
+    var tail = try b.slice(1, 2);
+    defer tail.release();
+    var ntail = try n.slice(1, 2);
+    defer ntail.release();
+    try expectNullType(&ctx, "if_else", &.{ .{ .array = tail }, .{ .array = ntail }, ns }, 2, 0);
+    var bc = try common.chunkedAt(allocator, b, &.{1});
+    defer bc.release();
+    try expectNullType(&ctx, "if_else", &.{ .{ .chunked = bc }, nd, nd }, 3, 2);
+    try expectNullType(&ctx, "choose", &.{ .{ .chunked = bc }, nd, nd }, 3, 2);
+
+    // A null-type cond or index with typed values: every row null of the values' type.
+    var x = try common.makeArray(i64, allocator, &.{ 1, 2, 3 });
+    defer x.release();
+    var y = try common.makeArray(i64, allocator, &.{ 4, 5, 6 });
+    defer y.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "if_else", &.{ nd, .{ .array = x }, .{ .array = y } }, &.{ null, null, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "choose", &.{ nd, .{ .array = x } }, &.{ null, null, null });
+    // if_else(bool, null, int64) -> int64 [null, 2, null].
+    try common.expectInvoke(i64, &ctx, .scalar, "if_else", &.{ .{ .array = b }, nd, .{ .array = x } }, &.{ null, 2, null });
+
+    // choose with a bool index (0 / 1): choose([T, F, null], [T, F, null], [T, F, null]) ->
+    // [true, false, null]; choose([T, F, null], [1, 2, 3], [4, 5, 6]) -> [4, 2, null].
+    try common.expectInvoke(bool, &ctx, .scalar, "choose", &.{ .{ .array = b }, .{ .array = b }, .{ .array = b } }, &.{ true, false, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "choose", &.{ .{ .array = b }, .{ .array = x }, .{ .array = y } }, &.{ 4, 2, null });
+    try common.expectInvoke(i64, &ctx, .scalar, "choose", &.{ .{ .array = tail }, .{ .scalar = common.scalarOf(i64, 7) }, .{ .scalar = common.scalarOf(i64, 8) } }, &.{ 7, null });
+    var chosen = try ctx.invokeScalar("choose", &.{ .{ .chunked = bc }, .{ .array = x }, .{ .array = y } }, none);
+    defer chosen.release();
+    try std.testing.expectEqual(@as(usize, 2), chosen.chunked.numChunks());
+    try common.expectInvoke(i64, &ctx, .scalar, "choose", &.{ .{ .chunked = bc }, .{ .array = x }, .{ .array = y } }, &.{ 4, 2, null });
+    var picked = try ctx.invokeScalar("choose", &.{ .{ .scalar = common.scalarOf(bool, true) }, .{ .scalar = common.scalarOf(i64, 1) }, .{ .scalar = common.scalarOf(i64, 2) } }, none);
+    defer picked.release();
+    try std.testing.expectEqual(@as(i64, 2), picked.scalar.value.i64);
+    // A true index with one value is out of range (pyarrow 26: IndexError).
+    try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("choose", &.{ .{ .array = b }, .{ .array = x } }, none));
+}

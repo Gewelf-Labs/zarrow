@@ -604,6 +604,9 @@ test "registerAll registers every kernel family function name with its kind" {
     try std.testing.expectEqual(@as(usize, 4), registry.kernelCount("binary_slice", .scalar));
     try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("count_substring", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("extract_regex", .scalar));
+    try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("count_substring_regex", .scalar));
+    try std.testing.expectEqual(@as(usize, 7), registry.kernelCount("find_substring_regex", .scalar));
+    try std.testing.expectEqual(@as(usize, 5), registry.kernelCount("binary_join_element_wise", .scalar));
     try std.testing.expectEqual(@as(usize, 6), registry.kernelCount("floor_temporal", .scalar));
     try std.testing.expectEqual(@as(usize, 1), registry.kernelCount("is_in", .scalar));
     try std.testing.expectEqual(@as(usize, 12), registry.kernelCount("hash_sum", .hash_aggregate));
