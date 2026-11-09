@@ -21,9 +21,9 @@ implementing code and a test; `python -I tools/check_doc_evidence.py` checks the
 | Integration JSON writer: Arrow C++'s member order and names; one dictionary per id (deltas folded in); sliced batches written as their rows | yes | `src/integration/json_writer.zig:44` | `src/integration/test_json.zig:"integration json writes sliced batches as their logical rows"`, `src/integration/test_json.zig:"integration json reads and round-trips null, bool, integer and float columns"` |
 | Logical comparison with Arrow's equality (dictionary ids and list / map internal field names ignored, metadata compared) and a message naming the first difference | yes | `src/integration/compare.zig:47`, `src/integration/compare.zig:108` | `src/integration/test_json.zig:"integration compare follows Arrow's type equality"`, `src/integration/test_json.zig:"integration golden check reports a case whose IPC files differ from its JSON"` |
 | Tester with archery's commands (`--integration --mode=VALIDATE / JSON_TO_ARROW / ARROW_TO_JSON`, `--stream-to-file`, `--file-to-stream`) | yes | `tools/integration_runner.zig:31` | `build.zig:"integration-runner"`, `tools/interop/integration_pyarrow_check.py:1` (pyarrow cross-check, below) |
-| Golden-file check: JSON, IPC file and IPC stream agree; JSON through zarrow's stream and file writers; file to stream to file; JSON writer output read back | yes | `src/integration/golden.zig:63`, `tools/integration_runner.zig:159` | `src/integration/test_json.zig:"integration golden check passes on the arrow-testing cases in src/ipc/testdata"`, `build.zig:"integration-golden"` |
-| Big-endian gold files (`1.0.0-bigendian`) | no (rejected as expected: zarrow reads little-endian IPC only, `UnsupportedType`) | `src/ipc/stream_reader.zig:1222` | `build.zig:"integration-golden"` |
-| Unsigned dictionary index types (`generated_dictionary_unsigned`; uint8 .. uint64) in the IPC reader and writer and the C data interface, every index bounded by its dictionary when a batch is decoded or imported | yes | `src/ipc/stream_reader.zig:1613`, `src/ipc/stream_reader.zig:1876`, `src/array/array_data.zig:489` | `src/ipc/stream_reader.zig:"stream and file readers bound unsigned dictionary indices by the dictionary length"`, `src/ipc/stream_writer.zig:"ipc writer writes a dictionary with an unsigned index type"`, `src/ffi/c_data.zig:"c data unsigned dictionary index formats round trip and bound every index"`, `src/integration/test_json.zig:"integration golden check passes on generated_dictionary_unsigned with unsigned index types"` |
+| Golden-file check: JSON, IPC file and IPC stream agree; JSON through zarrow's stream and file writers; file to stream to file; JSON writer output read back | yes | `src/integration/golden.zig:61`, `tools/integration_runner.zig:159` | `src/integration/test_json.zig:"integration golden check passes on the arrow-testing cases in src/ipc/testdata"`, `build.zig:"integration-golden"` |
+| Big-endian gold files (`1.0.0-bigendian`, 22 cases) and big-endian IPC in general: the stream and file readers byte-swap every body buffer to little-endian while decoding (as Arrow C++ `IpcReadOptions::ensure_native_endian`, the default) and present a little-endian schema; `endianness_mode = .strict` rejects them (`UnsupportedType`). Swapped before validation, compressed bodies after decompression, zero-copy reads copy only the swapped buffers; a buffer that is not a whole number of values is `InvalidBody` | yes | `src/ipc/stream_reader.zig:114`, `src/ipc/file_reader.zig:19`, `src/ipc/stream_reader.zig:2134`, `src/ipc/stream_writer.zig:110` | `src/ipc/stream_reader.zig:"ipc stream reader byte-swaps a big-endian stream of every layout to the little-endian values"`, `src/ipc/stream_reader.zig:"ipc stream reader decompresses then byte-swaps an LZ4-compressed big-endian stream"`, `src/ipc/stream_reader.zig:"ipc stream reader reads big-endian rewrites of the Arrow C++ gold streams equal to the originals"`, `src/ipc/stream_reader.zig:"ipc stream reader rejects a big-endian buffer that is not a whole number of values, and corruptions fail cleanly"`, `src/ipc/file_reader.zig:"ipc file reader reads a big-endian file equal to the little-endian original"`, `build.zig:"integration-golden"` |
+| Unsigned dictionary index types (`generated_dictionary_unsigned`; uint8 .. uint64) in the IPC reader and writer and the C data interface, every index bounded by its dictionary when a batch is decoded or imported | yes | `src/ipc/stream_reader.zig:1618`, `src/ipc/stream_reader.zig:1886`, `src/array/array_data.zig:489` | `src/ipc/stream_reader.zig:"stream and file readers bound unsigned dictionary indices by the dictionary length"`, `src/ipc/stream_writer.zig:"ipc writer writes a dictionary with an unsigned index type"`, `src/ffi/c_data.zig:"c data unsigned dictionary index formats round trip and bound every index"`, `src/integration/test_json.zig:"integration golden check passes on generated_dictionary_unsigned with unsigned index types"` |
 
 ## Running it
 
@@ -71,28 +71,28 @@ on Zig 0.16.0 (identical tables), arrow-testing 5a26d35785ff8761e56d79eebff971f6
 | 0.14.1 | generated_primitive_no_batches | pass |  |
 | 0.14.1 | generated_primitive_zerolength | pass |  |
 | 0.17.1 | generated_union | pass |  |
-| 1.0.0-bigendian | generated_custom_metadata | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_datetime | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_decimal | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_decimal256 | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_dictionary | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_dictionary_unsigned | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_duplicate_fieldnames | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_extension | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_interval | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_map | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_map_non_canonical | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_nested | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_nested_dictionary | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_nested_large_offsets | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_null | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_null_trivial | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_primitive | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_primitive_large_offsets | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_primitive_no_batches | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_primitive_zerolength | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_recursive_nested | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
-| 1.0.0-bigendian | generated_union | rejected-as-expected | file: UnsupportedType, stream: UnsupportedType |
+| 1.0.0-bigendian | generated_custom_metadata | pass |  |
+| 1.0.0-bigendian | generated_datetime | pass |  |
+| 1.0.0-bigendian | generated_decimal | pass |  |
+| 1.0.0-bigendian | generated_decimal256 | pass |  |
+| 1.0.0-bigendian | generated_dictionary | pass |  |
+| 1.0.0-bigendian | generated_dictionary_unsigned | pass |  |
+| 1.0.0-bigendian | generated_duplicate_fieldnames | pass |  |
+| 1.0.0-bigendian | generated_extension | pass |  |
+| 1.0.0-bigendian | generated_interval | pass |  |
+| 1.0.0-bigendian | generated_map | pass |  |
+| 1.0.0-bigendian | generated_map_non_canonical | pass |  |
+| 1.0.0-bigendian | generated_nested | pass |  |
+| 1.0.0-bigendian | generated_nested_dictionary | pass |  |
+| 1.0.0-bigendian | generated_nested_large_offsets | pass |  |
+| 1.0.0-bigendian | generated_null | pass |  |
+| 1.0.0-bigendian | generated_null_trivial | pass |  |
+| 1.0.0-bigendian | generated_primitive | pass |  |
+| 1.0.0-bigendian | generated_primitive_large_offsets | pass |  |
+| 1.0.0-bigendian | generated_primitive_no_batches | pass |  |
+| 1.0.0-bigendian | generated_primitive_zerolength | pass |  |
+| 1.0.0-bigendian | generated_recursive_nested | pass |  |
+| 1.0.0-bigendian | generated_union | pass |  |
 | 1.0.0-littleendian | generated_custom_metadata | pass |  |
 | 1.0.0-littleendian | generated_datetime | pass |  |
 | 1.0.0-littleendian | generated_decimal | pass |  |
@@ -153,10 +153,10 @@ on Zig 0.16.0 (identical tables), arrow-testing 5a26d35785ff8761e56d79eebff971f6
 | cpp-21.0.0 | generated_run_end_encoded | pass |  |
 | cpp-21.0.0 | generated_union | pass |  |
 
-91 cases: 69 pass, 0 FAIL, 22 rejected (big-endian as expected, or by zarrow validation as listed)
+91 cases: 91 pass, 0 FAIL, 0 rejected (by zarrow validation as listed)
 
-`python -P tools/interop/integration_pyarrow_check.py` (pyarrow 26.0.0) on the same clone: all 69
-little-endian cases check out (JSON → zarrow file equals the gold file in pyarrow,
+`python -P tools/interop/integration_pyarrow_check.py` (pyarrow 26.0.0) on the same clone: all 91
+cases, the 22 big-endian ones included, check out (JSON → zarrow file equals the gold file in pyarrow,
 gold file → zarrow JSON equals the gold JSON after a normalising parse, zarrow's `--stream-to-file` /
 `--file-to-stream` output equals the gold data in pyarrow).
 
@@ -164,8 +164,8 @@ gold file → zarrow JSON equals the gold JSON after a normalising parse, zarrow
 
 | Bug | Cause | Fix | Regression test |
 |---|---|---|---|
-| A dictionary nested in another dictionary's values (`generated_nested_dictionary`) was never written by the IPC writers: the stream had only the outer dictionary and reading it back failed (`InvalidMetadata`) | `collectDictionaryIdsFromField` / `collectDictionaryArraysFromData` did not descend into dictionary value types / values | both descend first, so inner dictionaries are numbered and sent before the dictionaries that use them (`src/ipc/stream_writer.zig:897`) | `src/integration/test_json.zig:"IPC writers emit a dictionary nested in another dictionary's values before it"` |
-| An unchanged dictionary with nested or view values was re-sent with every batch; in an IPC file that is a replacement, which pyarrow rejects ("Unsupported dictionary replacement in IPC file") | `arraysEqualForDelta` answered "different" for every non-flat value type | the same dictionary (same `ArrayRef`) is skipped, other value types compare logically (`src/ipc/stream_writer.zig:1047`) | `src/integration/test_json.zig:"IPC file writer writes an unchanged list-valued dictionary once"` |
+| A dictionary nested in another dictionary's values (`generated_nested_dictionary`) was never written by the IPC writers: the stream had only the outer dictionary and reading it back failed (`InvalidMetadata`) | `collectDictionaryIdsFromField` / `collectDictionaryArraysFromData` did not descend into dictionary value types / values | both descend first, so inner dictionaries are numbered and sent before the dictionaries that use them (`src/ipc/stream_writer.zig:902`) | `src/integration/test_json.zig:"IPC writers emit a dictionary nested in another dictionary's values before it"` |
+| An unchanged dictionary with nested or view values was re-sent with every batch; in an IPC file that is a replacement, which pyarrow rejects ("Unsupported dictionary replacement in IPC file") | `arraysEqualForDelta` answered "different" for every non-flat value type | the same dictionary (same `ArrayRef`) is skipped, other value types compare logically (`src/ipc/stream_writer.zig:1052`) | `src/integration/test_json.zig:"IPC file writer writes an unchanged list-valued dictionary once"` |
 | zarrow's file writer wrote dictionary replacements, producing files other readers reject | no check | the file writer now fails with `DictionaryReplacement` (deltas still allowed) (`src/ipc/file_writer.zig:31`) | `src/integration/test_json.zig:"IPC file writer rejects a dictionary replacement, the stream writer sends it"` |
 | A map's entries field name (`generated_map_non_canonical`: `some_entries`) was lost: zarrow wrote `entries` to IPC and the C data interface, so an implementation that compares field names strictly (arrow-rs) sees another schema | `MapType` had no entries name | `MapType.entries_name` (default `entries`), carried by the IPC reader and writer, the C data import and export and the JSON reader and writer (`src/datatype.zig:186`) | `src/integration/test_json.zig:"IPC keeps a non-canonical map entries field name"`, `src/ffi/c_data.zig:"c data schema keeps a non-canonical map entries field name"` |
 
@@ -200,14 +200,21 @@ was in the corpus already).
   also accepts Arrow C++'s current `decimal32` / `decimal64` / `decimal256` names.
 - **Null slots** are written as Arrow C++ writes them (`0`, `"0"`, `false`, `{}`), except that a null
   string or view is written empty instead of with whatever bytes its slot holds.
+- **Big-endian IPC** is swapped by the rules of Arrow C++'s `SwapEndianArrayData`
+  (`cpp/src/arrow/array/util.cc`): validity bitmaps, bool, 1-byte values, fixed_size_binary and union
+  type ids stay as they are; offsets, list-view offsets and sizes, dense union offsets, dictionary
+  indices, run ends and fixed-width values swap by their width, interval day_time as two i32,
+  month_day_nano as i32, i32, i64, decimals as one 4 / 8 / 16 / 32-byte integer
+  (`swapElementWidth`, `src/ipc/stream_reader.zig:1896`). Two layouts go further than Arrow C++, which
+  returns `NotImplemented` for them: run-end encoded arrays (the run ends are an ordinary integer child)
+  and string_view / binary_view, where the i32 length is swapped first and, for a view longer than 12
+  bytes, the buffer index and offset (the 4-byte prefix is bytes and stays). Tensor and sparse tensor
+  messages carry no endianness flag and are returned as stored. zarrow targets little-endian hosts.
 - **Pre-1.0 unions** carry a `VALIDITY` member in the gold JSON (0.17.1); the reader ignores it, as
   Arrow C++ does, and the writer does not write it.
 
 ## Rejected inputs (validation not loosened)
 
-- **Big-endian IPC** (`1.0.0-bigendian`, 22 cases): zarrow's IPC readers accept little-endian data only
-  (`UnsupportedType`); the runner reports these cases as `rejected-as-expected`. The JSON side of these
-  cases reads fine.
 - **A record batch without columns but with rows** (Arrow allows it; no gold case has one) is accepted:
   the readers take the row count from the message when there are no columns
   (`src/ipc/stream_reader.zig:"ipc stream and file readers keep the row count of a record batch without columns"`);

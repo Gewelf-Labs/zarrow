@@ -17,7 +17,9 @@ pub const SchemaRef = schema_mod.SchemaRef;
 pub const RecordBatch = record_batch.RecordBatch;
 pub const EndiannessMode = stream_reader.EndiannessMode;
 pub const ReaderOptions = struct {
-    endianness_mode: EndiannessMode = .strict,
+    /// Big-endian files are byte-swapped to little-endian by default (as Arrow C++ does);
+    /// `.strict` rejects them instead.
+    endianness_mode: EndiannessMode = .normalize_to_little,
 };
 
 pub const FileError = stream_reader.StreamError || array_data.ValidationError || record_batch.RecordBatchError || fbs_lite_builder.PackError || error{
@@ -233,6 +235,7 @@ pub const FileReader = struct {
             footer_t.schema.?,
             self.options.endianness_mode,
         );
+        self.decode.big_endian = footer_t.schema.?.endianness == .Big;
         self.schema_ref = try SchemaRef.fromArena(self.allocator, arena, schema);
 
         self.resetDecodeState();
@@ -1156,5 +1159,47 @@ test "file reader reads zero-length buffers and empty arrays without offsets" {
             try std.testing.expectEqual(rows, batch.numRows());
             for (batch.columns) |col| try col.data().validateFull();
         }
+    }
+}
+
+test "ipc file reader reads a big-endian file equal to the little-endian original" {
+    const allocator = std.testing.allocator;
+    const fixtures = [_][]const u8{
+        @embedFile("testdata/at-0.14.1-generated_decimal.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_binary_view.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_interval_mdn.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_nested_dictionary.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_union.stream"),
+    };
+    for (fixtures) |little| {
+        const big = try stream_reader.bigEndianStreamForTest(allocator, little, .{});
+        defer allocator.free(big);
+        // FileWriter indexes the raw big-endian messages (end-of-stream marker dropped) into a file.
+        var file_bytes: std.Io.Writer.Allocating = .init(allocator);
+        defer file_bytes.deinit();
+        var fw = try file_writer.FileWriter.init(allocator, &file_bytes.writer);
+        defer fw.deinit();
+        try fw.pending.writer.writeAll(big[0 .. big.len - 8]);
+        try fw.writeEnd();
+
+        var strict = FileReader.initWithOptions(allocator, file_bytes.written(), .{ .endianness_mode = .strict });
+        defer strict.deinit();
+        try std.testing.expectError(error.UnsupportedType, strict.readSchema());
+
+        var in: std.Io.Reader = .fixed(little);
+        var expected = stream_reader.StreamReader.init(allocator, &in);
+        defer expected.deinit();
+        var reader = FileReader.init(allocator, file_bytes.written());
+        defer reader.deinit();
+        try std.testing.expect((try expected.readSchema()).eql(try reader.readSchema()));
+        var i: usize = 0;
+        while (try expected.nextRecordBatch()) |e| : (i += 1) {
+            var want = e;
+            defer want.deinit();
+            var got = try reader.readRecordBatchAt(i);
+            defer got.deinit();
+            for (want.columns, got.columns) |a, b| try stream_reader.expectArrayDataEqual(a.data(), b.data());
+        }
+        try std.testing.expectEqual(i, try reader.recordBatchCount());
     }
 }

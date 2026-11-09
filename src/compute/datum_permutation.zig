@@ -1233,6 +1233,8 @@ pub fn datumFilter(datum: Datum, predicate: Datum, options: FilterOptions) Kerne
     const allocator = common.inferDatumsAllocator(&[_]Datum{ datum, predicate });
     const out_type = datum.dataType();
 
+    // An empty slice keeps every type and layout (the builders know only a few types).
+    if (output_len == 0 and datum == .array) return Datum.fromArray(datum.array.slice(0, 0) catch return error.OutOfMemory);
     if (output_len == 0) return builders.datumBuildEmptyLikeWithAllocator(allocator, out_type);
     if (predicate == .array and options.drop_nulls and output_len <= std.math.maxInt(u32)) {
         // drop_nulls: every kept row is a valid index, so the selections are dense u32 (4 B per

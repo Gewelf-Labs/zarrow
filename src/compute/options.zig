@@ -115,6 +115,10 @@ pub const OptionsTag = enum {
     struct_field,
     /// Query key and occurrence of map_lookup.
     map_lookup,
+    /// Bounds checking of take / array_take.
+    take,
+    /// Run end type of run_end_encode.
+    run_end_encode,
     /// Escape hatch for downstream custom kernels.
     custom,
 };
@@ -622,6 +626,19 @@ pub const MapLookupOptions = struct {
     occurrence: Occurrence = .first,
 };
 
+/// Options of take and array_take (Arrow `TakeOptions`).
+pub const TakeOptions = struct {
+    /// Arrow skips the index check when false; zarrow always checks (an out-of-range index is
+    /// `InvalidInput` either way) and accepts the option for compatibility.
+    boundscheck: bool = true,
+};
+
+/// Options of run_end_encode (Arrow `RunEndEncodeOptions`).
+pub const RunEndEncodeOptions = struct {
+    /// The integer type of the run ends (Arrow allows int16, int32 and int64).
+    run_end_type: enum { int16, int32, int64 } = .int32,
+};
+
 /// Custom untyped options hook for downstream extension kernels.
 pub const CustomOptions = struct {
     /// Caller-defined discriminator.
@@ -687,6 +704,8 @@ pub const Options = union(OptionsTag) {
     make_struct: MakeStructOptions,
     struct_field: StructFieldOptions,
     map_lookup: MapLookupOptions,
+    take: TakeOptions,
+    run_end_encode: RunEndEncodeOptions,
     custom: CustomOptions,
 
     pub fn noneValue() Options {

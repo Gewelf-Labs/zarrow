@@ -112,7 +112,9 @@ pub const TensorLikeMetadata = tensor_types.TensorLikeMetadata;
 pub const EndiannessMode = stream_writer.EndiannessMode;
 
 pub const ReaderOptions = struct {
-    endianness_mode: EndiannessMode = .strict,
+    /// Big-endian input is byte-swapped to little-endian by default (as Arrow C++ does);
+    /// `.strict` rejects it instead.
+    endianness_mode: EndiannessMode = .normalize_to_little,
 };
 
 pub const OwnedTensorLikeMessage = struct {
@@ -216,6 +218,7 @@ pub const StreamReader = struct {
             msg.msg.header.Schema.?,
             self.options.endianness_mode,
         );
+        self.decode.big_endian = msg.msg.header.Schema.?.endianness == .Big;
 
         if (self.schema_ref) |*ref| ref.release();
         self.schema_ref = try SchemaRef.fromArena(self.allocator, arena, s);
@@ -502,7 +505,7 @@ test "stream reader initZeroCopy slices column buffers out of the source" {
     try std.testing.expectEqual(@as(i32, 3), try view.value(2));
 }
 
-fn expectArrayDataEqual(a: *const ArrayData, b: *const ArrayData) !void {
+pub fn expectArrayDataEqual(a: *const ArrayData, b: *const ArrayData) !void {
     try std.testing.expect(a.data_type.eql(b.data_type));
     try std.testing.expectEqual(a.length, b.length);
     try std.testing.expectEqual(a.offset, b.offset);
@@ -1219,6 +1222,8 @@ pub fn buildSchemaFromFlatbuf(allocator: std.mem.Allocator, schema_t: *fbs.Schem
     return try buildSchemaFromFlatbufWithEndiannessMode(allocator, schema_t, .strict);
 }
 
+/// With `.normalize_to_little` a big-endian schema is returned as little-endian; the caller must
+/// then set `DecodeContexts.big_endian` so the batch bodies are byte-swapped while decoding.
 pub fn buildSchemaFromFlatbufWithEndiannessMode(
     allocator: std.mem.Allocator,
     schema_t: *fbs.SchemaT,
@@ -1698,6 +1703,7 @@ fn buildRecordBatchFromFlatbuf(
             &variadic_index,
             dictionary_values,
             metadata_version,
+            contexts.big_endian,
         );
         col_count += 1;
     }
@@ -1730,6 +1736,7 @@ fn readArrayFromMeta(
     variadic_index: *usize,
     dictionary_values: *const std.AutoHashMap(i64, ArrayRef),
     metadata_version: fbs.MetadataVersion,
+    big_endian: bool,
 ) (StreamError || array_data.ValidationError || error{OutOfMemory})!ArrayRef {
     if (node_index.* >= nodes.len) return StreamError.InvalidMetadata;
     const node = nodes[node_index.*];
@@ -1820,6 +1827,9 @@ fn readArrayFromMeta(
         buf_count = normalized_len;
     }
 
+    // Big-endian bodies: swap before anything reads the values (children swap in their own call).
+    if (big_endian) for (buffers, 0..) |*buf, idx| try byteSwapBuffer(allocator, layout_dt, idx, buf);
+
     var children: []ArrayRef = &.{};
     var filled: usize = 0;
     defer if (children.len > 0) allocator.free(children);
@@ -1832,29 +1842,29 @@ fn readArrayFromMeta(
         else
             childValueType(layout_dt);
         children = try allocator.alloc(ArrayRef, 1);
-        children[0] = try readArrayFromMeta(allocator, child_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+        children[0] = try readArrayFromMeta(allocator, child_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version, big_endian);
         filled = 1;
     } else if (layout_dt == .struct_) {
         const field_count = layout_dt.struct_.fields.len;
         children = try allocator.alloc(ArrayRef, field_count);
         var idx: usize = 0;
         while (idx < field_count) : (idx += 1) {
-            children[idx] = try readArrayFromMeta(allocator, layout_dt.struct_.fields[idx].data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+            children[idx] = try readArrayFromMeta(allocator, layout_dt.struct_.fields[idx].data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version, big_endian);
             filled += 1;
         }
     } else if (layout_dt == .sparse_union or layout_dt == .dense_union) {
         const union_fields = if (layout_dt == .sparse_union) layout_dt.sparse_union.fields else layout_dt.dense_union.fields;
         children = try allocator.alloc(ArrayRef, union_fields.len);
         for (union_fields, 0..) |field, idx| {
-            children[idx] = try readArrayFromMeta(allocator, field.data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+            children[idx] = try readArrayFromMeta(allocator, field.data_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version, big_endian);
             filled += 1;
         }
     } else if (layout_dt == .run_end_encoded) {
         const run_end_dt = try dataTypeFromIntType(layout_dt.run_end_encoded.run_end_type);
         children = try allocator.alloc(ArrayRef, 2);
-        children[0] = try readArrayFromMeta(allocator, run_end_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+        children[0] = try readArrayFromMeta(allocator, run_end_dt, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version, big_endian);
         filled += 1;
-        children[1] = try readArrayFromMeta(allocator, layout_dt.run_end_encoded.value_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version);
+        children[1] = try readArrayFromMeta(allocator, layout_dt.run_end_encoded.value_type.*, nodes, buffers_meta, variadic_buffer_counts, body, node_index, buffer_index, variadic_index, dictionary_values, metadata_version, big_endian);
         filled += 1;
     } else if (layout_dt == .dictionary) {
         const dictionary_id = layout_dt.dictionary.id orelse return StreamError.InvalidMetadata;
@@ -1876,6 +1886,70 @@ fn readArrayFromMeta(
     // value past its dictionary.
     if (layout_dt == .dictionary) data.validateDictionaryIndices(layout_dt.dictionary, 0, array_len) catch return StreamError.InvalidBody;
     return ArrayRef.fromOwnedInline(allocator, data);
+}
+
+/// Bytes per element that are reversed together when a big-endian buffer is swapped to
+/// little-endian (Arrow C++ `SwapEndianArrayData`); 1 = never swapped (bitmaps, bytes, union type
+/// ids, fixed_size_binary). `buffer_idx` is in the V5 layout (V4 union validity already dropped).
+/// interval_day_time swaps its two i32 halves; month_day_nano and views are split further in
+/// `byteSwapBuffer`; decimals reverse as one 4/8/16/32-byte integer.
+fn swapElementWidth(layout_dt: DataType, buffer_idx: usize) usize {
+    switch (layout_dt) {
+        .sparse_union => return 1,
+        .dense_union => return if (buffer_idx == 1) 4 else 1,
+        else => {},
+    }
+    if (buffer_idx == 0) return 1; // validity bitmap
+    return switch (layout_dt) {
+        .int16, .uint16, .half_float => 2,
+        .int32, .uint32, .float, .date32, .time32, .interval_months, .interval_day_time, .decimal32 => 4,
+        .int64, .uint64, .double, .date64, .time64, .timestamp, .duration, .decimal64 => 8,
+        .decimal128, .interval_month_day_nano => 16,
+        .decimal256 => 32,
+        .string, .binary, .list, .map => if (buffer_idx == 1) 4 else 1,
+        .large_string, .large_binary, .large_list => if (buffer_idx == 1) 8 else 1,
+        .list_view => 4, // offsets and sizes
+        .large_list_view => 8,
+        .string_view, .binary_view => if (buffer_idx == 1) 16 else 1, // views; data buffers are bytes
+        .dictionary => |d| d.index_type.bit_width / 8,
+        else => 1,
+    };
+}
+
+/// Replaces `buf` with a little-endian copy of its big-endian elements. Never in place: the body
+/// may be the zero-copy source or shared. A length that is not a whole number of elements is
+/// `InvalidBody`.
+fn byteSwapBuffer(allocator: std.mem.Allocator, layout_dt: DataType, buffer_idx: usize, buf: *array_data.SharedBuffer) (StreamError || error{OutOfMemory})!void {
+    const width = swapElementWidth(layout_dt, buffer_idx);
+    const len = buf.len();
+    if (width <= 1 or len == 0) return;
+    if (len % width != 0) return StreamError.InvalidBody;
+    var owned = try buffer.OwnedBuffer.initUninit(allocator, len);
+    errdefer owned.deinit();
+    const out = owned.data[0..len];
+    @memcpy(out, buf.data);
+    var i: usize = 0;
+    while (i < len) : (i += width) {
+        const e = out[i..][0..width];
+        switch (layout_dt) {
+            .interval_month_day_nano => { // months i32, days i32, nanoseconds i64
+                std.mem.reverse(u8, e[0..4]);
+                std.mem.reverse(u8, e[4..8]);
+                std.mem.reverse(u8, e[8..16]);
+            },
+            .string_view, .binary_view => { // length i32, then 12 inline bytes or prefix, buffer index i32, offset i32
+                std.mem.reverse(u8, e[0..4]);
+                if (std.mem.readInt(i32, e[0..4], .little) > 12) {
+                    std.mem.reverse(u8, e[8..12]);
+                    std.mem.reverse(u8, e[12..16]);
+                }
+            },
+            else => std.mem.reverse(u8, e),
+        }
+    }
+    const swapped = try owned.toShared(len);
+    buf.release();
+    buf.* = swapped;
 }
 
 fn childValueType(dt: DataType) DataType {
@@ -2054,10 +2128,13 @@ const DecodedRecordBatchBody = struct {
     }
 };
 
-/// Decompression state a reader keeps across messages: zstd and LZ4 frame contexts, taken on
-/// first use (ZSTD_decompress and a fresh LZ4F context per buffer allocate and free one on every
-/// call), and the decoded buffer layout of the current message.
+/// Decode state a reader keeps across messages: zstd and LZ4 frame contexts, taken on first use
+/// (ZSTD_decompress and a fresh LZ4F context per buffer allocate and free one on every call), the
+/// decoded buffer layout of the current message, and the byte order of the stream's bodies.
 pub const DecodeContexts = struct {
+    /// The schema was big-endian: every body buffer is byte-swapped to little-endian
+    /// (`byteSwapBuffer`) before it is validated.
+    big_endian: bool = false,
     zstd_dctx: ?*anyopaque = null,
     lz4_dctx: ?*anyopaque = null,
     decoded_meta: std.ArrayList(fbs.BufferT) = .empty,
@@ -2306,6 +2383,7 @@ fn ingestDictionaryBatchWithMap(
         &variadic_index,
         dictionary_values,
         metadata_version,
+        contexts.big_endian,
     );
     errdefer dictionary.release();
 
@@ -5561,7 +5639,7 @@ test "ipc reader maps parse failures to deterministic errors" {
     }
 }
 
-test "ipc reader supports optional big-endian schema normalization" {
+test "ipc reader rejects a big-endian schema only in strict mode" {
     const allocator = std.testing.allocator;
 
     var bytes = std.Io.Writer.Allocating.init(allocator);
@@ -5577,20 +5655,464 @@ test "ipc reader supports optional big-endian schema normalization" {
 
     {
         var stream: std.Io.Reader = .fixed(bytes.written());
-        var reader = StreamReader.init(allocator, &stream);
+        var reader = StreamReader.initWithOptions(allocator, &stream, .{ .endianness_mode = .strict });
         defer reader.deinit();
         try std.testing.expectError(StreamError.UnsupportedType, reader.readSchema());
     }
 
     {
         var stream: std.Io.Reader = .fixed(bytes.written());
-        var reader = StreamReader.initWithOptions(allocator, &stream, .{
-            .endianness_mode = .normalize_to_little,
-        });
+        var reader = StreamReader.init(allocator, &stream);
         defer reader.deinit();
         const schema = try reader.readSchema();
         try std.testing.expectEqual(datatype.Endianness.little, schema.endianness);
+        try std.testing.expect(reader.decode.big_endian);
     }
+}
+
+pub const BigEndianTestOptions = struct {
+    /// Re-encode every buffer of the swapped bodies as an LZ4 frame.
+    compress: bool = false,
+    /// Applied to every record batch message after swapping (to corrupt it on purpose).
+    tweak: ?*const fn (*fbs.RecordBatchT) void = null,
+};
+
+/// Test helper: rewrites a little-endian V5 IPC stream as the stream a big-endian Arrow writer
+/// would produce: the schema says Big and every multi-byte value of the record and dictionary
+/// batch bodies is byte-reversed. The per-type rules are written out again here (and views are
+/// swapped in the opposite direction, reading the length before reversing it), independently of
+/// `swapElementWidth`, so a wrong reader rule shows up as a mismatch.
+pub fn bigEndianStreamForTest(allocator: std.mem.Allocator, little: []const u8, options: BigEndianTestOptions) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var schema: ?Schema = null;
+    var in: std.Io.Reader = .fixed(little);
+    while (try format.readMessageLength(&in)) |prefix| {
+        const meta = try in.take(prefix.len);
+        try format.skipPadding(&in, prefix.pad);
+        var msg = try fbs_lite_builder.unpackMessage(allocator, meta);
+        defer msg.deinit(allocator);
+        const body_len: usize = @intCast(msg.bodyLength);
+        const body = try in.take(body_len);
+        format.skipBodyPadding(&in, format.padLen(body_len));
+
+        var types: []const DataType = undefined;
+        const rb: *fbs.RecordBatchT = switch (msg.header) {
+            .Schema => |s| {
+                schema = try buildSchemaFromFlatbuf(arena.allocator(), s.?);
+                s.?.endianness = .Big;
+                try appendEncodedMessage(allocator, &out.writer, msg, body);
+                continue;
+            },
+            .RecordBatch => |rb| blk: {
+                const column_types = try arena.allocator().alloc(DataType, schema.?.fields.len);
+                for (schema.?.fields, column_types) |f, *t| t.* = f.data_type.*;
+                types = column_types;
+                break :blk rb.?;
+            },
+            .DictionaryBatch => |db| blk: {
+                types = try arena.allocator().dupe(DataType, &.{findDictionaryValueType(schema.?, db.?.id).?});
+                break :blk db.?.data.?;
+            },
+            else => {
+                try appendEncodedMessage(allocator, &out.writer, msg, body);
+                continue;
+            },
+        };
+        const swapped = try allocator.dupe(u8, body);
+        defer allocator.free(swapped);
+        var buf_i: usize = 0;
+        var var_i: usize = 0;
+        for (types) |t| swapColumnToBigForTest(t, rb, swapped, &buf_i, &var_i);
+        try std.testing.expectEqual(rb.buffers.items.len, buf_i);
+        if (options.tweak) |tweak| tweak(rb);
+        if (!options.compress) {
+            try appendEncodedMessage(allocator, &out.writer, msg, swapped);
+            continue;
+        }
+        var packed_body: std.ArrayList(u8) = .empty;
+        defer packed_body.deinit(allocator);
+        for (rb.buffers.items) |*b| {
+            const raw = swapped[@intCast(b.offset)..][0..@intCast(b.length)];
+            const start = packed_body.items.len;
+            if (raw.len > 0) {
+                const frame = try compressLz4FrameForTest(allocator, raw);
+                defer allocator.free(frame);
+                var len_prefix: [8]u8 = undefined;
+                std.mem.writeInt(i64, &len_prefix, @intCast(raw.len), .little);
+                try packed_body.appendSlice(allocator, &len_prefix);
+                try packed_body.appendSlice(allocator, frame);
+            }
+            b.* = .{ .offset = @intCast(start), .length = @intCast(packed_body.items.len - start) };
+            try packed_body.appendNTimes(allocator, 0, format.padLen(packed_body.items.len));
+        }
+        const compression = try allocator.create(fbs.BodyCompressionT);
+        compression.* = .{ .codec = .LZ4_FRAME, .method = .BUFFER };
+        rb.compression = compression;
+        msg.bodyLength = @intCast(packed_body.items.len);
+        try appendEncodedMessage(allocator, &out.writer, msg, packed_body.items);
+    }
+    try format.writeMessageLength(&out.writer, 0);
+    return out.toOwnedSlice();
+}
+
+/// Reverses the multi-byte values of one column's buffers (and its children's), little to big.
+fn swapColumnToBigForTest(dt: DataType, rb: *fbs.RecordBatchT, body: []u8, buf_i: *usize, var_i: *usize) void {
+    const t = storageDataType(dt);
+    // Element width of each of this node's buffers ('M' month_day_nano, 'V' views, 0 bytes).
+    const widths: []const u8 = switch (t) {
+        .null, .run_end_encoded => &.{},
+        .struct_, .fixed_size_list, .sparse_union => &.{0},
+        .bool, .int8, .uint8, .fixed_size_binary => &.{ 0, 0 },
+        .int16, .uint16, .half_float => &.{ 0, 2 },
+        .int32, .uint32, .float, .date32, .time32, .interval_months, .decimal32 => &.{ 0, 4 },
+        .interval_day_time => &.{ 0, 4 }, // two i32 halves
+        .int64, .uint64, .double, .date64, .time64, .timestamp, .duration, .decimal64 => &.{ 0, 8 },
+        .decimal128 => &.{ 0, 16 },
+        .decimal256 => &.{ 0, 32 },
+        .interval_month_day_nano => &.{ 0, 'M' },
+        .string, .binary => &.{ 0, 4, 0 },
+        .large_string, .large_binary => &.{ 0, 8, 0 },
+        .list, .map => &.{ 0, 4 },
+        .large_list => &.{ 0, 8 },
+        .list_view => &.{ 0, 4, 4 },
+        .large_list_view => &.{ 0, 8, 8 },
+        .string_view, .binary_view => &.{ 0, 'V' },
+        .dense_union => &.{ 0, 4 },
+        .dictionary => |d| switch (d.index_type.bit_width) {
+            8 => &.{ 0, 0 },
+            16 => &.{ 0, 2 },
+            32 => &.{ 0, 4 },
+            else => &.{ 0, 8 },
+        },
+        else => unreachable,
+    };
+    for (widths) |w| {
+        const meta = rb.buffers.items[buf_i.*];
+        buf_i.* += 1;
+        const bytes = body[@intCast(meta.offset)..][0..@intCast(meta.length)];
+        var i: usize = 0;
+        switch (w) {
+            0 => {},
+            'M' => while (i < bytes.len) : (i += 16) {
+                std.mem.reverse(u8, bytes[i..][0..4]);
+                std.mem.reverse(u8, bytes[i + 4 ..][0..4]);
+                std.mem.reverse(u8, bytes[i + 8 ..][0..8]);
+            },
+            'V' => while (i < bytes.len) : (i += 16) {
+                const out_of_line = std.mem.readInt(i32, bytes[i..][0..4], .little) > 12;
+                std.mem.reverse(u8, bytes[i..][0..4]);
+                if (out_of_line) {
+                    std.mem.reverse(u8, bytes[i + 8 ..][0..4]);
+                    std.mem.reverse(u8, bytes[i + 12 ..][0..4]);
+                }
+            },
+            else => while (i < bytes.len) : (i += w) std.mem.reverse(u8, bytes[i..][0..w]),
+        }
+    }
+    if (t == .string_view or t == .binary_view) {
+        buf_i.* += @intCast(rb.variadicBufferCounts.items[var_i.*]);
+        var_i.* += 1;
+    }
+    switch (t) {
+        .list, .large_list, .list_view, .large_list_view, .fixed_size_list => swapColumnToBigForTest(childValueType(t), rb, body, buf_i, var_i),
+        .map => |m| swapColumnToBigForTest(m.entries_type.?.*, rb, body, buf_i, var_i),
+        .struct_ => |s| for (s.fields) |f| swapColumnToBigForTest(f.data_type.*, rb, body, buf_i, var_i),
+        .sparse_union, .dense_union => |u| for (u.fields) |f| swapColumnToBigForTest(f.data_type.*, rb, body, buf_i, var_i),
+        .run_end_encoded => |r| {
+            swapColumnToBigForTest(dataTypeFromIntType(r.run_end_type) catch unreachable, rb, body, buf_i, var_i);
+            swapColumnToBigForTest(r.value_type.*, rb, body, buf_i, var_i);
+        },
+        else => {},
+    }
+}
+
+/// Reads `little` and its big-endian rewrite (`bigEndianStreamForTest`) and requires equal
+/// schemas and batches, a strict reader to reject the big-endian stream, and (uncompressed) the
+/// zero-copy read of it to equal the copying read.
+fn expectBigEndianReadsEqual(allocator: std.mem.Allocator, little: []const u8, options: BigEndianTestOptions) !void {
+    const big = try bigEndianStreamForTest(allocator, little, options);
+    defer allocator.free(big);
+    {
+        var in: std.Io.Reader = .fixed(big);
+        var strict = StreamReader.initWithOptions(allocator, &in, .{ .endianness_mode = .strict });
+        defer strict.deinit();
+        try std.testing.expectError(StreamError.UnsupportedType, strict.readSchema());
+    }
+    var little_in: std.Io.Reader = .fixed(little);
+    var little_reader = StreamReader.init(allocator, &little_in);
+    defer little_reader.deinit();
+    var big_in: std.Io.Reader = .fixed(big);
+    var big_reader = StreamReader.init(allocator, &big_in);
+    defer big_reader.deinit();
+    try std.testing.expect((try little_reader.readSchema()).eql(try big_reader.readSchema()));
+    var batches: usize = 0;
+    while (try little_reader.nextRecordBatch()) |l| {
+        var little_batch = l;
+        defer little_batch.deinit();
+        var big_batch = (try big_reader.nextRecordBatch()) orelse return error.TestUnexpectedResult;
+        defer big_batch.deinit();
+        try std.testing.expectEqual(little_batch.numRows(), big_batch.numRows());
+        for (little_batch.columns, big_batch.columns) |a, b| try expectArrayDataEqual(a.data(), b.data());
+        batches += 1;
+    }
+    try std.testing.expect((try big_reader.nextRecordBatch()) == null);
+    if (batches > 0 and !options.compress) try expectZeroCopyMatchesCopy(allocator, big, false);
+}
+
+/// A stream with one 3-row batch (row 1 null where the layout has validity) of every layout
+/// whose buffers are built here byte by byte: all fixed widths, bool, null, (large) binary and
+/// string, string_view (inline and out-of-line), (large) list, (large) list_view,
+/// fixed_size_list, struct and dictionaries with int8 and int32 indices.
+fn writeEveryLayoutStreamForTest(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) !void {
+    const SharedBuffer = array_data.SharedBuffer;
+    var pattern: [96]u8 = undefined;
+    for (&pattern, 0..) |*b, k| b.* = @intCast(k + 1);
+    const validity = [_]u8{0b101};
+    const bool_values = [_]u8{0b110};
+    const Fixed = struct { dt: DataType, width: usize };
+    const fixed = [_]Fixed{
+        .{ .dt = .{ .int8 = {} }, .width = 1 },
+        .{ .dt = .{ .uint8 = {} }, .width = 1 },
+        .{ .dt = .{ .int16 = {} }, .width = 2 },
+        .{ .dt = .{ .uint16 = {} }, .width = 2 },
+        .{ .dt = .{ .int32 = {} }, .width = 4 },
+        .{ .dt = .{ .uint32 = {} }, .width = 4 },
+        .{ .dt = .{ .int64 = {} }, .width = 8 },
+        .{ .dt = .{ .uint64 = {} }, .width = 8 },
+        .{ .dt = .{ .half_float = {} }, .width = 2 },
+        .{ .dt = .{ .float = {} }, .width = 4 },
+        .{ .dt = .{ .double = {} }, .width = 8 },
+        .{ .dt = .{ .date32 = {} }, .width = 4 },
+        .{ .dt = .{ .date64 = {} }, .width = 8 },
+        .{ .dt = .{ .time32 = .{ .unit = .millisecond } }, .width = 4 },
+        .{ .dt = .{ .time64 = .{ .unit = .nanosecond } }, .width = 8 },
+        .{ .dt = .{ .timestamp = .{ .unit = .microsecond, .timezone = "UTC" } }, .width = 8 },
+        .{ .dt = .{ .duration = .{ .unit = .second } }, .width = 8 },
+        .{ .dt = .{ .interval_months = .{ .unit = .months } }, .width = 4 },
+        .{ .dt = .{ .interval_day_time = .{ .unit = .day_time } }, .width = 8 },
+        .{ .dt = .{ .interval_month_day_nano = .{ .unit = .month_day_nano } }, .width = 16 },
+        .{ .dt = .{ .decimal32 = .{ .precision = 9, .scale = 2 } }, .width = 4 },
+        .{ .dt = .{ .decimal64 = .{ .precision = 18, .scale = 2 } }, .width = 8 },
+        .{ .dt = .{ .decimal128 = .{ .precision = 38, .scale = 2 } }, .width = 16 },
+        .{ .dt = .{ .decimal256 = .{ .precision = 76, .scale = 2 } }, .width = 32 },
+        .{ .dt = .{ .fixed_size_binary = .{ .byte_width = 3 } }, .width = 3 },
+    };
+    const int32_type = DataType{ .int32 = {} };
+    const int16_type = DataType{ .int16 = {} };
+    const string_type = DataType{ .string = {} };
+    const item = Field{ .name = "item", .data_type = &int32_type };
+    const struct_fields = [_]Field{ .{ .name = "a", .data_type = &int32_type }, .{ .name = "s", .data_type = &string_type } };
+    const nested = [_]DataType{
+        .{ .bool = {} },
+        .{ .null = {} },
+        .{ .string = {} },
+        .{ .binary = {} },
+        .{ .large_string = {} },
+        .{ .large_binary = {} },
+        .{ .string_view = {} },
+        .{ .list = .{ .value_field = item } },
+        .{ .large_list = .{ .value_field = item } },
+        .{ .list_view = .{ .value_field = item } },
+        .{ .large_list_view = .{ .value_field = item } },
+        .{ .fixed_size_list = .{ .value_field = .{ .name = "item", .data_type = &int16_type }, .list_size = 2 } },
+        .{ .struct_ = .{ .fields = &struct_fields } },
+        .{ .dictionary = .{ .id = 0, .index_type = .{ .bit_width = 8, .signed = true }, .value_type = &string_type } },
+        .{ .dictionary = .{ .id = 1, .index_type = .{ .bit_width = 32, .signed = true }, .value_type = &string_type } },
+    };
+
+    const offsets32 = [_]i32{ 0, 1, 3, 6 };
+    const offsets64 = [_]i64{ 0, 1, 3, 6 };
+    const list_offsets32 = [_]i32{ 0, 2, 2, 5 };
+    const list_offsets64 = [_]i64{ 0, 2, 2, 5 };
+    const view_offsets32 = [_]i32{ 3, 0, 0 };
+    const view_sizes32 = [_]i32{ 2, 0, 3 };
+    const view_offsets64 = [_]i64{ 3, 0, 0 };
+    const view_sizes64 = [_]i64{ 2, 0, 3 };
+    const indices8 = [_]i8{ 2, 0, 1 };
+    const indices32 = [_]i32{ 1, 2, 0 };
+    const long0 = "an out-of-line string value";
+    const long1 = "xyzanother long view value";
+    var views: [48]u8 = @splat(0);
+    std.mem.writeInt(i32, views[0..4], 2, .little);
+    @memcpy(views[4..6], "ab");
+    std.mem.writeInt(i32, views[32..36], long1.len - 3, .little);
+    @memcpy(views[36..40], long1[3..7]);
+    std.mem.writeInt(i32, views[40..44], 1, .little); // buffer index
+    std.mem.writeInt(i32, views[44..48], 3, .little); // offset
+    // Row 1 is null: an out-of-line view into buffer 0 all the same.
+    std.mem.writeInt(i32, views[16..20], long0.len, .little);
+    @memcpy(views[20..24], long0[0..4]);
+
+    const bytes = std.mem.sliceAsBytes;
+    const no_validity: SharedBuffer = .empty;
+    const string_bufs = [_]SharedBuffer{ no_validity, .fromSlice(bytes(offsets32[0..])), .fromSlice("abbccc") };
+    var dict = try ArrayRef.fromBorrowed(allocator, .{ .data_type = string_type, .length = 3, .null_count = 0, .buffers = &string_bufs });
+    defer dict.release();
+    const child32_bufs = [_]SharedBuffer{ no_validity, .fromSlice(pattern[0..20]) };
+    var child32 = try ArrayRef.fromBorrowed(allocator, .{ .data_type = int32_type, .length = 5, .null_count = 0, .buffers = &child32_bufs });
+    defer child32.release();
+    const child16_bufs = [_]SharedBuffer{ no_validity, .fromSlice(pattern[0..12]) };
+    var child16 = try ArrayRef.fromBorrowed(allocator, .{ .data_type = int16_type, .length = 6, .null_count = 0, .buffers = &child16_bufs });
+    defer child16.release();
+    const struct_a_bufs = [_]SharedBuffer{ .fromSlice(&validity), .fromSlice(pattern[4..16]) };
+    var struct_a = try ArrayRef.fromBorrowed(allocator, .{ .data_type = int32_type, .length = 3, .null_count = 1, .buffers = &struct_a_bufs });
+    defer struct_a.release();
+
+    const list_children = [_]ArrayRef{child32};
+    const fsl_children = [_]ArrayRef{child16};
+    const struct_children = [_]ArrayRef{ struct_a, dict };
+    var fields: [fixed.len + nested.len]Field = undefined;
+    var columns: [fixed.len + nested.len]ArrayRef = undefined;
+    var filled: usize = 0;
+    defer for (columns[0..filled]) |*c| c.release();
+    for (&fixed, 0..) |*f, i| {
+        fields[i] = .{ .name = "f", .data_type = &f.dt };
+        const bufs = [_]SharedBuffer{ .fromSlice(&validity), .fromSlice(pattern[0 .. 3 * f.width]) };
+        columns[i] = try ArrayRef.fromBorrowed(allocator, .{ .data_type = f.dt, .length = 3, .null_count = 1, .buffers = &bufs });
+        filled += 1;
+    }
+    for (&nested, fixed.len..) |*dt, i| {
+        fields[i] = .{ .name = "f", .data_type = dt };
+        const v: SharedBuffer = .fromSlice(&validity);
+        var layout: ArrayData = .{ .data_type = dt.*, .length = 3, .null_count = 1, .buffers = &.{} };
+        var bufs: [4]SharedBuffer = undefined;
+        switch (dt.*) {
+            .bool => bufs[0..2].* = .{ v, .fromSlice(&bool_values) },
+            .null => layout.null_count = 3,
+            .string, .binary => bufs[0..3].* = .{ v, .fromSlice(bytes(offsets32[0..])), .fromSlice("abbccc") },
+            .large_string, .large_binary => bufs[0..3].* = .{ v, .fromSlice(bytes(offsets64[0..])), .fromSlice("abbccc") },
+            .string_view => bufs[0..4].* = .{ v, .fromSlice(&views), .fromSlice(long0), .fromSlice(long1) },
+            .list => bufs[0..2].* = .{ v, .fromSlice(bytes(list_offsets32[0..])) },
+            .large_list => bufs[0..2].* = .{ v, .fromSlice(bytes(list_offsets64[0..])) },
+            .list_view => bufs[0..3].* = .{ v, .fromSlice(bytes(view_offsets32[0..])), .fromSlice(bytes(view_sizes32[0..])) },
+            .large_list_view => bufs[0..3].* = .{ v, .fromSlice(bytes(view_offsets64[0..])), .fromSlice(bytes(view_sizes64[0..])) },
+            .fixed_size_list => bufs[0] = v,
+            .struct_ => bufs[0] = v,
+            .dictionary => |d| bufs[0..2].* = .{ v, .fromSlice(if (d.index_type.bit_width == 8) bytes(indices8[0..]) else bytes(indices32[0..])) },
+            else => unreachable,
+        }
+        layout.buffers = bufs[0..switch (dt.*) {
+            .null => 0,
+            .fixed_size_list, .struct_ => 1,
+            .bool, .list, .large_list, .dictionary => 2,
+            .string_view => 4,
+            else => 3,
+        }];
+        layout.children = switch (dt.*) {
+            .list, .large_list, .list_view, .large_list_view => &list_children,
+            .fixed_size_list => &fsl_children,
+            .struct_ => &struct_children,
+            else => &.{},
+        };
+        if (dt.* == .dictionary) layout.dictionary = dict;
+        columns[i] = try ArrayRef.fromBorrowed(allocator, layout);
+        filled += 1;
+    }
+
+    const schema = Schema{ .fields = &fields };
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &columns);
+    defer batch.deinit();
+    for (batch.columns) |c| try c.data().validateLayout();
+    var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    try writer.writeSchema(schema);
+    try writer.writeRecordBatch(batch);
+    try writer.writeRecordBatch(batch);
+    try writer.writeEnd();
+}
+
+test "ipc stream reader byte-swaps a big-endian stream of every layout to the little-endian values" {
+    const allocator = std.testing.allocator;
+    var little: std.Io.Writer.Allocating = .init(allocator);
+    defer little.deinit();
+    try writeEveryLayoutStreamForTest(allocator, &little);
+    try expectBigEndianReadsEqual(allocator, little.written(), .{});
+}
+
+test "ipc stream reader decompresses then byte-swaps an LZ4-compressed big-endian stream" {
+    const allocator = std.testing.allocator;
+    var little: std.Io.Writer.Allocating = .init(allocator);
+    defer little.deinit();
+    try writeEveryLayoutStreamForTest(allocator, &little);
+    try expectBigEndianReadsEqual(allocator, little.written(), .{ .compress = true });
+}
+
+test "ipc stream reader reads big-endian rewrites of the Arrow C++ gold streams equal to the originals" {
+    // Map, unions, run-end encoded, views, list views, intervals, decimals, nested and unsigned
+    // dictionaries and extensions as Arrow C++ lays them out; the copy, zero-copy and LZ4 paths.
+    const fixtures = [_][]const u8{
+        @embedFile("testdata/at-0.14.1-generated_decimal.stream"),
+        @embedFile("testdata/at-0.14.1-generated_primitive_zerolength.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_binary_view.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_custom_metadata.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_datetime.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_dictionary_unsigned.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_duplicate_fieldnames.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_extension.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_interval_mdn.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_list_view.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_map.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_map_non_canonical.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_nested_dictionary.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_null_trivial.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_run_end_encoded.stream"),
+        @embedFile("testdata/at-cpp-21.0.0-generated_union.stream"),
+    };
+    for (fixtures) |little| {
+        try expectBigEndianReadsEqual(std.testing.allocator, little, .{});
+        try expectBigEndianReadsEqual(std.testing.allocator, little, .{ .compress = true });
+    }
+}
+
+fn oddInt32ValuesLength(rb: *fbs.RecordBatchT) void {
+    rb.buffers.items[1].length -= 1; // 2 int32 values in 7 bytes
+    rb.nodes.items[0].length = 1;
+    rb.length = 1;
+}
+
+test "ipc stream reader rejects a big-endian buffer that is not a whole number of values, and corruptions fail cleanly" {
+    const allocator = std.testing.allocator;
+    const int_type = DataType{ .int32 = {} };
+    const fields = [_]Field{.{ .name = "v", .data_type = &int_type }};
+    const schema = Schema{ .fields = &fields };
+    const values = [_]i32{ 7, -8 };
+    const bufs = [_]array_data.SharedBuffer{ .empty, .fromSlice(std.mem.sliceAsBytes(&values)) };
+    var col = try ArrayRef.fromBorrowed(allocator, .{ .data_type = int_type, .length = 2, .null_count = 0, .buffers = &bufs });
+    defer col.release();
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &.{col});
+    defer batch.deinit();
+    var little: std.Io.Writer.Allocating = .init(allocator);
+    defer little.deinit();
+    var writer = stream_writer.StreamWriter.init(allocator, &little.writer);
+    defer writer.deinit();
+    try writer.writeSchema(schema);
+    try writer.writeRecordBatch(batch);
+    try writer.writeEnd();
+
+    // Little-endian, 7 bytes hold the one int32 the node asks for; big-endian they cannot be swapped.
+    const odd = try bigEndianStreamForTest(allocator, little.written(), .{ .tweak = oddInt32ValuesLength });
+    defer allocator.free(odd);
+    for ([_]bool{ false, true }) |zero_copy| {
+        var in: std.Io.Reader = .fixed(odd);
+        var reader = if (zero_copy) StreamReader.initZeroCopy(allocator, &in, .fromSlice(odd)) else StreamReader.init(allocator, &in);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        try std.testing.expectError(StreamError.InvalidBody, reader.nextRecordBatch());
+    }
+
+    const big = try bigEndianStreamForTest(allocator, little.written(), .{});
+    defer allocator.free(big);
+    {
+        var in: std.Io.Reader = .fixed(big[0 .. big.len - 12]); // cut inside the body
+        var reader = StreamReader.init(allocator, &in);
+        defer reader.deinit();
+        _ = try reader.readSchema();
+        try std.testing.expectError(error.EndOfStream, reader.nextRecordBatch());
+    }
+    try expectCorruptionsFailCleanly(allocator, big);
 }
 
 test "ipc reader rejects unexpected variadic buffer counts" {

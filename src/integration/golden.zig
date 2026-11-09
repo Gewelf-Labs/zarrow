@@ -18,14 +18,12 @@ const RecordBatch = json.RecordBatch;
 pub const Expect = enum {
     /// Every step must pass.
     accept,
-    /// Big-endian IPC: zarrow reads little-endian only, so the IPC files must be rejected.
-    reject_big_endian,
     /// A case zarrow's IPC validation rejects on purpose (docs/integration-suite.md lists them):
     /// the JSON must read and both IPC files must be rejected.
     reject_known,
 };
 
-pub const Outcome = enum { pass, rejected_as_expected, rejected_known, fail };
+pub const Outcome = enum { pass, rejected_known, fail };
 
 /// What a check found: the outcome and, for a rejection or a failure, where and why.
 pub const Result = struct {
@@ -69,10 +67,9 @@ pub fn check(allocator: Allocator, json_text: []const u8, arrow_file: []const u8
     defer doc.deinit();
 
     if (expect != .accept) {
-        const outcome: Outcome = if (expect == .reject_big_endian) .rejected_as_expected else .rejected_known;
         var file_doc = readFile(allocator, arrow_file) catch |fe| {
             var stream_doc = readStream(allocator, stream) catch |se| {
-                r.set(outcome, "file: {s}, stream: {s}", .{ @errorName(fe), @errorName(se) });
+                r.set(.rejected_known, "file: {s}, stream: {s}", .{ @errorName(fe), @errorName(se) });
                 return r;
             };
             stream_doc.deinit();

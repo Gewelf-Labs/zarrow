@@ -622,7 +622,7 @@ fn exerciseKernels(gpa: Allocator, arr: ArrayRef, sliced: ArrayRef) void {
         if (zarrow.compute.kernels.hash_aggregate.isGroupKeyType(a.data().data_type)) exerciseGroupBy(&ctx, a);
         exerciseRound16(&ctx, a);
         exerciseRound18(&ctx, a);
-        exerciseRound21(&ctx, a);
+        exerciseRounds21To23(&ctx, a);
     }
 }
 
@@ -2256,4 +2256,52 @@ test "fuzz integration-json" {
 
 test "fuzz temporal" {
     try std.testing.fuzz(Target.temporal, fuzzOne, .{ .corpus = &.{smithSeed("corpus/temporal/iso.bin")} });
+}
+
+/// The decoded-array kernels of rounds 21 and 23.
+fn exerciseRounds21To23(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    exerciseRound21(ctx, a);
+    exerciseRound23(ctx, a);
+}
+
+/// Round 23 kernels on any decoded array: take of the reversed rows with every third index null,
+/// filter of the even rows, run_end_encode (unsupported types: NoMatchingKernel) and
+/// run_end_decode back to as many rows, dictionary_decode, and modulo / remainder (+ checked) and
+/// hypot of an integer or float column with itself. Each succeeds (or fails with a listed error)
+/// and every array output validates with the expected length.
+fn exerciseRound23(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const gpa = std.heap.page_allocator;
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    var ib = zarrow.Int64Builder.init(gpa, len) catch return;
+    defer ib.deinit();
+    var pb = zarrow.BooleanBuilder.init(gpa, len) catch return;
+    defer pb.deinit();
+    for (0..len) |i| {
+        (if (i % 3 == 2) ib.appendNull() else ib.append(@intCast(len - 1 - i))) catch return;
+        pb.append(i % 2 == 0) catch return;
+    }
+    var idx = ib.finish() catch return;
+    defer idx.release();
+    var pred = pb.finish() catch return;
+    defer pred.release();
+    expectCall(ctx, "take", .vector, &.{ d, .{ .array = idx } }, .none, len, &.{});
+    expectCall(ctx, "filter", .vector, &.{ d, .{ .array = pred } }, .none, (len + 1) / 2, &.{});
+    expectCall(ctx, "dictionary_decode", .vector, &.{d}, .none, len, &.{});
+    if (ctx.invoke("run_end_encode", .vector, &.{d}, .none)) |enc| {
+        var e = enc;
+        defer e.release();
+        expectValid("run_end_encode", e.array, len);
+        expectCall(ctx, "run_end_decode", .vector, &.{e}, .none, len, &.{});
+    } else |err| if (err != error.NoMatchingKernel) std.debug.panic("fuzz-invariant: run_end_encode failed on a valid {s} array: {s}", .{ @tagName(a.data().data_type.id()), @errorName(err) });
+    switch (a.data().data_type) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float, .double => {
+            inline for (.{ "modulo", "modulo_checked", "remainder", "remainder_checked" }) |name| {
+                expectCall(ctx, name, .scalar, &.{ d, d }, .none, len, &.{ error.DivideByZero, error.Overflow });
+            }
+            // InvalidCast: an integer that float64 cannot hold exactly (Arrow's safe implicit cast).
+            expectCall(ctx, "hypot", .scalar, &.{ d, d }, .none, len, &.{error.InvalidCast});
+        },
+        else => {},
+    }
 }

@@ -1,11 +1,16 @@
-//! Arithmetic kernels: add, subtract, multiply, divide, negate, abs and their `_checked` variants
-//! for int8..int64, uint8..uint64, float32 and float64 (Arrow C++ "Arithmetic functions").
+//! Arithmetic kernels: add, subtract, multiply, divide, modulo, remainder, negate, abs and their
+//! `_checked` variants for int8..int64, uint8..uint64, float32 and float64 (Arrow C++ "Arithmetic
+//! functions").
 //!
 //! Null handling is intersection. The unchecked functions wrap on integer overflow, or saturate when
 //! `ExecConfig.overflow_mode` is `saturating`; the `_checked` functions return `Overflow`. Integer
 //! division truncates toward zero and a zero divisor in a valid row is `DivideByZero` in both
 //! variants (as in Arrow C++); `divide(minInt, -1)` is 0 (Arrow C++) or `maxInt` when saturating.
-//! Float division by zero gives inf / nan unless checked. Float add / subtract / multiply never
+//! Float division by zero gives inf / nan unless checked. modulo is floored (the sign of the
+//! divisor, Python's `%`), remainder truncated (the sign of the dividend, C's `%` and `fmod`); a
+//! zero integer divisor is `DivideByZero` in both variants, `modulo(minInt, -1)` is 0 and
+//! `Overflow` only in the `_checked` variants, a zero float divisor gives NaN (`DivideByZero`
+//! when checked), as pyarrow 26. Float add / subtract / multiply never
 //! report overflow. Operands of different numeric types are first cast to their common type
 //! (Arrow's implicit casts, `registry.commonNumericType`: int32 + int64 is int64, int + float32 is
 //! float32, uint32 + int32 is int64; a value the cast cannot represent is `InvalidCast`).
@@ -25,12 +30,13 @@ const Kernel = core.Kernel;
 const KernelError = core.KernelError;
 const Options = core.Options;
 
-const Op = enum { add, subtract, multiply, divide, negate, abs };
+const Op = enum { add, subtract, multiply, divide, modulo, remainder, negate, abs };
 const Mode = enum { wrapping, saturating, checked };
 
-/// Register add, subtract, multiply, divide, negate, abs and their `_checked` variants.
+/// Register add, subtract, multiply, divide, modulo, remainder, negate, abs and their `_checked`
+/// variants.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
-    inline for (.{ Op.add, Op.subtract, Op.multiply, Op.divide, Op.negate, Op.abs }) |op| {
+    inline for (.{ Op.add, Op.subtract, Op.multiply, Op.divide, Op.modulo, Op.remainder, Op.negate, Op.abs }) |op| {
         inline for (dense.numeric_types) |T| {
             try registry.registerScalarKernel(@tagName(op), kernel(T, op, false));
             // Arrow C++ has no negate_checked kernel for unsigned integers.
@@ -174,6 +180,7 @@ fn Arith(comptime T: type, comptime op: Op, comptime checked: bool) type {
         fn runBinary(comptime mode: Mode, a: anytype, b: anytype, out: *Out) KernelError!void {
             const dst = out.values();
             if (op == .divide) return divide(mode, a, b, out);
+            if (op == .modulo or op == .remainder) return modRem(mode, a, b, out);
             if (is_float or mode == .wrapping) {
                 for (dst, 0..) |*d, i| d.* = wrapOp(at(a, i), at(b, i));
             } else if (mode == .saturating) {
@@ -224,6 +231,32 @@ fn Arith(comptime T: type, comptime op: Op, comptime checked: bool) type {
             };
         }
 
+        /// modulo (floored) or remainder (truncated) of every row; see the file comment.
+        fn modRem(comptime mode: Mode, a: anytype, b: anytype, out: *Out) KernelError!void {
+            const dst = out.values();
+            if (is_float) {
+                for (dst, 0..) |*d, i| d.* = modRemValue(T, op == .modulo, at(a, i), at(b, i));
+                if (mode == .checked) for (0..dst.len) |i| {
+                    if (at(b, i) == 0 and out.isValid(i)) return error.DivideByZero;
+                };
+                return;
+            }
+            // A zero divisor (null rows may hold one) or -1 (minInt % -1 traps) divides by 1:
+            // both give 0, the remainder of any value by -1.
+            var zero: u8 = 0;
+            for (dst, 0..) |*d, i| {
+                const y = at(b, i);
+                zero |= @intFromBool(y == 0);
+                d.* = modRemValue(T, op == .modulo, at(a, i), y);
+            }
+            if (zero != 0) for (0..dst.len) |i| {
+                if (at(b, i) == 0 and out.isValid(i)) return error.DivideByZero;
+            };
+            if (signed and mode == .checked) for (0..dst.len) |i| {
+                if (at(a, i) == std.math.minInt(T) and at(b, i) == -1 and out.isValid(i)) return error.Overflow;
+            };
+        }
+
         fn runUnary(comptime mode: Mode, a: anytype, out: *Out) KernelError!void {
             const dst = out.values();
             if (is_float) {
@@ -248,4 +281,23 @@ fn Arith(comptime T: type, comptime op: Op, comptime checked: bool) type {
             };
         }
     };
+}
+
+/// `x mod y` floored (`modulo`: the sign of `y`, Python's `%`) or truncated (the sign of `x`, C's
+/// `%` / `fmod`). Integers: a zero or -1 divisor gives 0 (callers report a zero divisor). Floats:
+/// IEEE `fmod`, then Python's adjustment (a zero result takes the sign of `y`).
+pub inline fn modRemValue(comptime T: type, comptime floored: bool, x: T, y: T) T {
+    if (@typeInfo(T) == .float) {
+        var r = @rem(x, y);
+        if (!floored) return r;
+        if (r != 0) {
+            if ((y < 0) != (r < 0)) r += y;
+        } else r = std.math.copysign(@as(T, 0), y);
+        return r;
+    }
+    const signed = @typeInfo(T).int.signedness == .signed;
+    const d: T = if (y == 0 or (signed and y == -1)) 1 else y;
+    var r = x -% @divTrunc(x, d) *% d;
+    if (floored and signed and r != 0 and ((r < 0) != (d < 0))) r += d;
+    return r;
 }

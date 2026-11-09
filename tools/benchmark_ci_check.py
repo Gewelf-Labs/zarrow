@@ -98,6 +98,10 @@ EXPECTED_BENCHES = {
     "compute_list_value_length",
     "compute_struct_field",
     "compute_map_lookup",
+    "compute_take_int32",
+    "compute_filter_int32",
+    "compute_run_end_encode_int32",
+    "compute_modulo_int64",
 }
 
 

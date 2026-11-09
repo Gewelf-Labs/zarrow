@@ -3,12 +3,13 @@
 //!
 //! - float32 / float64 (integers and decimals are cast to float64 first, Arrow's
 //!   `ArithmeticFloatingPointFunction`): sqrt, exp, expm1, ln, log10, log2, log1p, sin, cos, tan,
-//!   asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh; binary atan2 and logb. The unchecked
-//!   functions follow IEEE 754 (NaN for a domain error, -inf for a logarithm of zero); the
+//!   asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh; binary atan2, hypot and logb. The
+//!   unchecked functions follow IEEE 754 (NaN for a domain error, -inf for a logarithm of zero); the
 //!   `_checked` variants Arrow has (sqrt, ln, log10, log2, log1p, logb, sin, cos, tan, asin, acos,
 //!   acosh, atanh) return `InvalidInput` on a valid row outside the domain (a negative square
 //!   root, a logarithm of zero or of a negative number, the sine of an infinity, an arcsine past
-//!   1). NaN passes through every function.
+//!   1). NaN passes through every function but hypot, which is +inf when either argument is an
+//!   infinity (C's `hypot`; no intermediate overflow).
 //! - power (+ `_checked`) on int8..int64, uint8..uint64 (a negative exponent in a valid row is
 //!   `InvalidInput` in both variants; unchecked wraps, checked returns `Overflow` like Arrow's
 //!   left-to-right squaring) and on floats (`pow`, never an error); a decimal operand makes both
@@ -50,7 +51,7 @@ fn hasChecked(comptime op: Unary) bool {
 }
 
 /// Binary operations of this file.
-const Binary = enum { power, atan2, logb, bit_wise_and, bit_wise_or, bit_wise_xor, shift_left, shift_right };
+const Binary = enum { power, atan2, hypot, logb, bit_wise_and, bit_wise_or, bit_wise_xor, shift_left, shift_right };
 
 /// Register the math, bit-wise and shift functions.
 pub fn register(registry: *FunctionRegistry) KernelError!void {
@@ -64,10 +65,11 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     }
     inline for (float_types) |T| {
         try registry.registerScalarKernel("atan2", binaryKernel(T, .atan2, false));
+        try registry.registerScalarKernel("hypot", binaryKernel(T, .hypot, false));
         try registry.registerScalarKernel("logb", binaryKernel(T, .logb, false));
         try registry.registerScalarKernel("logb_checked", binaryKernel(T, .logb, true));
     }
-    inline for (.{ "atan2", "logb", "logb_checked" }) |name| try registry.setImplicitCast(name, .scalar, .floating);
+    inline for (.{ "atan2", "hypot", "logb", "logb_checked" }) |name| try registry.setImplicitCast(name, .scalar, .floating);
     inline for (dense.numeric_types) |T| {
         try registry.registerScalarKernel("power", binaryKernel(T, .power, false));
         try registry.registerScalarKernel("power_checked", binaryKernel(T, .power, true));
@@ -258,6 +260,9 @@ fn binaryKernel(comptime T: type, comptime op: Binary, comptime checked: bool) K
                 switch (op) {
                     .atan2 => for (dst, 0..) |*d, i| {
                         d.* = std.math.atan2(at(a, i), at(b, i));
+                    },
+                    .hypot => for (dst, 0..) |*d, i| {
+                        d.* = std.math.hypot(at(a, i), at(b, i));
                     },
                     .logb => {
                         for (dst, 0..) |*d, i| d.* = logbValue(T, at(a, i), at(b, i));

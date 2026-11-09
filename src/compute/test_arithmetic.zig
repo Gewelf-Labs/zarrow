@@ -408,3 +408,110 @@ test "arithmetic implicit casts: mixed numeric operands use Arrow's common type 
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("add", &.{ .{ .array = small }, .{ .array = flags } }, none));
     try std.testing.expectEqual(@as(?common.DataType, null), common.core.commonNumericType(&.{ .{ .array = small }, .{ .array = small } }));
 }
+
+test "modulo, remainder and their checked variants: signs, zero divisors, overflow, floats, nulls, sliced, chunked, scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // pc.modulo([7, -7, 7, -7, None], [2, 2, -2, -2, 1]) -> [1, 1, -1, -1, null];
+    // pc.remainder(...) -> [1, -1, 1, -1, null].
+    var x = try common.makeArray(i64, allocator, &.{ 7, -7, 7, -7, null });
+    defer x.release();
+    var y = try common.makeArray(i64, allocator, &.{ 2, 2, -2, -2, 1 });
+    defer y.release();
+    const xy = [_]Datum{ .{ .array = x }, .{ .array = y } };
+    inline for (.{ "", "_checked" }) |suffix| {
+        try common.expectInvoke(i64, &ctx, .scalar, "modulo" ++ suffix, &xy, &.{ 1, 1, -1, -1, null });
+        try common.expectInvoke(i64, &ctx, .scalar, "remainder" ++ suffix, &xy, &.{ 1, -1, 1, -1, null });
+    }
+    // Sliced operands.
+    var xs = try x.slice(2, 3);
+    defer xs.release();
+    var ys = try y.slice(1, 3);
+    defer ys.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "modulo", &.{ .{ .array = xs }, .{ .array = ys } }, &.{ 1, -1, null });
+    // Chunked operands give a chunked result.
+    var cx = try common.chunkedAt(allocator, x, &.{ 1, 3 });
+    defer cx.release();
+    var out = try ctx.invokeScalar("remainder", &.{ .{ .chunked = cx }, .{ .array = y } }, none);
+    defer out.release();
+    try std.testing.expect(out == .chunked);
+    const got = try common.collect(i64, allocator, out);
+    defer allocator.free(got);
+    try common.expectRows(i64, &.{ 1, -1, 1, -1, null }, got);
+    // Scalars: pc.modulo(7, -2) -> -1, pc.remainder(7, -2) -> 1.
+    try common.expectInvoke(i64, &ctx, .scalar, "modulo", &.{ .{ .scalar = common.scalarOf(i64, 7) }, .{ .scalar = common.scalarOf(i64, -2) } }, &.{-1});
+    try common.expectInvoke(i64, &ctx, .scalar, "remainder", &.{ .{ .scalar = common.scalarOf(i64, 7) }, .{ .scalar = common.scalarOf(i64, -2) } }, &.{1});
+    try common.expectInvoke(i64, &ctx, .scalar, "modulo", &.{ .{ .array = x }, .{ .scalar = common.scalarOf(i64, null) } }, &.{ null, null, null, null, null });
+
+    // int8 minInt by -1: 0 unchecked, Overflow checked (Arrow: "overflow").
+    var m = try common.makeArray(i8, allocator, &.{ -128, 5 });
+    defer m.release();
+    var n1 = try common.makeArray(i8, allocator, &.{ -1, 3 });
+    defer n1.release();
+    const mn = [_]Datum{ .{ .array = m }, .{ .array = n1 } };
+    try common.expectInvoke(i8, &ctx, .scalar, "modulo", &mn, &.{ 0, 2 });
+    try common.expectInvoke(i8, &ctx, .scalar, "remainder", &mn, &.{ 0, 2 });
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("modulo_checked", &mn, none));
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("remainder_checked", &mn, none));
+    // A zero divisor is an error in both variants (Arrow: "divide by zero"), not in a null row.
+    var z = try common.makeArray(u8, allocator, &.{ 5, 3 });
+    defer z.release();
+    var zd = try common.makeArray(u8, allocator, &.{ 3, 0 });
+    defer zd.release();
+    inline for (.{ "modulo", "modulo_checked", "remainder", "remainder_checked" }) |name| {
+        try std.testing.expectError(error.DivideByZero, ctx.invokeScalar(name, &.{ .{ .array = z }, .{ .array = zd } }, none));
+    }
+    var zn = try common.makeArray(i32, allocator, &.{ null, 9 });
+    defer zn.release();
+    var zz = try common.makeArray(i32, allocator, &.{ 0, 4 });
+    defer zz.release();
+    try common.expectInvoke(i32, &ctx, .scalar, "modulo_checked", &.{ .{ .array = zn }, .{ .array = zz } }, &.{ null, 1 });
+    // Unsigned and mixed types (int8 % uint8 is int16: -7 % 3 = 2, remainder -1).
+    var big = try common.makeArray(u64, allocator, &.{(1 << 63) + 5});
+    defer big.release();
+    var seven = try common.makeArray(u64, allocator, &.{7});
+    defer seven.release();
+    try common.expectInvoke(u64, &ctx, .scalar, "modulo", &.{ .{ .array = big }, .{ .array = seven } }, &.{6});
+    var s8 = try common.makeArray(i8, allocator, &.{-7});
+    defer s8.release();
+    var u8a = try common.makeArray(u8, allocator, &.{3});
+    defer u8a.release();
+    try common.expectInvoke(i16, &ctx, .scalar, "modulo", &.{ .{ .array = s8 }, .{ .array = u8a } }, &.{2});
+    try common.expectInvoke(i16, &ctx, .scalar, "remainder", &.{ .{ .array = s8 }, .{ .array = u8a } }, &.{-1});
+
+    // Floats: modulo is Python's %, remainder is fmod; a zero divisor gives NaN unchecked.
+    const inf = std.math.inf(f64);
+    const nan = std.math.nan(f64);
+    var fx = try common.makeArray(f64, allocator, &.{ 7.5, -7.5, 7.5, -7.5, 1.0, inf, 5.0, -5.0, 5.0, -0.0, 6.0, -6.0, nan, null });
+    defer fx.release();
+    var fy = try common.makeArray(f64, allocator, &.{ 2.0, 2.0, -2.0, -2.0, 0.0, 2.0, inf, inf, -inf, -2.0, -3.0, 3.0, 2.0, 1.0 });
+    defer fy.release();
+    const fxy = [_]Datum{ .{ .array = fx }, .{ .array = fy } };
+    try common.expectInvoke(f64, &ctx, .scalar, "modulo", &fxy, &.{ 1.5, 0.5, -0.5, -1.5, nan, nan, 5.0, inf, -inf, -0.0, -0.0, 0.0, nan, null });
+    try common.expectInvoke(f64, &ctx, .scalar, "remainder", &fxy, &.{ 1.5, -1.5, 1.5, -1.5, nan, nan, 5.0, -5.0, 5.0, -0.0, 0.0, -0.0, nan, null });
+    // Signs of the zeros (expectRows compares -0.0 == 0.0).
+    var fm = try ctx.invokeScalar("modulo", &fxy, none);
+    defer fm.release();
+    const fmv = try (common.array_mod.PrimitiveArray(f64){ .data = fm.array.data() }).values();
+    try std.testing.expect(std.math.signbit(fmv[9]) and std.math.signbit(fmv[10]) and !std.math.signbit(fmv[11]));
+    var fr = try ctx.invokeScalar("remainder", &fxy, none);
+    defer fr.release();
+    const frv = try (common.array_mod.PrimitiveArray(f64){ .data = fr.array.data() }).values();
+    try std.testing.expect(std.math.signbit(frv[9]) and !std.math.signbit(frv[10]) and std.math.signbit(frv[11]));
+    try std.testing.expectError(error.DivideByZero, ctx.invokeScalar("modulo_checked", &fxy, none));
+    try std.testing.expectError(error.DivideByZero, ctx.invokeScalar("remainder_checked", &fxy, none));
+    var f32x = try common.makeArray(f32, allocator, &.{-7.5});
+    defer f32x.release();
+    try common.expectInvoke(f32, &ctx, .scalar, "modulo", &.{ .{ .array = f32x }, .{ .scalar = common.scalarOf(f32, 2) } }, &.{0.5});
+    // int32 % double is double: pc.modulo([7], [2.5]) -> [2.0].
+    var seven_i = try common.makeArray(i32, allocator, &.{7});
+    defer seven_i.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "modulo_checked", &.{ .{ .array = seven_i }, .{ .scalar = common.scalarOf(f64, 2.5) } }, &.{2.0});
+    // No bool or float16 kernel (as Arrow).
+    var bools = try common.makeArray(bool, allocator, &.{true});
+    defer bools.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("modulo", &.{ .{ .array = bools }, .{ .array = bools } }, none));
+}

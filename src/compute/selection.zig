@@ -28,6 +28,9 @@
 //!   and inverse_permutation(indices) (`InversePermutationOptions`): see their functions below;
 //!   indices are bounds-checked before any write and option-driven output lengths are capped.
 //!
+//! - take / array_take(values, indices) (`TakeOptions`) and filter / array_filter(values,
+//!   predicate) (`FilterOptions`): see `takeExec` and `filterExec`.
+//!
 //! Inputs pass `validateLayout` before any buffer is read.
 const std = @import("std");
 const core = @import("core.zig");
@@ -97,6 +100,22 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         .signature = .{ .arity = 1, .type_check = inverseArgs, .options_check = inverseOptions, .result_type_fn = inverseType },
         .exec = inverseExec,
     });
+    // take and filter (Arrow's meta functions) also take chunked, record batch and table values;
+    // array_take takes arrays only and array_filter arrays and chunked arrays, as Arrow.
+    inline for (.{ "take", "array_take" }) |name| {
+        const meta = comptime std.mem.eql(u8, name, "take");
+        try registry.registerVectorKernel(name, .{
+            .signature = .{ .arity = 2, .type_check = Selector(meta).takeArgs, .options_check = takeOptions, .result_type_fn = valuesType, .tabular = meta },
+            .exec = takeExec,
+        });
+    }
+    inline for (.{ "filter", "array_filter" }) |name| {
+        const meta = comptime std.mem.eql(u8, name, "filter");
+        try registry.registerVectorKernel(name, .{
+            .signature = .{ .arity = 2, .type_check = Selector(meta).filterArgs, .options_check = filterOptions, .result_type_fn = valuesType, .tabular = meta },
+            .exec = filterExec,
+        });
+    }
 }
 
 fn notScalar(args: []const Datum) bool {
@@ -934,4 +953,137 @@ fn nonzeroIn(d: *const ArrayData, out: ?[]u64, base: usize) KernelError!usize {
         }
     }
     return error.InvalidInput;
+}
+
+// ------------------------------------------------------------------------------ take, filter
+
+fn Selector(comptime meta: bool) type {
+    return struct {
+        /// take: values of any datum kind but a scalar, indices an integer array or chunked
+        /// array; array_take: both arrays.
+        fn takeArgs(args: []const Datum) bool {
+            if (args.len != 2 or !isIntegerType(args[1].dataType())) return false;
+            if (!meta) return args[0] == .array and args[1] == .array;
+            return args[0] != .scalar and (args[1] == .array or args[1] == .chunked);
+        }
+
+        /// filter: values of any datum kind but a scalar; array_filter: an array or chunked
+        /// array. The predicate is a bool array or chunked array (a scalar is not, as Arrow).
+        fn filterArgs(args: []const Datum) bool {
+            if (args.len != 2 or args[1].dataType() != .bool) return false;
+            if (args[1] != .array and args[1] != .chunked) return false;
+            return args[0] == .array or args[0] == .chunked or (meta and args[0].isTabular());
+        }
+    };
+}
+
+fn isIntegerType(dt: DataType) bool {
+    return switch (dt) {
+        .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => true,
+        else => false,
+    };
+}
+
+fn takeOptions(options: Options) bool {
+    return options == .none or options == .take;
+}
+
+fn filterOptions(options: Options) bool {
+    return options == .none or options == .filter;
+}
+
+fn valuesType(args: []const Datum, _: Options) KernelError!DataType {
+    if (args.len != 2) return error.InvalidArity;
+    return args[0].dataType();
+}
+
+/// Validate every chunk of an array or chunked datum (record batch and table columns were
+/// checked when the batch or table was built).
+fn validateParts(datum: Datum) KernelError!void {
+    switch (datum) {
+        .array => |a| a.data().validateLayout() catch return error.InvalidInput,
+        .chunked => |c| for (c.chunks()) |p| p.data().validateLayout() catch return error.InvalidInput,
+        else => {},
+    }
+}
+
+/// take(values, indices): row `indices[i]` of `values` for every `i` (Arrow C++). Indices of any
+/// integer type; a null index gives a null row; a negative index or one at or past the values'
+/// length is `InvalidInput` (Arrow's IndexError), also with `TakeOptions.boundscheck` false
+/// (Arrow then skips the check; zarrow never reads out of bounds). Chunked values give a chunked
+/// result, record batches and tables their own kind (`take` only); chunked indices give a
+/// chunked result. Every layout the take kernels handle.
+pub fn takeExec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    if (args.len != 2) return error.InvalidArity;
+    try validateParts(args[0]);
+    const n = args[0].length();
+    const parts: []const ArrayRef = switch (args[1]) {
+        .array => |*a| a[0..1],
+        .chunked => |c| c.chunks(),
+        else => return error.InvalidInput,
+    };
+    const total = args[1].length();
+    const none_idx = std.math.maxInt(usize); // a null index
+    const dense_idx = ctx.allocator.alloc(usize, total) catch return error.OutOfMemory;
+    defer ctx.allocator.free(dense_idx);
+    var any_null = false;
+    var pos: usize = 0;
+    for (parts) |p| {
+        const d = p.data();
+        d.validateLayout() catch return error.InvalidInput;
+        const out = dense_idx[pos..][0..d.length];
+        switch (d.data_type) {
+            inline .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => |_, tag| {
+                const I = switch (tag) {
+                    .int8 => i8,
+                    .int16 => i16,
+                    .int32 => i32,
+                    .int64 => i64,
+                    .uint8 => u8,
+                    .uint16 => u16,
+                    .uint32 => u32,
+                    else => u64,
+                };
+                const xs = (PrimitiveArray(I){ .data = d }).values() catch return error.InvalidInput;
+                const bits = dense.validityBits(d);
+                for (out, xs, 0..) |*o, x, i| {
+                    if (bits) |b| if (!bitmap.bitIsSet(b, d.offset + i)) {
+                        any_null = true;
+                        o.* = none_idx;
+                        continue;
+                    };
+                    const at = std.math.cast(usize, x) orelse return error.InvalidInput;
+                    if (at >= n) return error.InvalidInput;
+                    o.* = at;
+                }
+            },
+            else => return error.InvalidInput,
+        }
+        pos += d.length;
+    }
+    const out = if (any_null) blk: {
+        const nullable = ctx.allocator.alloc(?usize, total) catch return error.OutOfMemory;
+        defer ctx.allocator.free(nullable);
+        for (nullable, dense_idx) |*o, x| o.* = if (x == none_idx) null else x;
+        break :blk try core.datumTakeNullable(args[0], nullable);
+    } else try core.datumTake(args[0], dense_idx);
+    if (args[1] == .chunked and out == .array) return likeInput(ctx.allocator, args[1], out.array);
+    return out;
+}
+
+/// filter(values, predicate): the rows where the bool predicate (of the values' length,
+/// `InvalidInput` otherwise) is true; a null predicate row drops the row, or gives a null row with
+/// `FilterOptions.drop_nulls` false (Arrow's `emit_null`). Array values and predicate give an
+/// array, a chunked argument a chunked result, record batches and tables their own kind
+/// (`filter` only). Every layout the take kernels handle.
+pub fn filterExec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+    if (args.len != 2) return error.InvalidArity;
+    try validateParts(args[0]);
+    try validateParts(args[1]);
+    if (args[1].length() != args[0].length()) return error.InvalidInput;
+    const opts: core.FilterOptions = if (options == .filter) options.filter else .{};
+    if (args[0] == .array and args[1] == .array) return core.datumFilter(args[0], args[1], opts);
+    const out = try core.datumFilterChunkAware(args[0], args[1], opts);
+    if (args[1] == .chunked and out == .array) return likeInput(ctx.allocator, args[1], out.array);
+    return out;
 }
