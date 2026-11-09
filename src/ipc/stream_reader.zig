@@ -1708,12 +1708,13 @@ fn buildRecordBatchFromFlatbuf(
     // Checked before the batch exists: an error return after the manual column release below
     // would run the columns errdefer again (double release + double free).
     const expected_rows = std.math.cast(usize, record_batch_t.length) orelse return StreamError.InvalidMetadata;
-    const num_rows = if (col_count == 0) 0 else columns[0].data().length;
-    if (num_rows != expected_rows) return StreamError.InvalidMetadata;
+    if (col_count != 0 and columns[0].data().length != expected_rows) return StreamError.InvalidMetadata;
 
     // The batch takes over `columns` (slice and refs); on error they are still ours to release.
-    const batch = try RecordBatch.initPrevalidatedOwned(allocator, mut_ref, columns);
+    var batch = try RecordBatch.initPrevalidatedOwned(allocator, mut_ref, columns);
     schema_taken = true;
+    // A batch without columns carries its row count in the message alone (Arrow allows it).
+    if (col_count == 0) batch.num_rows = expected_rows;
     return batch;
 }
 
@@ -3746,6 +3747,50 @@ fn extensionDictionary(allocator: std.mem.Allocator, index_type: datatype.IntTyp
     defer dict_builder.deinit();
     for (indices) |i| if (i) |x| try dict_builder.appendIndex(x) else try dict_builder.appendNull();
     return dict_builder.finish(values);
+}
+
+test "ipc stream and file readers keep the row count of a record batch without columns" {
+    // Arrow allows a schema with no fields and batches with rows; the length is in the message only.
+    const allocator = std.testing.allocator;
+    const schema = Schema{ .fields = &.{} };
+    var batch = try RecordBatch.initBorrowed(allocator, schema, &.{});
+    defer batch.deinit();
+    batch.num_rows = 4;
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var writer = stream_writer.StreamWriter.init(allocator, &out.writer);
+    defer writer.deinit();
+    try writer.writeSchema(schema);
+    try writer.writeRecordBatch(batch);
+    try writer.writeEnd();
+
+    var stream: std.Io.Reader = .fixed(out.written());
+    var reader = StreamReader.init(allocator, &stream);
+    defer reader.deinit();
+    const read_schema = try reader.readSchema();
+    try std.testing.expectEqual(@as(usize, 0), read_schema.fields.len);
+    var read_batch = (try reader.nextRecordBatch()).?;
+    defer read_batch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), read_batch.columns.len);
+    try std.testing.expectEqual(@as(usize, 4), read_batch.numRows());
+    try std.testing.expect((try reader.nextRecordBatch()) == null);
+
+    // The file format: the same batch through the file writer and reader.
+    var file_out = std.Io.Writer.Allocating.init(allocator);
+    defer file_out.deinit();
+    var file_writer = try @import("file_writer.zig").FileWriter.init(allocator, &file_out.writer);
+    defer file_writer.deinit();
+    try file_writer.writeSchema(schema);
+    try file_writer.writeRecordBatch(batch);
+    try file_writer.writeEnd();
+    var file_reader = @import("file_reader.zig").FileReader.init(allocator, file_out.written());
+    defer file_reader.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try file_reader.recordBatchCount());
+    var file_batch = try file_reader.readRecordBatchAt(0);
+    defer file_batch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), file_batch.columns.len);
+    try std.testing.expectEqual(@as(usize, 4), file_batch.numRows());
 }
 
 test "ipc stream reads a dictionary of an extension type as a dictionary whose value type is the extension (arrow.uuid and a custom name)" {

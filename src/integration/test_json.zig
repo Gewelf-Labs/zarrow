@@ -367,8 +367,7 @@ test "integration json reads schemas without batches" {
     );
     defer doc.deinit();
     try testing.expectEqual(@as(usize, 0), doc.batches.len);
-    // A batch without columns keeps its row count (JSON only: zarrow's IPC reader rejects a
-    // column-less batch with rows, see docs/integration-suite.md).
+    // A batch without columns keeps its row count, as the IPC readers do.
     var none = try roundTripOpts(
         \\{"schema": {"fields": []}, "batches": [{"count": 4, "columns": []}]}
     , false);

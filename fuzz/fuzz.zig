@@ -1273,8 +1273,8 @@ fn integrationJsonTarget(gpa: Allocator, bytes: []const u8, fb: *Feedback) !void
     var r: integration.golden.Result = .{};
     if (!integration.golden.same(&r, "JSON round trip", &doc, &again)) std.debug.panic("fuzz-invariant: {s}", .{r.message()});
 
-    // The IPC writers may refuse (a column-less batch with rows);
-    // what they write must read back equal.
+    // The IPC writers may refuse an input the JSON reader accepts (an index type the writer
+    // cannot number, say); what they write must read back equal.
     const ipc = integration.golden.writeIpc(gpa, &doc, .stream) catch return;
     defer gpa.free(ipc);
     var back = integration.golden.readStream(gpa, ipc) catch return;
