@@ -15,7 +15,7 @@ const Scalar = common.Scalar;
 const TypeTag = std.meta.Tag(DataType);
 
 /// A list row of int32 items (null: a null row).
-const Row = ?[]const ?i32;
+pub const Row = ?[]const ?i32;
 
 const none = Options.noneValue();
 const int32_type = DataType{ .int32 = {} };
@@ -44,7 +44,7 @@ fn ownedBytes(allocator: std.mem.Allocator, bytes: []const u8) !buffer.SharedBuf
 /// A list array of layout `tag` over int32 `rows`: list and large_list store the items in row
 /// order, the view layouts in reverse row order (not contiguous), a fixed_size_list stores `size`
 /// zeros for a null row.
-fn makeList(comptime tag: TypeTag, allocator: std.mem.Allocator, rows: []const Row, size: usize) !ArrayRef {
+pub fn makeList(comptime tag: TypeTag, allocator: std.mem.Allocator, rows: []const Row, size: usize) !ArrayRef {
     const n = rows.len;
     const view = tag == .list_view or tag == .large_list_view;
     var vals: std.ArrayList(?i32) = .empty;
@@ -319,7 +319,7 @@ test "structural list functions: list_value_length, list_element, list_flatten, 
 
 /// A struct array over `children` (retained) with field names `names` and row validity `valid`
 /// (null: no null rows).
-fn makeStruct(allocator: std.mem.Allocator, names: []const []const u8, children: []const ArrayRef, valid: ?[]const bool) !ArrayRef {
+pub fn makeStruct(allocator: std.mem.Allocator, names: []const []const u8, children: []const ArrayRef, valid: ?[]const bool) !ArrayRef {
     const len = children[0].data().length;
     var validity: ?buffer.OwnedBuffer = null;
     if (valid) |v| {
@@ -331,14 +331,14 @@ fn makeStruct(allocator: std.mem.Allocator, names: []const []const u8, children:
     return dense.structArray(allocator, names, children, len, validity);
 }
 
-const key_str = Field{ .name = "key", .data_type = &string_type, .nullable = false };
+pub const key_str = Field{ .name = "key", .data_type = &string_type, .nullable = false };
 const key_i32 = Field{ .name = "key", .data_type = &int32_type, .nullable = false };
-const value_i64 = Field{ .name = "value", .data_type = &int64_type };
+pub const value_i64 = Field{ .name = "value", .data_type = &int64_type };
 const value_str = Field{ .name = "value", .data_type = &string_type };
 const value_i32 = Field{ .name = "value", .data_type = &int32_type };
 
 /// A map array over `keys` and `items` (retained) with row lengths `lens` (null: a null row).
-fn makeMap(allocator: std.mem.Allocator, key: Field, item: Field, keys: ArrayRef, items: ArrayRef, lens: []const ?usize) !ArrayRef {
+pub fn makeMap(allocator: std.mem.Allocator, key: Field, item: Field, keys: ArrayRef, items: ArrayRef, lens: []const ?usize) !ArrayRef {
     _ = keys.retain();
     _ = items.retain();
     var entries = try dense.structArrayFields(allocator, &.{ key, item }, &.{ keys, items }, keys.data().length, null);

@@ -517,3 +517,68 @@ test "temporal time32 / time64 inputs, us_year and interval differences (Arrow C
     defer ud64.release();
     try common.expectInvoke(i64, &ctx, .scalar, "us_year", &.{.{ .array = ud64 }}, &.{ 1969, 1970 });
 }
+
+test "floor_temporal, ceil_temporal and round_temporal on duration: multiples from zero, finer units, strict ceil, weeks, sliced, chunked, scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const dur_ms = DataType{ .duration = .{ .unit = .millisecond } };
+    const dur_s = DataType{ .duration = .{ .unit = .second } };
+    const day: i64 = 86_400_000;
+
+    // Default options: one day.
+    var a = try common.makeTyped(i64, dur_ms, allocator, &.{ 1, 2, 4, null, -5 });
+    defer a.release();
+    const da: Datum = .{ .array = a };
+    try common.expectInvoke(i64, &ctx, .scalar, "ceil_temporal", &.{da}, &.{ day, day, day, null, 0 });
+    try common.expectInvoke(i64, &ctx, .scalar, "floor_temporal", &.{da}, &.{ 0, 0, 0, null, -day });
+    try common.expectInvoke(i64, &ctx, .scalar, "round_temporal", &.{da}, &.{ 0, 0, 0, null, 0 });
+    try std.testing.expect((try registry.resolveResultType("ceil_temporal", .scalar, &.{da}, none)).eql(dur_ms));
+    // Three milliseconds.
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{da}, round(3, .millisecond), &.{ 3, 3, 6, null, -3 });
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{da}, round(3, .millisecond), &.{ 0, 0, 3, null, -6 });
+    try common.expectInvokeWith(i64, &ctx, "round_temporal", &.{da}, round(3, .millisecond), &.{ 0, 3, 3, null, -6 });
+    // Sliced and chunked.
+    var tail = try a.slice(2, 3);
+    defer tail.release();
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{.{ .array = tail }}, round(3, .millisecond), &.{ 6, null, -3 });
+    var c = try common.chunkedAt(allocator, a, &.{ 1, 4 });
+    defer c.release();
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{.{ .chunked = c }}, round(3, .millisecond), &.{ 0, 0, 3, null, -6 });
+
+    // Seconds: seven minutes, a unit finer than the input (unchanged), strict ceil, weeks from zero.
+    var s = try common.makeTyped(i64, dur_s, allocator, &.{ 1500, -1500, 2500, 0, 420, 777605 });
+    defer s.release();
+    const ds: Datum = .{ .array = s };
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{ds}, round(7, .minute), &.{ 1680, -1260, 2520, 0, 420, 777840 });
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{ds}, round(7, .minute), &.{ 1260, -1680, 2100, 0, 420, 777420 });
+    try common.expectInvokeWith(i64, &ctx, "round_temporal", &.{ds}, round(7, .minute), &.{ 1680, -1680, 2520, 0, 420, 777420 });
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{ds}, roundWith(.{ .multiple = 7, .unit = .minute, .ceil_is_strictly_greater = true }), &.{ 1680, -1260, 2520, 420, 840, 777840 });
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{ds}, roundWith(.{ .unit = .second, .ceil_is_strictly_greater = true }), &.{ 1501, -1499, 2501, 1, 421, 777606 });
+    inline for (.{ "ceil_temporal", "floor_temporal", "round_temporal" }) |name| {
+        try common.expectInvokeWith(i64, &ctx, name, &.{ds}, roundWith(.{ .unit = .millisecond, .ceil_is_strictly_greater = true }), &.{ 1500, -1500, 2500, 0, 420, 777605 });
+    }
+    const week: i64 = 604800;
+    try common.expectInvokeWith(i64, &ctx, "ceil_temporal", &.{ds}, round(1, .week), &.{ week, 0, week, 0, week, 2 * week });
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{ds}, round(1, .week), &.{ 0, -week, 0, 0, 0, week });
+    try common.expectInvokeWith(i64, &ctx, "round_temporal", &.{ds}, round(1, .week), &.{ 0, 0, 0, 0, 0, week });
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{ds}, roundWith(.{ .unit = .week, .week_starts_monday = false }), &.{ 0, -week, 0, 0, 0, week });
+    try common.expectInvokeWith(i64, &ctx, "floor_temporal", &.{ds}, round(2, .week), &.{ 0, -2 * week, 0, 0, 0, 0 });
+
+    // Scalars.
+    var sc = try ctx.invokeScalar("ceil_temporal", &.{.{ .scalar = Scalar.init(dur_ms, .{ .duration = 1 }) }}, none);
+    defer sc.release();
+    try std.testing.expectEqual(day, sc.scalar.value.duration);
+    var sn = try ctx.invokeScalar("floor_temporal", &.{.{ .scalar = Scalar.init(dur_ms, .null) }}, none);
+    defer sn.release();
+    try std.testing.expect(sn.scalar.isNull());
+
+    // Calendar units and calendar_based_origin (Arrow: "Duration values can only be rounded
+    // using units from nanoseconds through weeks", "calendar_based_origin is not supported for
+    // duration inputs").
+    inline for (.{ CalendarUnit.month, CalendarUnit.quarter, CalendarUnit.year }) |u| {
+        try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("floor_temporal", &.{da}, round(1, u)));
+    }
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("round_temporal", &.{da}, roundWith(.{ .multiple = 2, .unit = .minute, .calendar_based_origin = true })));
+}

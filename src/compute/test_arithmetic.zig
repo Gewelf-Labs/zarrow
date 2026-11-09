@@ -515,3 +515,97 @@ test "modulo, remainder and their checked variants: signs, zero divisors, overfl
     defer bools.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("modulo", &.{ .{ .array = bools }, .{ .array = bools } }, none));
 }
+
+/// One function that takes null-type arguments: its name, kind and arity.
+const NullCase = struct { name: []const u8, kind: common.core.FunctionKind = .scalar, arity: usize };
+
+const null_type_cases = blk: {
+    const unary = [_][]const u8{
+        "abs",         "abs_checked", "negate",      "negate_checked", "sign",              "sqrt",          "sqrt_checked",  "exp",          "expm1",
+        "ln",          "ln_checked",  "log10",       "log10_checked",  "log1p",             "log1p_checked", "log2",          "log2_checked", "sin",
+        "sin_checked", "cos",         "cos_checked", "tan",            "tan_checked",       "asin",          "asin_checked",  "acos",         "acos_checked",
+        "atan",        "sinh",        "cosh",        "tanh",           "asinh",             "acosh",         "acosh_checked", "atanh",        "atanh_checked",
+        "ceil",        "floor",       "trunc",       "round",          "round_to_multiple", "bit_wise_not",
+    };
+    const binary = [_][]const u8{
+        "add",                 "add_checked",    "subtract",     "subtract_checked",  "multiply",     "multiply_checked", "divide",             "divide_checked",
+        "modulo",              "modulo_checked", "remainder",    "remainder_checked", "power",        "power_checked",    "logb",               "logb_checked",
+        "atan2",               "hypot",          "bit_wise_and", "bit_wise_or",       "bit_wise_xor", "shift_left",       "shift_left_checked", "shift_right",
+        "shift_right_checked", "round_binary",
+    };
+    var out: [unary.len + binary.len + 2]NullCase = undefined;
+    for (unary, 0..) |n, i| out[i] = .{ .name = n, .arity = 1 };
+    for (binary, 0..) |n, i| out[unary.len + i] = .{ .name = n, .arity = 2 };
+    out[unary.len + binary.len] = .{ .name = "pairwise_diff", .kind = .vector, .arity = 1 };
+    out[unary.len + binary.len + 1] = .{ .name = "pairwise_diff_checked", .kind = .vector, .arity = 1 };
+    break :blk out;
+};
+
+test "arithmetic, math, rounding, bit-wise and pairwise_diff functions on null-type arguments give a null-type result: arrays, sliced, chunked, scalars (pyarrow 26)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var nulls = try dense.nullArray(allocator, .{ .null = {} }, 5);
+    defer nulls.release();
+    var tail = try nulls.slice(2, 3);
+    defer tail.release();
+    var chunked = try common.chunkedAt(allocator, nulls, &.{2});
+    defer chunked.release();
+    const ns: Datum = .{ .scalar = common.Scalar.init(.{ .null = {} }, .null) };
+    for (null_type_cases) |c| {
+        const inputs = [_]Datum{ .{ .array = nulls }, .{ .array = tail }, .{ .chunked = chunked } };
+        for (inputs) |in| {
+            const args = [_]Datum{ in, in };
+            var out = try ctx.invoke(c.name, c.kind, args[0..c.arity], none);
+            defer out.release();
+            try std.testing.expect(out.dataType() == .null);
+            try std.testing.expectEqual(in.length(), out.length());
+            try std.testing.expectEqual(in == .chunked, out == .chunked);
+            if (out.asArray()) |a| try a.data().validateFull();
+            try std.testing.expect((try registry.resolveResultType(c.name, c.kind, args[0..c.arity], none)) == .null);
+        }
+        if (c.kind == .scalar) {
+            // Scalars, and an array with a null-type scalar (broadcast).
+            const sargs = [_]Datum{ ns, ns };
+            var s = try ctx.invoke(c.name, c.kind, sargs[0..c.arity], none);
+            defer s.release();
+            try std.testing.expect(s == .scalar and s.scalar.isNull() and s.dataType() == .null);
+            if (c.arity == 2) {
+                var m = try ctx.invoke(c.name, c.kind, &.{ .{ .array = nulls }, ns }, none);
+                defer m.release();
+                try std.testing.expectEqual(@as(usize, 5), m.array.data().length);
+            }
+        }
+        try std.testing.expectEqualStrings("kernel resolution should succeed: null-type arguments give a null-type result", registry.explainResolveKernelFailure(c.name, c.kind, (&[_]Datum{ .{ .array = nulls }, .{ .array = nulls } })[0..c.arity], none));
+    }
+    // Options are still checked, the arity too; a null type with another type is not this path.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("round", &.{.{ .array = nulls }}, .{ .cast = .{} }));
+    try std.testing.expectError(error.InvalidArity, ctx.invokeScalar("add", &.{.{ .array = nulls }}, none));
+    var ints = try common.makeArray(i32, allocator, &.{ 1, 2, 3, 4, 5 });
+    defer ints.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("round_binary", &.{ .{ .array = nulls }, .{ .array = ints } }, none));
+    try common.expectInvoke(i32, &ctx, .scalar, "add", &.{ .{ .array = nulls }, .{ .array = ints } }, &.{ null, null, null, null, null });
+    // Other functions keep rejecting the null type.
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("utf8_upper", &.{.{ .array = nulls }}, none));
+}
+
+test "sign on duration gives int8: nulls, sliced, chunked and scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const dt: common.DataType = .{ .duration = .{ .unit = .millisecond } };
+    var d = try common.makeTyped(i64, dt, allocator, &.{ 1, 2, 4, null, -5, 0 });
+    defer d.release();
+    try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .array = d }}, &.{ 1, 1, 1, null, -1, 0 });
+    var tail = try d.slice(3, 3);
+    defer tail.release();
+    try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .array = tail }}, &.{ null, -1, 0 });
+    var c = try common.chunkedAt(allocator, d, &.{4});
+    defer c.release();
+    try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .chunked = c }}, &.{ 1, 1, 1, null, -1, 0 });
+    try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .scalar = common.Scalar.init(dt, .{ .duration = -7 }) }}, &.{-1});
+    try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .scalar = common.Scalar.init(dt, .null) }}, &.{null});
+    try std.testing.expect((try registry.resolveResultType("sign", .scalar, &.{.{ .array = d }}, none)) == .int8);
+}

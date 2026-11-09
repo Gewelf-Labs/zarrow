@@ -21,7 +21,8 @@
 //!   `_checked` shifts return `InvalidInput` for it. shift_left wraps; shift_right is arithmetic
 //!   for signed types.
 //!
-//! Null handling is intersection; array, chunked or scalar operands.
+//! Null handling is intersection; array, chunked or scalar operands. Arguments that are all of
+//! the null type give a null-type result of their length (Arrow's null kernels).
 const std = @import("std");
 const core = @import("core.zig");
 const dense = @import("dense.zig");
@@ -88,6 +89,14 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
     }
     inline for (.{ "bit_wise_and", "bit_wise_or", "bit_wise_xor", "shift_left", "shift_left_checked", "shift_right", "shift_right_checked" }) |name| {
         try registry.setImplicitCast(name, .scalar, .numeric);
+    }
+    // Null-type arguments give a null-type result (Arrow's null kernels).
+    inline for (comptime std.meta.tags(Unary)) |op| {
+        try registry.setNullTypeResult(@tagName(op), .scalar);
+        if (comptime hasChecked(op)) try registry.setNullTypeResult(@tagName(op) ++ "_checked", .scalar);
+    }
+    inline for (.{ "atan2", "hypot", "logb", "logb_checked", "power", "power_checked", "bit_wise_and", "bit_wise_or", "bit_wise_xor", "bit_wise_not", "shift_left", "shift_left_checked", "shift_right", "shift_right_checked" }) |name| {
+        try registry.setNullTypeResult(name, .scalar);
     }
 }
 

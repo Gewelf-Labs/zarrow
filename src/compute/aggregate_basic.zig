@@ -16,10 +16,15 @@
 //!   0 when no row is valid and `min_count` is 0.
 //! - mean: float64 of the exact sum over the valid count; NaN when no row is valid and
 //!   `min_count` is 0.
+//! - sum / mean of bool (as pyarrow 26): sum is the uint64 count of true rows, mean the float64
+//!   fraction of true rows among the valid ones. Of the null type: int64 sum / float64 mean, null
+//!   with the default options (no valid row), 0 / 0.0 with `min_count = 0` and `skip_nulls`.
 //! - min / max / min_max: the input type; NaN is ignored unless every valid value is NaN; null (both
 //!   fields null for min_max) when no row is valid, whatever `min_count`. min_max returns a struct
 //!   scalar `{min, max}`.
-//! - count: valid, null or all rows (`CountOptions.mode`); count_all: all rows of its one
+//! - count: valid, null or all rows (`CountOptions.mode`) of any type; a union row is null when
+//!   its selected child's row is, a run-end encoded row when its run's value is
+//!   (`is_null.logicalValidity`, as Arrow's logical nulls); count_all: all rows of its one
 //!   argument, or 0 when called with no argument (Arrow's nullary calling convention: no batch, no
 //!   rows). Both int64, never null.
 //! - any / all: bool input; with no valid row (and `min_count` 0) any is false and all is true.
@@ -64,7 +69,11 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
         try add(registry, "max", 1, check, scalarAggregateOptions, MinMax(T, .max));
         try add(registry, "min_max", 1, check, scalarAggregateOptions, MinMax(T, .min_max));
     }
-    try add(registry, "count", 1, is_null.hasValidityBitmap, countOptions, Count(.count));
+    inline for (.{ .bool, .null }) |tag| {
+        try add(registry, "sum", 1, dense.argsOfType(tag, 1), scalarAggregateOptions, BoolOrNull(tag, .sum));
+        try add(registry, "mean", 1, dense.argsOfType(tag, 1), scalarAggregateOptions, BoolOrNull(tag, .mean));
+    }
+    try add(registry, "count", 1, is_null.oneArg, countOptions, Count(.count));
     try add(registry, "count_all", 1, is_null.hasValidityBitmap, dense.noOptions, Count(.count_all));
     try add(registry, "count_all", 0, noArgs, dense.noOptions, Count(.count_all));
     try add(registry, "any", 1, dense.argsOfType(.bool, 1), scalarAggregateOptions, AnyAll(.any));
@@ -416,6 +425,8 @@ fn Count(comptime which: enum { count, count_all }) type {
         fn update(state: *State, data: *const ArrayData) KernelError!void {
             const nulls = if (datatype.storageDataType(data.data_type) == .null)
                 data.length
+            else if (which == .count and !is_null.plainValidity(data.data_type))
+                try is_null.logicalNullCount(data)
             else if (dense.validityBits(data)) |bits|
                 bitmap.countUnsetBitsInRange(bits, data.offset, data.offset + data.length)
             else
@@ -442,6 +453,63 @@ fn Count(comptime which: enum { count, count_all }) type {
                 .all => state.total,
             };
             return .{ .scalar = Scalar.init(out_type, .{ .i64 = std.math.cast(i64, n) orelse return error.Overflow }) };
+        }
+    };
+}
+
+/// sum, mean and product (registered by aggregate_stats.zig) of bool, where a true row counts
+/// 1 (sum: uint64 count of true rows; product: uint64, 0 when a row is false, else 1; mean: the
+/// float64 fraction of true rows), and of the null type, whose rows are all null (Arrow's
+/// `NullSumImpl`: int64 / float64, null by the options, else sum 0, product 1, mean 0.0).
+pub fn BoolOrNull(comptime tag: std.meta.Tag(DataType), comptime which: enum { sum, mean, product }) type {
+    return struct {
+        pub const State = struct { trues: u64 = 0, count: u64 = 0, nulls: u64 = 0 };
+        pub const out_type: DataType = if (which == .mean) .{ .double = {} } else if (tag == .null) .{ .int64 = {} } else .{ .uint64 = {} };
+
+        pub fn update(state: *State, data: *const ArrayData) KernelError!void {
+            if (tag == .null) {
+                state.nulls += data.length;
+                return;
+            }
+            const vals = Bits.values(data);
+            const valid = Bits.validity(data);
+            const n = bitmap.byteLength(data.length);
+            var trues: u64 = 0;
+            var count: u64 = 0;
+            for (0..n) |j| {
+                var m = valid.byte(j);
+                if (j + 1 == n and data.length % 8 != 0) m &= (@as(u8, 1) << @as(u3, @intCast(data.length % 8))) - 1;
+                trues += @popCount(vals.byte(j) & m);
+                count += @popCount(m);
+            }
+            state.trues += trues;
+            state.count += count;
+            state.nulls += data.length - count;
+        }
+
+        pub fn updateScalar(state: *State, s: Scalar) KernelError!void {
+            if (tag == .null or s.isNull()) {
+                state.nulls += 1;
+                return;
+            }
+            state.trues += @intFromBool(try dense.scalarAs(bool, s));
+            state.count += 1;
+        }
+
+        pub fn merge(state: *State, other: *const State) void {
+            state.trues += other.trues;
+            state.count += other.count;
+            state.nulls += other.nulls;
+        }
+
+        pub fn finalize(_: *ExecContext, state: *const State, options: Options) KernelError!Datum {
+            if (nullByOptions(aggregateOptions(options), state.count, state.nulls)) return nullScalar(out_type);
+            const v: core.ScalarValue = switch (which) {
+                .mean => .{ .f64 = if (tag == .null) 0 else @as(f64, @floatFromInt(state.trues)) / @as(f64, @floatFromInt(state.count)) },
+                .sum => if (tag == .null) .{ .i64 = 0 } else .{ .u64 = state.trues },
+                .product => if (tag == .null) .{ .i64 = 1 } else .{ .u64 = @intFromBool(state.trues == state.count) },
+            };
+            return .{ .scalar = Scalar.init(out_type, v) };
         }
     };
 }

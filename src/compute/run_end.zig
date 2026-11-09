@@ -8,9 +8,12 @@
 //!   values `[1, 2, null]`). Rows compare by value bits (floats bitwise, as Arrow: NaNs with the
 //!   same bits are one run, 0.0 and -0.0 two). Types: null, bool, numbers (float16 too), dates,
 //!   times, timestamps, durations, intervals, decimals, fixed_size_binary and the string / binary
-//!   layouts, also string_view / binary_view (pyarrow 26 has no view kernel). Nested types
-//!   (list layouts, struct, map), dictionaries, unions and extension types are `NoMatchingKernel`
-//!   (Arrow encodes the list layouts, map and struct; zarrow has no row equality for them yet). A
+//!   layouts, also string_view / binary_view (pyarrow 26 has no view kernel), and the nested
+//!   types list, large_list, list_view, large_list_view, fixed_size_list, struct and map, whose
+//!   rows compare by `integration/compare.zig`'s logical equality (a null row equals a null row,
+//!   a struct of null fields is not a null struct, item nulls equal item nulls; float items by
+//!   bits, so a NaN item with the same bits is one run where Arrow, comparing by value, makes
+//!   two). Dictionaries, unions and extension types are `NoMatchingKernel`. A
 //!   chunk longer than the run end type holds is `InvalidInput` (Arrow: "Cannot run-end encode
 //!   Arrays with more elements than the run end type can hold").
 //! - run_end_decode: the plain values of a `run_end_encoded` array (the value type), also of a
@@ -25,6 +28,7 @@ const bitmap = @import("../bitmap.zig");
 const PrimitiveArray = @import("../array/primitive_array.zig").PrimitiveArray;
 const ArrayData = @import("../array/array_data.zig").ArrayData;
 const buffer = @import("../buffer.zig");
+const compare = @import("../integration/compare.zig");
 
 const ArrayRef = core.ArrayRef;
 const ChunkedArray = core.ChunkedArray;
@@ -59,6 +63,7 @@ pub fn isEncodable(dt: DataType) bool {
         .interval_months, .interval_day_time, .interval_month_day_nano => true,
         .decimal32, .decimal64, .decimal128, .decimal256, .fixed_size_binary => true,
         .string, .large_string, .string_view, .binary, .large_binary, .binary_view => true,
+        .list, .large_list, .list_view, .large_list_view, .fixed_size_list, .struct_, .map => true,
         else => false,
     };
 }
@@ -218,6 +223,7 @@ fn runStarts(allocator: std.mem.Allocator, arr: ArrayRef, starts: *std.ArrayList
     const c: Ctx = .{ .allocator = allocator, .d = d, .valid = valid, .starts = starts };
     switch (d.data_type) {
         .bool => return c.run(BoolRows{ .bits = d.buffers[1].data, .offset = d.offset }),
+        .list, .large_list, .list_view, .large_list_view, .fixed_size_list, .struct_, .map => return c.run(NestedRows{ .d = d }),
         .string, .large_string, .string_view, .binary, .large_binary, .binary_view => switch (try dense.StringOperand.init(.{ .array = arr })) {
             inline else => |op| return c.run(BytesRows(@TypeOf(op)){ .op = op }),
         },
@@ -260,6 +266,16 @@ const FixedRows = struct {
     width: usize,
     inline fn eql(self: FixedRows, i: usize, j: usize) bool {
         return std.mem.eql(u8, self.bytes[i * self.width ..][0..self.width], self.bytes[j * self.width ..][0..self.width]);
+    }
+};
+
+/// Rows of a nested array compared by `integration/compare.zig` (Arrow's logical equality: the
+/// validity, then the values of valid rows, nested nulls equal to nested nulls; a malformed child
+/// compares unequal).
+const NestedRows = struct {
+    d: *const ArrayData,
+    fn eql(self: NestedRows, i: usize, j: usize) bool {
+        return compare.rowsEqual(self.d, i, self.d, j);
     }
 };
 

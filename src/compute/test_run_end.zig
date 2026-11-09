@@ -1,6 +1,8 @@
 //! run_end_encode and run_end_decode. Expected values are pyarrow 26 results.
 const std = @import("std");
 const common = @import("test_common.zig");
+const structural = @import("test_structural.zig");
+const compare = @import("../integration/compare.zig");
 
 const ArrayRef = common.ArrayRef;
 const DataType = common.DataType;
@@ -216,7 +218,7 @@ test "run_end_encode and run_end_decode errors: run end overflow, types, scalars
     var ok = try ctx.invoke("run_end_encode", .vector, &.{.{ .array = fits }}, opts(.int16));
     ok.release();
 
-    // Types Arrow has no kernel for here: dictionaries, run_end_encoded, nested types; scalars.
+    // Types Arrow has no kernel for here: dictionaries, run_end_encoded; scalars.
     var a = try common.makeArray(i32, allocator, &.{ 1, 1 });
     defer a.release();
     var enc = try ctx.invoke("run_end_encode", .vector, &.{.{ .array = a }}, none);
@@ -229,9 +231,6 @@ test "run_end_encode and run_end_decode errors: run end overflow, types, scalars
     var dict = try common.makeDictionary(allocator, strs, .{ .bit_width = 32, .signed = true }, &.{ 0, 0, 1 });
     defer dict.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invoke("run_end_encode", .vector, &.{.{ .array = dict }}, none));
-    var st = try common.dense.structArray(allocator, &.{"a"}, &.{a.retain()}, 2, null);
-    defer st.release();
-    try std.testing.expectError(error.NoMatchingKernel, ctx.invoke("run_end_encode", .vector, &.{.{ .array = st }}, none));
     try std.testing.expectError(error.InvalidOptions, ctx.invoke("run_end_encode", .vector, &.{.{ .array = a }}, .{ .take = .{} }));
     try std.testing.expectError(error.InvalidArity, ctx.invoke("run_end_decode", .vector, &.{ enc, enc }, none));
 
@@ -249,4 +248,76 @@ test "run_end_encode and run_end_decode errors: run end overflow, types, scalars
     var bad = try ArrayRef.fromBorrowed(allocator, bad_data);
     defer bad.release();
     try std.testing.expectError(error.InvalidInput, ctx.invoke("run_end_decode", .vector, &.{.{ .array = bad }}, none));
+}
+
+/// Encode `input`, check the run ends, decode and compare the rows with `input` (logically).
+fn nestedRoundTrip(ctx: *ExecContext, input: ArrayRef, ends: []const i32) !void {
+    var enc = try ctx.invoke("run_end_encode", .vector, &.{.{ .array = input }}, none);
+    defer enc.release();
+    try enc.array.data().validateFull();
+    try std.testing.expect(enc.array.data().data_type.run_end_encoded.value_type.eql(input.data().data_type));
+    try std.testing.expectEqualSlices(i32, ends, try (common.array_mod.PrimitiveArray(i32){ .data = enc.array.data().children[0].data() }).values());
+    var dec = try ctx.invoke("run_end_decode", .vector, &.{enc}, none);
+    defer dec.release();
+    try dec.array.data().validateFull();
+    var why: compare.Mismatch = .{};
+    if (!compare.arraysEqual(dec.array.data(), input.data(), &why)) {
+        std.debug.print("decoded rows differ: {s}\n", .{why.message()});
+        return error.TestExpectedEqual;
+    }
+}
+
+test "run_end_encode and run_end_decode on the list layouts, fixed_size_list, struct and map: null rows, nested nulls, sliced, chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+
+    // [[1, 2], [1, 2], null, null, [3], [], []]: run ends [2, 4, 5, 7] for every list layout.
+    const rows = [_]structural.Row{ &.{ 1, 2 }, &.{ 1, 2 }, null, null, &.{3}, &.{}, &.{} };
+    inline for (.{ .list, .large_list, .list_view, .large_list_view }) |tag| {
+        var l = try structural.makeList(tag, allocator, &rows, 0);
+        defer l.release();
+        try nestedRoundTrip(&ctx, l, &.{ 2, 4, 5, 7 });
+        var mid = try l.slice(1, 5);
+        defer mid.release();
+        try nestedRoundTrip(&ctx, mid, &.{ 1, 3, 4, 5 });
+        var c = try common.chunkedAt(allocator, l, &.{3});
+        defer c.release();
+        var enc = try ctx.invoke("run_end_encode", .vector, &.{.{ .chunked = c }}, none);
+        defer enc.release();
+        try std.testing.expectEqual(@as(usize, 2), enc.chunked.numChunks());
+        try std.testing.expectEqualSlices(i32, &.{ 2, 3 }, try (common.array_mod.PrimitiveArray(i32){ .data = enc.chunked.chunks()[0].data().children[0].data() }).values());
+        try std.testing.expectEqualSlices(i32, &.{ 1, 2, 4 }, try (common.array_mod.PrimitiveArray(i32){ .data = enc.chunked.chunks()[1].data().children[0].data() }).values());
+        var dec = try ctx.invoke("run_end_decode", .vector, &.{enc}, none);
+        defer dec.release();
+        try std.testing.expectEqual(@as(usize, 7), dec.chunked.len());
+    }
+    // fixed_size_list<int32, 2> [[1, null], [1, null], [null, null], null]: item nulls equal.
+    const fsl_rows = [_]structural.Row{ &.{ 1, null }, &.{ 1, null }, &.{ null, null }, null };
+    var fsl = try structural.makeList(.fixed_size_list, allocator, &fsl_rows, 2);
+    defer fsl.release();
+    try nestedRoundTrip(&ctx, fsl, &.{ 2, 3, 4 });
+
+    // struct<a: int32, b: string> [{1, x}, {1, x}, null, {null, null}, {null, null}, {2, x}]: a
+    // null struct is not a struct of null fields.
+    var sa = try common.makeArray(i32, allocator, &.{ 1, 1, 0, null, null, 2 });
+    defer sa.release();
+    var sb = try common.makeStrings(.string, allocator, &.{ "x", "x", "", null, null, "x" });
+    defer sb.release();
+    var st = try structural.makeStruct(allocator, &.{ "a", "b" }, &.{ sa, sb }, &.{ true, true, false, true, true, true });
+    defer st.release();
+    try nestedRoundTrip(&ctx, st, &.{ 2, 3, 5, 6 });
+    var st_tail = try st.slice(2, 4);
+    defer st_tail.release();
+    try nestedRoundTrip(&ctx, st_tail, &.{ 1, 3, 4 });
+
+    // map<string, int64> [[(a, 1)], [(a, 1)], null, [(b, 2)]].
+    var keys = try common.makeStrings(.string, allocator, &.{ "a", "a", "b" });
+    defer keys.release();
+    var items = try common.makeArray(i64, allocator, &.{ 1, 1, 2 });
+    defer items.release();
+    var m = try structural.makeMap(allocator, structural.key_str, structural.value_i64, keys, items, &.{ 1, 1, null, 1 });
+    defer m.release();
+    try nestedRoundTrip(&ctx, m, &.{ 2, 3, 4 });
 }

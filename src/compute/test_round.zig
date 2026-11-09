@@ -468,3 +468,54 @@ const dec_multiple_hashes = [_][10]u64{
     .{ 0xd13d03ab1f94e3d1, 0x20df04d617e422a3, 0xa1093d8e06d45d6b, 0x46482f6744b0eaf5, 0x4a5dca420e3b4b4c, 0x47340ebd2efb3fcb, 0x47340ebd2efb3fcb, 0x4a5dca420e3b4b4c, 0x47340ebd2efb3fcb, 0x4a5dca420e3b4b4c },
     .{ 0x458d72a45a9b7efd, 0x9dc2ab26375d5c91, 0x80e9f9d8aec525b1, 0x1c038dad30a74935, 0xbcfdee7be213ba5b, 0xbcfdee7be213ba5b, 0xbcfdee7be213ba5b, 0xbcfdee7be213ba5b, 0xbcfdee7be213ba5b, 0xbcfdee7be213ba5b },
 };
+
+test "round_binary on decimal128 / decimal256 with decimal digits of any width and scale: nulls, modes, sliced, chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const d128 = comptime dec(20, 2);
+    const d256 = DataType{ .decimal256 = .{ .precision = 50, .scale = 2 } };
+    // [1.25, -3.57, null, 123.45, 0.05] rounded to [1, 0, 1, -1, 1] digits.
+    var a = try common.makeTyped(i128, d128, allocator, &.{ 125, -357, null, 12345, 5 });
+    defer a.release();
+    var a256 = try common.makeTyped(i256, d256, allocator, &.{ 125, -357, null, 12345, 5 });
+    defer a256.release();
+    var digits = try common.makeTyped(i128, d128, allocator, &.{ 100, 0, 100, -100, 100 });
+    defer digits.release();
+    var digits0 = try common.makeTyped(i128, comptime dec(10, 0), allocator, &.{ 1, 0, 1, -1, 1 });
+    defer digits0.release();
+    var digits256 = try common.makeTyped(i256, d256, allocator, &.{ 100, 0, 100, -100, 100 });
+    defer digits256.release();
+    var digits32 = try common.makeTyped(i32, .{ .decimal32 = .{ .precision = 5, .scale = 2 } }, allocator, &.{ 100, 0, 100, -100, 100 });
+    defer digits32.release();
+    for ([_]ArrayRef{ digits, digits0, digits256, digits32 }) |dg| {
+        try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .array = a }, .{ .array = dg } }, none, &.{ 120, -400, null, 12000, 0 });
+        var r256 = try ctx.invokeScalar("round_binary", &.{ .{ .array = a256 }, .{ .array = dg } }, none);
+        defer r256.release();
+        try r256.array.data().validateFull();
+        const got = try (common.array_mod.PrimitiveArray(i256){ .data = r256.array.data() }).values();
+        for ([_]?i256{ 120, -400, null, 12000, 0 }, got, 0..) |want, g, i| {
+            if (want) |w| try std.testing.expectEqual(w, g) else try std.testing.expect(r256.array.data().isNull(i));
+        }
+    }
+    try std.testing.expect((try registry.resolveResultType("round_binary", .scalar, &.{ .{ .array = a256 }, .{ .array = digits } }, none)).eql(d256));
+    try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .array = a }, .{ .array = digits } }, .{ .round_binary = .{ .round_mode = .half_up } }, &.{ 130, -400, null, 12000, 10 });
+    // Sliced and chunked operands (the digits chunked differently).
+    var a_tail = try a.slice(1, 4);
+    defer a_tail.release();
+    var d_tail = try digits.slice(1, 4);
+    defer d_tail.release();
+    try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .array = a_tail }, .{ .array = d_tail } }, none, &.{ -400, null, 12000, 0 });
+    var ca = try common.chunkedAt(allocator, a, &.{2});
+    defer ca.release();
+    var cd = try common.chunkedAt(allocator, digits, &.{ 1, 3 });
+    defer cd.release();
+    try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .chunked = ca }, .{ .chunked = cd } }, none, &.{ 120, -400, null, 12000, 0 });
+    // Digits with a fraction fail the safe cast to int32 (pyarrow: "Rescaling Decimal value would
+    // cause data loss"); whole float digits are cast too.
+    try std.testing.expectError(error.InvalidCast, ctx.invokeScalar("round_binary", &.{ .{ .array = a }, .{ .array = a } }, none));
+    var fd = try common.makeArray(f64, allocator, &.{ 1, 1, 1, 1, 1 });
+    defer fd.release();
+    try common.expectInvokeWith(i128, &ctx, "round_binary", &.{ .{ .array = a }, .{ .array = fd } }, none, &.{ 120, -360, null, 12340, 0 });
+}

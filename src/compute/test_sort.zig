@@ -455,3 +455,29 @@ test "rank_quantile, rank_normal and search_sorted hand-written values (pyarrow 
     defer mid_null.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("search_sorted", &.{ .{ .array = mid_null }, .{ .array = two_zero } }, left));
 }
+
+test "sort_indices and array_sort_indices of the null type: every row ties, 0 .. n-1; sliced, chunked, with another key (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var n = try common.dense.nullArray(allocator, .{ .null = {} }, 5);
+    defer n.release();
+    inline for (.{ "sort_indices", "array_sort_indices" }) |name| {
+        try expectIndices(&ctx, name, &.{.{ .array = n }}, none, &.{ 0, 1, 2, 3, 4 });
+        try expectIndices(&ctx, name, &.{.{ .array = n }}, sortOpts(.descending, .at_start), &.{ 0, 1, 2, 3, 4 });
+    }
+    var tail = try n.slice(2, 3);
+    defer tail.release();
+    try expectIndices(&ctx, "array_sort_indices", &.{.{ .array = tail }}, none, &.{ 0, 1, 2 });
+    var c = try common.chunkedAt(allocator, n, &.{ 1, 3 });
+    defer c.release();
+    try expectIndices(&ctx, "sort_indices", &.{.{ .chunked = c }}, none, &.{ 0, 1, 2, 3, 4 });
+    // A null-type key ties everywhere: the next key decides.
+    var ints = try common.makeArray(i32, allocator, &.{ 3, null, 1, 2, 1 });
+    defer ints.release();
+    try expectIndices(&ctx, "sort_indices", &.{ .{ .array = n }, .{ .array = ints } }, none, &.{ 2, 4, 3, 0, 1 });
+    try std.testing.expect((try registry.resolveResultType("array_sort_indices", .vector, &.{.{ .array = n }}, none)) == .uint64);
+    // rank and the selections keep rejecting it.
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("rank", &.{.{ .array = n }}, none));
+}
