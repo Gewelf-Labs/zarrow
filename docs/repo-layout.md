@@ -22,7 +22,7 @@ and kernels). Nothing compute-related is planned for a separate `zarrow-compute`
 | IPC stream and file | `src/ipc/` | |
 | C data and C stream interface | `src/ffi/`, `src/c_api.zig` | |
 | Compute framework | `src/compute/` (registry, signature, options, context, iterators, datum helpers, dense helpers) | documented in [compute-api.md](compute-api.md) |
-| Compute kernels | `src/compute/` as one file per family (`src/compute/<family>.zig`, tests in `src/compute/test_<family>.zig`), plus `src/concat_array_refs.zig` for concat and dictionary encode | status in [compute-support-matrix.md](compute-support-matrix.md) |
+| Compute kernels | `src/compute/` as one file per family (`src/compute/<family>.zig`, tests in `src/compute/test_<family>.zig`), plus `src/concat_array_refs.zig` for concat and dictionary encode | status in [compute-support-matrix.md](compute-support-matrix.md), per function in [compute/](compute/) |
 | Benchmarks | `benchmarks/`, registered in `tools/benchmark_ci_check.py`, `tools/benchmark_ci_thresholds.json`, `tools/test_benchmark_ci_check.py` | |
 | Fuzzing | `fuzz/`, `tools/fuzz*.py`, `tools/fuzz_docker.sh` | [fuzzing.md](fuzzing.md) |
 | Interop fixtures and runners | `tools/interop/` | |

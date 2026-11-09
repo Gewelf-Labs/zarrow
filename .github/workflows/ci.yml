@@ -226,6 +226,9 @@ jobs:
       - name: Check doc evidence references (compute / compatibility claims)
         run: python3 -I tools/check_doc_evidence.py
 
+      - name: Check generated per-function compute matrices are current
+        run: python3 -I tools/gen_compute_docs.py --check
+
       - name: Run ecosystem scorecard checks
         run: python3 -I tools/test_ecosystem_scorecard.py
 

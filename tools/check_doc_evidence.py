@@ -10,7 +10,7 @@ the checked docs must resolve:
 - test reference    `path/to/file.zig:"test name"` -> the file contains  test "test name"
 - build step        `build.zig:"step-name"`    -> build.zig mentions the step name
 
-Usage: python -I tools/check_doc_evidence.py [doc ...]   (default: the compute docs)
+Usage: python -I tools/check_doc_evidence.py [doc ...]   (default: the compute docs and docs/compute/*/*.md)
 Exit 1 on any missing evidence.
 """
 import re
@@ -70,7 +70,9 @@ def check_doc(doc: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    docs = [ROOT / d for d in (argv or DEFAULT_DOCS)]
+    # Default: the listed docs plus every group page under docs/compute/ (matrix.md and notes.md).
+    docs = [ROOT / d for d in argv] if argv else (
+        [ROOT / d for d in DEFAULT_DOCS] + sorted((ROOT / "docs/compute").glob("*/*.md")))
     problems = [p for d in docs for p in check_doc(d)]
     for p in problems:
         print(p)
