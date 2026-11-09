@@ -2258,11 +2258,36 @@ test "fuzz temporal" {
     try std.testing.fuzz(Target.temporal, fuzzOne, .{ .corpus = &.{smithSeed("corpus/temporal/iso.bin")} });
 }
 
-/// The decoded-array kernels of rounds 21, 23 and 24.
+/// The decoded-array kernels of rounds 21, 23, 24 and 25.
 fn exerciseRounds21To23(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
     exerciseRound21(ctx, a);
     exerciseRound23(ctx, a);
     exerciseRound24(ctx, a);
+    exerciseRound25(ctx, a);
+}
+
+/// Round 25 kernels on any decoded array: binary_join_element_wise of a binary / large_binary
+/// column with itself (the column as separator, every null handling), and binary_repeat with an
+/// int32 count array (0..3, every fifth null) on any column (other types: NoMatchingKernel; a
+/// row past the offset range: Overflow). Each output validates with the input's length.
+fn exerciseRound25(ctx: *zarrow.compute.ExecContext, a: ArrayRef) void {
+    const d: zarrow.compute.Datum = .{ .array = a };
+    const len = a.data().length;
+    switch (a.data().data_type) {
+        .binary, .large_binary => {
+            expectCall(ctx, "binary_join_element_wise", .scalar, &.{ d, d, d }, .none, len, &.{error.Overflow});
+            for ([_]zarrow.compute.JoinNullHandling{ .emit_null, .skip, .replace }) |h| {
+                expectCall(ctx, "binary_join_element_wise", .scalar, &.{ d, d }, .{ .join = .{ .null_handling = h, .null_replacement = "\xff" } }, len, &.{error.Overflow});
+            }
+        },
+        else => {},
+    }
+    var cb = zarrow.Int32Builder.init(std.heap.page_allocator, len) catch return;
+    defer cb.deinit();
+    for (0..len) |i| (if (i % 5 == 4) cb.appendNull() else cb.append(@intCast(i % 4))) catch return;
+    var counts = cb.finish() catch return;
+    defer counts.release();
+    expectCall(ctx, "binary_repeat", .scalar, &.{ d, .{ .array = counts } }, .none, len, &.{ error.NoMatchingKernel, error.Overflow });
 }
 
 /// Round 24 kernels on any decoded array: is_null, is_valid and true_unless_null (logical nulls,

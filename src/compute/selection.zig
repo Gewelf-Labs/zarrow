@@ -4,12 +4,16 @@
 //! inverse_permutation and indices_nonzero (vector functions).
 //!
 //! - coalesce(v0, v1, ...): per row the first valid value (null when none is).
-//! - if_else(cond, a, b): `a` where cond is true, `b` where false, null where cond is null.
+//! - if_else(cond, a, b): `a` where cond is true, `b` where false, null where cond is null (a
+//!   null-type cond is all null).
 //! - case_when(cond, v0, ..., vn[, else]): `cond` is a struct of bool fields (one per value;
 //!   a struct row may not be null: `InvalidInput`, as Arrow); per row the value of the first
 //!   true field (a null field counts as false), else the `else` value or null.
-//! - choose(index, v0, v1, ...): per row the value `index` selects (any integer type; null gives
-//!   null; a valid index outside `[0, n)` is `InvalidInput`, Arrow's IndexError).
+//! - choose(index, v0, v1, ...): per row the value `index` selects (any integer type, bool as
+//!   0 / 1 and the null type, cast to int64 as Arrow's implicit cast; null gives null; a valid
+//!   index outside `[0, n)` is `InvalidInput`, Arrow's IndexError).
+//! - if_else and choose whose values are all of the null type give a null-type result, without
+//!   looking at the index (pyarrow 26: choose([5], null, null) is [null]).
 //!
 //! The value arguments (array, chunked or scalar) are cast to their common type first: numbers
 //! to `commonNumericType`, temporal types to `commonTemporalType`, string / binary layouts to
@@ -202,8 +206,9 @@ fn Select(comptime kind: Kind) type {
             if (args.len <= first) return false;
             switch (kind) {
                 .coalesce => {},
-                .if_else => if (args.len != 3 or args[0].dataType() != .bool) return false,
-                .choose => if (!isInteger(args[0].dataType())) return false,
+                .if_else => if (args.len != 3 or (args[0].dataType() != .bool and args[0].dataType() != .null)) return false,
+                // A bool index is 0 / 1 (Arrow's implicit cast to an integer index).
+                .choose => if (!isInteger(args[0].dataType()) and args[0].dataType() != .bool and args[0].dataType() != .null) return false,
                 .case_when => {
                     const st = switch (args[0].dataType()) {
                         .struct_ => |st| st,
@@ -225,6 +230,8 @@ fn Select(comptime kind: Kind) type {
         fn exec(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
             if (args.len <= first) return error.InvalidArity;
             const out_type = commonValueType(args[first..]) orelse return error.NoMatchingKernel;
+            // Null-type values: a null-type result (Arrow's null kernels; no index is checked).
+            if (out_type == .null and (kind == .if_else or kind == .choose)) return registry_mod.null_type_kernel.exec(ctx, args, .none);
             const call = ctx.allocator.alloc(Datum, args.len) catch return error.OutOfMemory;
             defer ctx.allocator.free(call);
             const owned = ctx.allocator.alloc(bool, args.len) catch return error.OutOfMemory;
@@ -233,7 +240,11 @@ fn Select(comptime kind: Kind) type {
             defer for (call, owned) |*c, o| if (o) c.release();
             for (args, call, owned, 0..) |a, *c, *o, i| {
                 c.* = a;
-                const target: ?DataType = if (i >= first) out_type else if (kind == .choose and a.dataType() != .int64) DataType{ .int64 = {} } else null;
+                const target: ?DataType = if (i >= first) out_type else switch (kind) {
+                    .choose => if (a.dataType() != .int64) DataType{ .int64 = {} } else null,
+                    .if_else => if (a.dataType() == .null) DataType{ .bool = {} } else null,
+                    else => null,
+                };
                 if (target) |t| if (!a.dataType().eql(t)) {
                     c.* = try ctx.invoke("cast", .scalar, &.{a}, .{ .cast = .{ .to_type = t } });
                     o.* = true;

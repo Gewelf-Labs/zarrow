@@ -550,3 +550,47 @@ test "case-insensitive literal kernels fold through Unicode simple case folding 
     try expectDescribe(&ctx, "starts_with", &bargs, match("\xe9C", true), "0;0;N");
     try expectDescribe(&ctx, "count_substring", &bargs, match("COLE", true), "1;0;N");
 }
+
+test "count_substring_regex and find_substring_regex on fixed_size_binary: nulls, sliced, chunked and scalars (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    // fixed_size_binary[4] [aaaa, null, abab, \xc3\xa9ba, baaa]: Latin-1 rows, int32 results.
+    var fb = try common.array_mod.FixedSizeBinaryBuilder.init(allocator, 4, 5);
+    defer fb.deinit();
+    for ([_]?[]const u8{ "aaaa", null, "abab", "\xc3\xa9ba", "baaa" }) |r| if (r) |x| try fb.append(x) else try fb.appendNull();
+    var a = try fb.finish();
+    defer a.release();
+    const args = [_]Datum{.{ .array = a }};
+    const C = struct { p: []const u8, count: [5]?i32, find: [5]?i32 };
+    const cases = [_]C{
+        .{ .p = "a", .count = .{ 4, null, 2, 1, 3 }, .find = .{ 0, null, 0, 3, 1 } },
+        .{ .p = "b+", .count = .{ 0, null, 2, 1, 1 }, .find = .{ -1, null, 1, 2, 0 } },
+        .{ .p = "^a", .count = .{ 4, null, 1, 0, 0 }, .find = .{ 0, null, 0, -1, -1 } },
+        .{ .p = ".", .count = .{ 4, null, 4, 4, 4 }, .find = .{ 0, null, 0, 0, 0 } },
+        .{ .p = "a*", .count = .{ 2, null, 5, 5, 3 }, .find = .{ 0, null, 0, 0, 0 } },
+        .{ .p = "\xc3\xa9", .count = .{ 0, null, 0, 1, 0 }, .find = .{ -1, null, -1, 0, -1 } },
+    };
+    for (cases) |c| {
+        try common.expectInvokeWith(i32, &ctx, "count_substring_regex", &args, match(c.p, false), &c.count);
+        try common.expectInvokeWith(i32, &ctx, "find_substring_regex", &args, match(c.p, false), &c.find);
+    }
+    try common.expectInvokeWith(i32, &ctx, "count_substring_regex", &args, match("A", true), &.{ 4, null, 2, 1, 3 });
+    // Sliced (rows 1..4), chunked (one result chunk per input chunk) and scalar inputs.
+    var tail = try a.slice(1, 3);
+    defer tail.release();
+    try common.expectInvokeWith(i32, &ctx, "count_substring_regex", &.{.{ .array = tail }}, match("a", false), &.{ null, 2, 1 });
+    var chunks = try common.chunkedAt(allocator, a, &.{ 1, 3 });
+    defer chunks.release();
+    var out = try ctx.invokeScalar("find_substring_regex", &.{.{ .chunked = chunks }}, match("a", false));
+    defer out.release();
+    try std.testing.expectEqual(@as(usize, 3), out.chunked.numChunks());
+    try common.expectInvokeWith(i32, &ctx, "find_substring_regex", &.{.{ .chunked = chunks }}, match("a", false), &.{ 0, null, 0, 3, 1 });
+    const fsb4 = DataType{ .fixed_size_binary = .{ .byte_width = 4 } };
+    try common.expectInvokeWith(i32, &ctx, "find_substring_regex", &.{.{ .scalar = Scalar.init(fsb4, .{ .binary = "baaa" }) }}, match("a", false), &.{1});
+    try common.expectInvokeWith(i32, &ctx, "find_substring_regex", &.{.{ .scalar = Scalar.init(fsb4, .null) }}, match("a", false), &.{null});
+    // A pattern that does not compile, and missing options.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("count_substring_regex", &args, match("(a", false)));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("find_substring_regex", &args, common.none));
+}

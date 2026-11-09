@@ -18,10 +18,10 @@
 //!   the value is kept; a result past the precision is `Overflow`.
 //! - round_to_multiple casts its multiple to the input type (safe: a lost fraction is
 //!   `InvalidCast`); a null, zero, negative or NaN multiple is `InvalidOptions`.
-//! - round_binary takes its digits per row (any integer type, cast to int32; for a decimal128 /
-//!   decimal256 input also a decimal of any width and scale or a float, cast safely to int32 as
-//!   pyarrow 26: a fraction is `InvalidCast`); a row whose digits are out of range for an integer
-//!   or decimal input is `InvalidInput`.
+//! - round_binary takes its digits per row (any integer type or bool, cast to int32; for a
+//!   decimal128 / decimal256 input also a decimal of any width and scale or a float, cast safely
+//!   to int32 as pyarrow 26: a fraction is `InvalidCast`); a row whose digits are out of range
+//!   for an integer or decimal input is `InvalidInput`.
 //!
 //! Errors are only raised for valid rows. Null handling is intersection. Arguments that are all
 //! of the null type give a null-type result of their length (Arrow's null kernels).
@@ -75,11 +75,11 @@ fn isIntegerTag(tag: std.meta.Tag(DataType)) bool {
     };
 }
 
-/// The digits of round_binary on decimal128 / decimal256 `tag`: an integer, or a decimal of any
-/// width or a float (cast to int32 like the integers; a fraction or a value past int32 fails the
-/// cast, as pyarrow 26).
+/// The digits of round_binary: an integer or a bool (0 / 1), and on decimal128 / decimal256 `tag`
+/// also a decimal of any width or a float (cast to int32 like the integers; a fraction or a value
+/// past int32 fails the cast, as pyarrow 26).
 fn digitsOk(tag: std.meta.Tag(DataType), digits: std.meta.Tag(DataType)) bool {
-    if (isIntegerTag(digits)) return true;
+    if (isIntegerTag(digits) or digits == .bool) return true;
     if (tag != .decimal128 and tag != .decimal256) return false;
     return switch (digits) {
         .decimal32, .decimal64, .decimal128, .decimal256, .half_float, .float, .double => true,

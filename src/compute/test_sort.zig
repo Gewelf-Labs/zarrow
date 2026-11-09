@@ -481,3 +481,30 @@ test "sort_indices and array_sort_indices of the null type: every row ties, 0 ..
     // rank and the selections keep rejecting it.
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("rank", &.{.{ .array = n }}, none));
 }
+
+test "partition_nth_indices of the null type: 0 .. n-1 for any pivot; sliced, chunked and empty (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var n = try common.dense.nullArray(allocator, .{ .null = {} }, 3);
+    defer n.release();
+    // partition_nth_indices(nulls(3), pivot) -> uint64 [0, 1, 2] for pivot 0, 1 and 4.
+    for ([_]usize{ 0, 1, 3, 4 }) |pivot| {
+        try expectIndices(&ctx, "partition_nth_indices", &.{.{ .array = n }}, .{ .partition_nth = .{ .pivot = pivot } }, &.{ 0, 1, 2 });
+        try expectIndices(&ctx, "partition_nth_indices", &.{.{ .array = n }}, .{ .partition_nth = .{ .pivot = pivot, .null_placement = .at_start } }, &.{ 0, 1, 2 });
+    }
+    var tail = try n.slice(1, 2);
+    defer tail.release();
+    try expectIndices(&ctx, "partition_nth_indices", &.{.{ .array = tail }}, .{ .partition_nth = .{ .pivot = 1 } }, &.{ 0, 1 });
+    var c = try common.chunkedAt(allocator, n, &.{2});
+    defer c.release();
+    try expectIndices(&ctx, "partition_nth_indices", &.{.{ .chunked = c }}, .{ .partition_nth = .{ .pivot = 1 } }, &.{ 0, 1, 2 });
+    var empty = try common.dense.nullArray(allocator, .{ .null = {} }, 0);
+    defer empty.release();
+    try expectIndices(&ctx, "partition_nth_indices", &.{.{ .array = empty }}, .{ .partition_nth = .{ .pivot = 0 } }, &.{});
+    try std.testing.expect((try registry.resolveResultType("partition_nth_indices", .vector, &.{.{ .array = n }}, .{ .partition_nth = .{ .pivot = 0 } })) == .uint64);
+    // Options are still required; a scalar is still rejected.
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("partition_nth_indices", &.{.{ .array = n }}, none));
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeVector("partition_nth_indices", &.{.{ .scalar = common.Scalar.init(.{ .null = {} }, .null) }}, .{ .partition_nth = .{ .pivot = 0 } }));
+}

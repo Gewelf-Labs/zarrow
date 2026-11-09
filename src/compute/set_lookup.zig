@@ -12,7 +12,8 @@
 //! the value set: is_in true, index_in its position; is_in false / index_in null without one),
 //! `skip` (nulls never match: is_in false, index_in null), `emit_null` (a null input gives null)
 //! and `inconclusive` (like emit_null; also null for a value not found when the value set holds a
-//! null).
+//! null). A null-type input is all null rows under these rules (pyarrow 26: is_in(null, value_set
+//! = nulls) is all true, index_in all 0; with `skip` false / null).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
@@ -47,7 +48,7 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
 }
 
 fn keyArg(args: []const Datum) bool {
-    return args.len == 1 and hash.isKeyType(args[0].dataType());
+    return args.len == 1 and (args[0].dataType() == .null or hash.isKeyType(args[0].dataType()));
 }
 
 /// `SetLookupOptions` whose value set is an array or a chunked array.
@@ -104,6 +105,16 @@ fn Lookup(comptime op: Op) type {
             const o = options.set_lookup;
             const in_type = args[0].dataType();
             const set_type = o.value_set.dataType();
+            if (in_type == .null) {
+                // Every row is null: looked up as a null of the value set's type (int8 for a
+                // null-type value set), so `null_matching_behavior` applies as to any null row.
+                const target: DataType = if (set_type == .null) .{ .int8 = {} } else if (hash.isKeyType(set_type)) set_type else return error.InvalidOptions;
+                var input = try ctx.invoke("cast", .scalar, &.{args[0]}, .{ .cast = .{ .to_type = target } });
+                defer input.release();
+                var vs = if (set_type == .null) try ctx.invoke("cast", .scalar, &.{o.value_set}, .{ .cast = .{ .to_type = target } }) else o.value_set.retain();
+                defer vs.release();
+                return run(ctx, input, vs, o.null_matching_behavior);
+            }
             if (set_type.eql(in_type)) return run(ctx, args[0], o.value_set, o.null_matching_behavior);
             if (ctx.invoke("cast", .scalar, &.{o.value_set}, .{ .cast = .{ .to_type = in_type } })) |cast_set| {
                 var vs = cast_set;

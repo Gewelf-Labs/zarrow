@@ -2,7 +2,8 @@
 //! "String joining", "String predicates", "Containment tests") on string, large_string and
 //! string_view; the output keeps the input layout (string in, string out; lengths are int32 for
 //! string / string_view and int64 for large_string). Null handling is intersection, except
-//! binary_join_element_wise, which follows `JoinOptions`.
+//! binary_join_element_wise, which follows `JoinOptions` and also takes binary and large_binary
+//! (any `null_replacement` bytes there).
 //!
 //! Unicode (tables in `unicode_tables.zig`, Unicode 17.0.0, the version of pyarrow 26's utf8proc):
 //! - utf8_upper / utf8_lower / utf8_swapcase / utf8_capitalize / utf8_title map every code point
@@ -113,16 +114,12 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             try registry.registerScalarKernel(@tagName(p), unaryKernel(tag, predicateOptions(p), dense.resultTypeOf(bool_type), Predicates(p).exec));
         }
         try registry.registerScalarKernel("utf8_length", unaryKernel(tag, dense.noOptions, dense.resultTypeOf(lengthType(tag)), Lengths(.utf8_length).exec));
-        try registry.registerScalarKernel("binary_join_element_wise", .{
-            .signature = .{
-                .arity = 1,
-                .variadic = true,
-                .type_check = allOfType(tag),
-                .options_check = joinOptions,
-                .result_type_fn = dense.resultTypeOf(@unionInit(DataType, @tagName(tag), {})),
-            },
-            .exec = join,
-        });
+        try registry.registerScalarKernel("binary_join_element_wise", joinKernel(tag, joinOptions));
+    }
+    // binary_join_element_wise on binary and large_binary (Arrow; not binary_view): any
+    // null_replacement bytes.
+    inline for (.{ TypeTag.binary, TypeTag.large_binary }) |tag| {
+        try registry.registerScalarKernel("binary_join_element_wise", joinKernel(tag, joinBinaryOptions));
     }
     inline for (string_tags ++ binary_tags) |tag| {
         try registry.registerScalarKernel("binary_length", unaryKernel(tag, dense.noOptions, dense.resultTypeOf(lengthType(tag)), Lengths(.binary_length).exec));
@@ -199,6 +196,24 @@ fn joinOptions(options: Options) bool {
         .none => true,
         .join => |o| std.unicode.utf8ValidateSlice(o.null_replacement),
         else => false,
+    };
+}
+
+/// Accept `none` (emit_null) or any `JoinOptions` (binary rows: any `null_replacement` bytes).
+fn joinBinaryOptions(options: Options) bool {
+    return options == .none or options == .join;
+}
+
+fn joinKernel(comptime tag: TypeTag, comptime options_check: core.OptionsCheckFn) core.Kernel {
+    return .{
+        .signature = .{
+            .arity = 1,
+            .variadic = true,
+            .type_check = allOfType(tag),
+            .options_check = options_check,
+            .result_type_fn = dense.resultTypeOf(@unionInit(DataType, @tagName(tag), {})),
+        },
+        .exec = join,
     };
 }
 

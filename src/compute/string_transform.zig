@@ -27,8 +27,8 @@
 //! the pad functions and the whitespace splits the string layouts; binary_slice and
 //! binary_reverse the binary layouts only (as in Arrow); binary_length, count_substring,
 //! find_substring, binary_slice and binary_replace_slice also take fixed_size_binary, as Arrow
-//! (see `registerFixed`). binary_repeat takes an int64 count
-//! (Arrow: any integer type). replace_substring and the forward splits of the offsets layouts
+//! (see `registerFixed`). binary_repeat takes a count of any integer type (cast to int64) and
+//! decodes a dictionary input first, as Arrow. replace_substring and the forward splits of the offsets layouts
 //! work over the whole value window of a chunk at once (no per-row output bookkeeping).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
@@ -73,6 +73,8 @@ pub fn register(registry: *FunctionRegistry) KernelError!void {
             .exec = repeat,
         });
     }
+    // binary_repeat on a dictionary decodes it first (Arrow: dictionary<string> in, string out).
+    try registry.setImplicitCast("binary_repeat", .scalar, .decode);
     inline for (string_tags) |tag| {
         try registry.registerScalarKernel("utf8_replace_slice", unary(tag, replaceSliceOptions(true), sameType(tag), Transform(.replace_slice_utf8).exec));
         try registry.registerScalarKernel("utf8_zero_fill", unary(tag, zeroFillOptions, sameType(tag), Transform(.zero_fill).exec));
@@ -142,7 +144,11 @@ fn listTypeFor(dt: DataType) KernelError!DataType {
 fn repeatArgs(comptime tag: TypeTag) core.TypeCheckFn {
     return &struct {
         fn check(args: []const Datum) bool {
-            return args.len == 2 and std.meta.activeTag(args[0].dataType()) == tag and args[1].dataType() == .int64;
+            if (args.len != 2 or std.meta.activeTag(args[0].dataType()) != tag) return false;
+            return switch (args[1].dataType()) {
+                .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64 => true,
+                else => false,
+            };
         }
     }.check;
 }
@@ -567,8 +573,11 @@ fn replaceRows(allocator: std.mem.Allocator, data: *const @import("../array/arra
 // ------------------------------------------------------------------------------ repeat
 
 /// Repeat each row `count` times (binary_repeat); a negative count in a valid row is `InvalidInput`.
+/// Counts of any integer type are cast to int64 first (a uint64 past int64 fails that cast).
 fn repeat(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
-    return dense.execElementwiseWith(ctx, args, options, args[0].dataType(), true, repeatChunk);
+    var counts = if (args[1].dataType() == .int64) args[1].retain() else try ctx.invoke("cast", .scalar, &.{args[1]}, .{ .cast = .{ .to_type = .{ .int64 = {} } } });
+    defer counts.release();
+    return dense.execElementwiseWith(ctx, &.{ args[0], counts }, options, args[0].dataType(), true, repeatChunk);
 }
 
 fn repeatChunk(ctx: *ExecContext, values: []const ExecChunkValue, len: usize, _: Options) KernelError!ArrayRef {
@@ -1086,9 +1095,9 @@ fn fixedAsBinary(allocator: std.mem.Allocator, v: ExecChunkValue) KernelError!Ar
 
 /// Run a binary chunk function on the rows of a fixed_size_binary chunk; with `fixed` its binary
 /// result (every valid row of the computed width) becomes a fixed_size_binary array.
-fn FixedVia(comptime chunk_fn: dense.ChunkOptionsFn, comptime fixed: bool) type {
+pub fn FixedVia(comptime chunk_fn: dense.ChunkOptionsFn, comptime fixed: bool) type {
     return struct {
-        fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
+        pub fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             const out_type: DataType = if (fixed) try fixedResultType(args, options) else .{ .int32 = {} };
             return dense.execElementwiseWith(ctx, args, options, out_type, true, chunk);
         }
