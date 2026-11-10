@@ -425,3 +425,105 @@ test "hypot: no intermediate overflow, infinities over NaN, integer and mixed op
     defer s.release();
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("hypot", &.{ .{ .array = s }, .{ .array = s } }, none));
 }
+
+test "power_checked by name: nulls, sliced, chunked, overflow and negative exponents (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var b = try common.makeArray(i64, allocator, &.{ 2, -3, null, 0, 5, -2 });
+    defer b.release();
+    var e = try common.makeArray(i64, allocator, &.{ 10, 3, 2, null, 0, 63 });
+    defer e.release();
+    // pyarrow 26: [1024, -27, None, None, 1, -9223372036854775808]; [1:4] -> [-27, None, None].
+    try common.expectInvoke(i64, &ctx, .scalar, "power_checked", &.{ .{ .array = b }, .{ .array = e } }, &.{ 1024, -27, null, null, 1, std.math.minInt(i64) });
+    var bs = try b.slice(1, 3);
+    defer bs.release();
+    var es = try e.slice(1, 3);
+    defer es.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "power_checked", &.{ .{ .array = bs }, .{ .array = es } }, &.{ -27, null, null });
+    var bc = try common.chunkedAt(allocator, b, &.{2});
+    defer bc.release();
+    var ec = try common.chunkedAt(allocator, e, &.{3});
+    defer ec.release();
+    try common.expectInvoke(i64, &ctx, .scalar, "power_checked", &.{ .{ .chunked = bc }, .{ .chunked = ec } }, &.{ 1024, -27, null, null, 1, std.math.minInt(i64) });
+    // pyarrow 26: 2 ** 63 -> "overflow"; 2 ** -1 -> "integers to negative integer powers are not allowed".
+    var two = try common.makeArray(i64, allocator, &.{2});
+    defer two.release();
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("power_checked", &.{ .{ .array = two }, .{ .scalar = common.scalarOf(i64, 63) } }, none));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("power_checked", &.{ .{ .array = two }, .{ .scalar = common.scalarOf(i64, -1) } }, none));
+    // Floats: pyarrow 26 [2.0, None, -8.0] ** [-1.0, 1.0, 1/3] -> [0.5, None, nan].
+    var fb = try common.makeArray(f64, allocator, &.{ 2.0, null, -8.0 });
+    defer fb.release();
+    var fe = try common.makeArray(f64, allocator, &.{ -1.0, 1.0, 1.0 / 3.0 });
+    defer fe.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "power_checked", &.{ .{ .array = fb }, .{ .array = fe } }, &.{ 0.5, null, nan });
+}
+
+test "shift_left_checked and shift_right_checked by name: nulls, sliced, chunked, amount range (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var l = try common.makeArray(i8, allocator, &.{ 1, -1, null, 3, 64 });
+    defer l.release();
+    var r = try common.makeArray(i8, allocator, &.{ 16, -16, null, 7, -1 });
+    defer r.release();
+    var n = try common.makeArray(i8, allocator, &.{ 3, 6, 1, null, 1 });
+    defer n.release();
+    var ns = try n.slice(1, 3);
+    defer ns.release();
+    var nc = try common.chunkedAt(allocator, n, &.{2});
+    defer nc.release();
+    const cases = .{
+        .{ "shift_left_checked", l, [_]?i8{ 8, -64, null, null, -128 }, [_]?i8{ -64, null, null } },
+        .{ "shift_right_checked", r, [_]?i8{ 2, -1, null, null, -1 }, [_]?i8{ -1, null, null } },
+    };
+    inline for (cases) |c| {
+        const w2 = c[2];
+        const w3 = c[3];
+        try common.expectInvoke(i8, &ctx, .scalar, c[0], &.{ .{ .array = c[1] }, .{ .array = n } }, &w2);
+        var xs = try c[1].slice(1, 3);
+        defer xs.release();
+        try common.expectInvoke(i8, &ctx, .scalar, c[0], &.{ .{ .array = xs }, .{ .array = ns } }, &w3);
+        var xc = try common.chunkedAt(allocator, c[1], &.{3});
+        defer xc.release();
+        try common.expectInvoke(i8, &ctx, .scalar, c[0], &.{ .{ .chunked = xc }, .{ .chunked = nc } }, &w2);
+        // pyarrow 26: int8 amount 7 -> "shift amount must be >= 0 and less than precision of type".
+        try std.testing.expectError(error.InvalidInput, ctx.invokeScalar(c[0], &.{ .{ .array = c[1] }, .{ .scalar = common.scalarOf(i8, 7) } }, none));
+    }
+    // uint8 has 8 digits: 1 << 7 -> [128] (pyarrow 26).
+    var u = try common.makeArray(u8, allocator, &.{1});
+    defer u.release();
+    try common.expectInvoke(u8, &ctx, .scalar, "shift_left_checked", &.{ .{ .array = u }, .{ .scalar = common.scalarOf(u8, 7) } }, &.{128});
+}
+
+test "random: seeded values in [0, 1), length, system initializer" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var a = try ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 100, .seed = 42 } });
+    defer a.release();
+    var b = try ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 100, .seed = 42 } });
+    defer b.release();
+    try a.array.data().validateFull();
+    const xs = try (common.array_mod.PrimitiveArray(f64){ .data = a.array.data() }).values();
+    const ys = try (common.array_mod.PrimitiveArray(f64){ .data = b.array.data() }).values();
+    try std.testing.expectEqual(@as(usize, 100), xs.len);
+    try std.testing.expectEqualSlices(f64, xs, ys);
+    for (xs) |x| try std.testing.expect(x >= 0 and x < 1);
+    // The system initializer needs the context's I/O; with it, two calls draw two seeds.
+    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 1, .initializer = .system } }));
+    var sys_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .io = std.testing.io });
+    var s1 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
+    defer s1.release();
+    var s2 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
+    defer s2.release();
+    try s1.array.data().validateFull();
+    const v1 = try s1.array.data().buffers[1].typedSlice(f64);
+    const v2 = try s2.array.data().buffers[1].typedSlice(f64);
+    for (v1[0..64]) |x| try std.testing.expect(x >= 0 and x < 1);
+    try std.testing.expect(!std.mem.eql(f64, v1[0..64], v2[0..64]));
+    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("random", &.{}, none));
+}

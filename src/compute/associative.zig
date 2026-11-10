@@ -4,8 +4,8 @@
 //! and the string / binary layouts; unique and value_counts also take the null type).
 //!
 //! The rows are hashed by the `Grouper` of hash_aggregate.zig: distinct values come in
-//! first-seen order, a null is one value of its own, floats compare by bits after folding every
-//! NaN into one (NaN is one value, -0.0 and 0.0 are two, as Arrow).
+//! first-seen order, a null is one value of its own, floats compare by bits, as pyarrow 26
+//! hashes them (NaN with another sign or payload is another value, -0.0 and 0.0 are two).
 //!
 //! - unique: the distinct values (an array of the input type).
 //! - value_counts: `struct<values: T, counts: int64>`, one row per distinct value (the struct

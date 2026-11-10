@@ -79,6 +79,19 @@ pub const null_type_kernel: Kernel = .{
     .exec = execNullType,
 };
 
+/// `null_type_kernel` of a vector function (pairwise_diff): a chunked argument is rejected and a
+/// scalar gives a one-row array, as Arrow's vector executor ("Vector kernel cannot execute
+/// chunkwise").
+pub const null_type_vector_kernel: Kernel = .{
+    .signature = null_type_kernel.signature,
+    .exec = execNullTypeVector,
+};
+
+fn execNullTypeVector(ctx: *ExecContext, args: []const Datum, _: Options) KernelError!Datum {
+    for (args) |a| if (a == .chunked) return error.InvalidInput;
+    return .{ .array = try dense.nullArray(ctx.allocator, .{ .null = {} }, args[0].length()) };
+}
+
 fn allNullType(args: []const Datum) bool {
     if (args.len == 0) return false;
     for (args) |a| if (a.isTabular() or a.dataType() != .null) return false;
@@ -304,7 +317,8 @@ pub const FunctionRegistry = struct {
         }
         if (best_kernel) |kernel| return kernel;
         if (function.null_type_result and saw_matching_arity and allNullType(args)) {
-            return if (saw_matching_options) &null_type_kernel else error.InvalidOptions;
+            if (!saw_matching_options) return error.InvalidOptions;
+            return if (kind == .vector) &null_type_vector_kernel else &null_type_kernel;
         }
         if (!saw_matching_arity) return error.InvalidArity;
         // A record batch or table argument to a function without a tabular kernel (Arrow:
@@ -530,6 +544,13 @@ pub const FunctionRegistry = struct {
     ) KernelError!Datum {
         const kernel = self.resolveKernel(name, kind, args, options) catch |err| {
             const targets = self.implicitTargets(err, name, kind, args) orelse return err;
+            // As Arrow's DispatchBest: no kernel for the target types is NoMatchingKernel, before
+            // any cast runs (a dictionary of int32 to binary_repeat must not fail in the cast).
+            var stack: [4]Datum = undefined;
+            if (args.len <= stack.len) {
+                for (stack[0..args.len], 0..) |*a, i| a.* = .{ .scalar = core.Scalar.init(targets.of(i), .null) };
+                _ = self.resolveKernel(name, kind, stack[0..args.len], options) catch return err;
+            }
             return self.invokeCast(ctx, name, kind, args, options, targets);
         };
         try kernel.signature.checkResultType(args, options);

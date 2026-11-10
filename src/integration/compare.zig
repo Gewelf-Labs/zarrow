@@ -132,6 +132,13 @@ pub fn rowsEqual(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) b
     return c.range(a, i, b, j, 1);
 }
 
+/// `rowsEqual`, but a NaN float item never equals anything (Arrow's nested value comparison, as
+/// run_end_encode uses it: pyarrow 26 splits `[[nan], [nan]]` into two runs).
+pub fn rowsEqualNanUnequal(a: *const ArrayData, i: usize, b: *const ArrayData, j: usize) bool {
+    var c: Cmp = .{ .why = null, .nans_unequal = true };
+    return c.range(a, i, b, j, 1);
+}
+
 /// `a` equals the first `a.length` rows of `b`.
 pub fn arrayIsPrefix(a: *const ArrayData, b: *const ArrayData, why: ?*Mismatch) bool {
     var c: Cmp = .{ .why = why };
@@ -141,6 +148,8 @@ pub fn arrayIsPrefix(a: *const ArrayData, b: *const ArrayData, why: ?*Mismatch) 
 
 const Cmp = struct {
     why: ?*Mismatch,
+    /// A NaN float item compares unequal (else floats compare by bits).
+    nans_unequal: bool = false,
     path: [max_depth + 1][]const u8 = undefined,
     depth: usize = 0,
     /// Dictionary pairs already found equal.
@@ -263,9 +272,19 @@ const Cmp = struct {
                 const va = fixedAt(a, w, a.offset + i) orelse return self.fail("row {d}: bad buffer", .{i});
                 const vb = fixedAt(b, w, b.offset + j) orelse return self.fail("row {d}: bad buffer", .{j});
                 if (!std.mem.eql(u8, va, vb)) return self.fail("row {d}: value bytes {X} vs {X}", .{ i, va, vb });
+                if (self.nans_unequal and isNan(st, va)) return self.fail("row {d}: NaN", .{i});
                 return true;
             },
         }
+    }
+
+    fn isNan(t: DataType, v: []const u8) bool {
+        return switch (t) {
+            .half_float => std.math.isNan(@as(f16, @bitCast(std.mem.readInt(u16, v[0..2], .little)))),
+            .float => std.math.isNan(@as(f32, @bitCast(std.mem.readInt(u32, v[0..4], .little)))),
+            .double => std.math.isNan(@as(f64, @bitCast(std.mem.readInt(u64, v[0..8], .little)))),
+            else => false,
+        };
     }
 
     fn bytes(self: *Cmp, i: usize, va: array_data.AccessorError![]const u8, vb: array_data.AccessorError![]const u8) bool {

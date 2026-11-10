@@ -54,12 +54,12 @@ test "unique, value_counts and dictionary_encode hand-written values (pyarrow 26
     try vc_slice.data().validateFull();
     try std.testing.expect(vc_slice.data().data_type.struct_.fields[0].data_type.* == .int32);
 
-    // Floats: NaN is one value, -0.0 and 0.0 are two.
+    // Floats by bits (pyarrow 26 value_counts: nan, 0, -0, nan(-), null each once).
     var f = try common.makeArray(f64, allocator, &.{ nan, 0.0, -0.0, -nan, null });
     defer f.release();
     var fu = try vector(&ctx, "value_counts", .{ .array = f }, none);
     defer fu.release();
-    try expectCounts(f64, fu, &.{ nan, 0.0, -0.0, null }, &.{ 2, 1, 1, 1 });
+    try expectCounts(f64, fu, &.{ nan, 0.0, -0.0, -nan, null }, &.{ 1, 1, 1, 1, 1 });
 
     // Chunked input: one result over all chunks.
     var c = try common.makeArray(i64, allocator, &.{ 1, 2, 2, null, 3 });
@@ -369,4 +369,110 @@ test "dictionary_decode: nulls, null entries, sliced, chunked, non-dictionary an
     var malformed = try ArrayRef.fromBorrowed(allocator, bad_data);
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeVector("dictionary_decode", &.{.{ .array = malformed }}, none));
+}
+
+/// Bits of a float64 result column, null rows as null.
+fn bitsOf(arr: ArrayRef) ![]?u64 {
+    const allocator = std.testing.allocator;
+    const v = try common.collect(f64, allocator, .{ .array = arr });
+    defer allocator.free(v);
+    const out = try allocator.alloc(?u64, v.len);
+    for (v, out) |x, *o| o.* = if (x) |f| @as(u64, @bitCast(f)) else null;
+    return out;
+}
+
+test "hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    const payload: f64 = @bitCast(@as(u64, 0x7FF8_0000_0000_0001));
+    // a = [0.0, -0.0, nan, -nan, nan(payload 1), nan, null]
+    var a = try common.makeArray(f64, allocator, &.{ 0.0, -0.0, nan, -nan, payload, nan, null });
+    defer a.release();
+    var s = try a.slice(1, 5);
+    defer s.release();
+    var c = try common.chunkedAt(allocator, a, &.{3});
+    defer c.release();
+    var set = try common.makeArray(f64, allocator, &.{ nan, 0.0 });
+    defer set.release();
+    const lookup: common.Options = .{ .set_lookup = .{ .value_set = .{ .array = set } } };
+    const qnan: u64 = 0x7FF8_0000_0000_0000;
+
+    // pyarrow 26: count_distinct a -> 5 (mode all 6), a[1:6] -> 4, chunked -> 5.
+    inline for (.{ .{ Datum{ .array = a }, 5 }, .{ Datum{ .array = s }, 4 }, .{ Datum{ .chunked = c }, 5 } }) |k| {
+        var cd = try ctx.invokeAggregate("count_distinct", &.{k[0]}, none);
+        defer cd.release();
+        try std.testing.expectEqual(@as(i64, k[1]), cd.scalar.value.i64);
+    }
+    var cd_all = try ctx.invokeAggregate("count_distinct", &.{.{ .array = a }}, .{ .count = .{ .mode = .all } });
+    defer cd_all.release();
+    try std.testing.expectEqual(@as(i64, 6), cd_all.scalar.value.i64);
+
+    // unique (chunked): [0.0, -0.0, nan, -nan, nan(payload), null] by bits.
+    var u = try vector(&ctx, "unique", .{ .chunked = c }, none);
+    defer u.release();
+    const ub = try bitsOf(u);
+    defer allocator.free(ub);
+    try common.expectRows(u64, &.{ 0, 1 << 63, qnan, qnan | 1 << 63, qnan | 1, null }, ub);
+    // value_counts: a -> counts [1, 1, 2, 1, 1, 1]; a[1:6] -> [1, 2, 1, 1].
+    var vc = try vector(&ctx, "value_counts", .{ .array = a }, none);
+    defer vc.release();
+    try expectCounts(f64, vc, &.{ 0.0, -0.0, nan, -nan, payload, null }, &.{ 1, 1, 2, 1, 1, 1 });
+    var vs = try vector(&ctx, "value_counts", .{ .array = s }, none);
+    defer vs.release();
+    try expectCounts(f64, vs, &.{ -0.0, nan, -nan, payload }, &.{ 1, 2, 1, 1 });
+    // dictionary_encode a[1:6]: indices [0, 1, 2, 3, 1].
+    var de = try vector(&ctx, "dictionary_encode", .{ .array = s }, none);
+    defer de.release();
+    const idx = try common.collect(i32, allocator, .{ .array = de });
+    defer allocator.free(idx);
+    try common.expectRows(i32, &.{ 0, 1, 2, 3, 1 }, idx);
+
+    // is_in / index_in with value_set [nan, 0.0]: -0.0, -nan and the payload NaN do not match.
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = a }}, lookup, &.{ true, false, true, false, false, true, false });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = s }}, lookup, &.{ false, true, false, false, true });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .chunked = c }}, lookup, &.{ true, false, true, false, false, true, false });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = a }}, lookup, &.{ 1, null, 0, null, null, 0, null });
+    try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = s }}, lookup, &.{ null, 0, null, null, 0 });
+
+    // Group keys: six groups, sums of v = [1, 2, 4, 8, 16, 32, 64] -> [1, 2, 36, 8, 16, 64];
+    // hash_count_distinct by g = [1, 1, 1, 2, 2, 2, 2] -> [3, 3].
+    const hash = @import("hash_aggregate.zig");
+    var v = try common.makeArray(i64, allocator, &.{ 1, 2, 4, 8, 16, 32, 64 });
+    defer v.release();
+    var by = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = a }}, &.{.{ .function = "hash_sum", .input = v, .name = "s" }});
+    defer by.deinit();
+    const sums = try common.collect(i64, allocator, .{ .array = by.columnByName("s").?.* });
+    defer allocator.free(sums);
+    try common.expectRows(i64, &.{ 1, 2, 36, 8, 16, 64 }, sums);
+    var g = try common.makeArray(i64, allocator, &.{ 1, 1, 1, 2, 2, 2, 2 });
+    defer g.release();
+    var gd = try hash.groupBy(&ctx, &.{.{ .name = "g", .array = g }}, &.{.{ .function = "hash_count_distinct", .input = a, .name = "n" }});
+    defer gd.deinit();
+    const ns = try common.collect(i64, allocator, .{ .array = gd.columnByName("n").?.* });
+    defer allocator.free(ns);
+    try common.expectRows(i64, &.{ 3, 3 }, ns);
+
+    // mode and index compare by value, as pyarrow 26: mode([0.0, -0.0, 1.0], n=3) -> [0, 1] x
+    // [2, 1]; mode([nan, -nan, 1, 1], n=3) -> [1, nan] x [2, 2]; index([0.0, -0.0], -0.0) -> 0.
+    var z = try common.makeArray(f64, allocator, &.{ 0.0, -0.0, 1.0 });
+    defer z.release();
+    var nn = try common.makeArray(f64, allocator, &.{ nan, -nan, 1.0, 1.0 });
+    defer nn.release();
+    inline for (.{ .{ z, [_]?f64{ 0.0, 1.0 }, [_]?i64{ 2, 1 } }, .{ nn, [_]?f64{ 1.0, nan }, [_]?i64{ 2, 2 } } }) |k| {
+        const want_v = k[1];
+        const want_c = k[2];
+        var m = try vector(&ctx, "mode", .{ .array = k[0] }, .{ .mode = .{ .n = 3 } });
+        defer m.release();
+        const mv = try common.collect(f64, allocator, .{ .array = m.data().children[0] });
+        defer allocator.free(mv);
+        try common.expectRows(f64, &want_v, mv);
+        const mc = try common.collect(i64, allocator, .{ .array = m.data().children[1] });
+        defer allocator.free(mc);
+        try common.expectRows(i64, &want_c, mc);
+    }
+    var ix = try ctx.invokeAggregate("index", &.{.{ .array = z }}, .{ .index = .{ .value = common.scalarOf(f64, -0.0) } });
+    defer ix.release();
+    try std.testing.expectEqual(@as(i64, 0), ix.scalar.value.i64);
 }

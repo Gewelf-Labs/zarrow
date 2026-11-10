@@ -69,7 +69,7 @@ Evidence: `src/compute/math.zig:240`,
 As [`shift_left`](#shift_left), but a shift amount outside `[0, digits)` in a valid row is
 `InvalidInput`. Overflow of the shifted value itself is not reported.
 
-Evidence: `src/compute/math.zig:58`,
+Evidence: `src/compute/math.zig:58`, `src/compute/test_math.zig:"shift_left_checked and shift_right_checked by name: nulls, sliced, chunked, amount range (pyarrow 26 results)"`,
 `src/compute/test_math.zig:"math checked variants: domain errors only on valid rows, NaN passes (pyarrow 26)"`
 
 ## shift_right
@@ -85,5 +85,5 @@ Evidence: `src/compute/math.zig:240`,
 As [`shift_right`](#shift_right), but a shift amount outside `[0, digits)` in a valid row is
 `InvalidInput`.
 
-Evidence: `src/compute/math.zig:58`,
+Evidence: `src/compute/math.zig:58`, `src/compute/test_math.zig:"shift_left_checked and shift_right_checked by name: nulls, sliced, chunked, amount range (pyarrow 26 results)"`,
 `src/compute/test_math.zig:"math checked variants: domain errors only on valid rows, NaN passes (pyarrow 26)"`

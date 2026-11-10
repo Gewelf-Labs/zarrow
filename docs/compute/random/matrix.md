@@ -11,4 +11,4 @@ first line of the family file that names the function and the family's `register
 
 | Function | Kind | Status | Source | Tests |
 |---|---|---|---|---|
-| [`random`](notes.md#random) | scalar | yes | `src/compute/math.zig:58` | `src/compute/test_cumulative.zig:"random: seeded values in [0, 1), length, system initializer"`, `src/compute/test_registry.zig:"registerAll registers every kernel family function name with its kind"` |
+| [`random`](notes.md#random) | scalar | yes | `src/compute/math.zig:58` | `src/compute/test_math.zig:"random: seeded values in [0, 1), length, system initializer"`, `src/compute/test_registry.zig:"registerAll registers every kernel family function name with its kind"` |

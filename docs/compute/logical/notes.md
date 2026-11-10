@@ -6,7 +6,9 @@ The Arrow C++ "Logical functions" in `logical.zig`, on bool operands only (no im
 non-bool operand is an error). Each takes bool arrays, chunked arrays or scalars at any bit offset
 and returns bool. The plain functions propagate nulls (intersection); the `_kleene` functions use
 Kleene three-valued logic, where a known operand can decide the row alone. Truth tables are checked
-against Arrow. Evidence: `src/compute/logical.zig:25`,
+against Arrow. A null-type operand (alone or with bool) is `NoMatchingKernel`, as pyarrow 26 ("has no
+kernel matching input types (null, null)"). Evidence: `src/compute/logical.zig:25`,
+`src/compute/test_logical.zig:"logical functions reject null-type arguments, alone or with bool (pyarrow 26: no kernel matching (null, null) / (bool, null))"`,
 `src/compute/test_logical.zig:"logical hand-written truth tables including Kleene logic (Arrow C++ results)"`,
 `src/compute/test_logical.zig:"logical errors: non-bool operands, arity, options, lengths and malformed scalars"`.
 

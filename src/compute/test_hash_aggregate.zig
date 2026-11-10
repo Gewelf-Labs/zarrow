@@ -120,7 +120,8 @@ test "hash aggregate hand-written values: group by one and two keys, every hash_
     defer fv.release();
     var floats = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = fk }}, &.{.{ .function = "hash_sum", .input = fv, .name = "s" }});
     defer floats.deinit();
-    try expectColumn(i64, &floats, "s", &.{ 1, 2, 7 });
+    // Keys by bits (pyarrow 26 group_by: 0.0, -0.0, nan, -nan are four groups).
+    try expectColumn(i64, &floats, "s", &.{ 1, 2, 3, 4 });
 
     // The kernels on their own: values and group ids in, one row per group out.
     var ids = try groupIds(&.{k});
@@ -457,6 +458,8 @@ test "hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26
     defer v.release();
     var b = try common.makeArray(bool, allocator, &.{ true, null, false, true, null });
     defer b.release();
+    var str = try common.makeStrings(.string, allocator, &.{ "a", null, "b", "c", null });
+    defer str.release();
     var batch = try hash.groupBy(&ctx, &.{.{ .name = "k", .array = k }}, &.{
         .{ .function = "hash_sum", .input = v, .name = "sum_keep", .options = aggOpts(false, 1) },
         .{ .function = "hash_sum", .input = v, .name = "sum_mc2", .options = aggOpts(true, 2) },
@@ -465,6 +468,7 @@ test "hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26
         .{ .function = "hash_min", .input = v, .name = "min_keep", .options = aggOpts(false, 1) },
         .{ .function = "hash_min", .input = v, .name = "min_mc0", .options = aggOpts(true, 0) },
         .{ .function = "hash_max", .input = v, .name = "max_mc2", .options = aggOpts(true, 2) },
+        .{ .function = "hash_max", .input = str, .name = "smax_mc3", .options = aggOpts(true, 3) },
         .{ .function = "hash_min_max", .input = v, .name = "mm_keep", .options = aggOpts(false, 1) },
         .{ .function = "hash_count", .input = v, .name = "count_null", .options = countOpts(.only_null) },
         .{ .function = "hash_count", .input = v, .name = "count_all", .options = countOpts(.all) },
@@ -487,7 +491,12 @@ test "hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26
     try expectColumn(f64, &batch, "mean_mc0", &.{ 1.0, 3.5, std.math.nan(f64) });
     try expectColumn(i32, &batch, "min_keep", &.{ null, 3, null });
     try expectColumn(i32, &batch, "min_mc0", &.{ 1, 3, null });
-    try expectColumn(i32, &batch, "max_mc2", &.{ null, 4, null });
+    // Grouped min / max ignore min_count (pyarrow 26: max(min_count=2) -> [1, 4, None];
+    // strings max(min_count=3) -> ['a', 'c', None]).
+    try expectColumn(i32, &batch, "max_mc2", &.{ 1, 4, null });
+    const smax = try common.collectStrings(allocator, .{ .array = batch.columnByName("smax_mc3").?.* });
+    defer allocator.free(smax);
+    try common.expectStrings(&.{ "a", "c", null }, smax);
     const mm = batch.columnByName("mm_keep").?.data();
     try std.testing.expectEqual(@as(?usize, 0), mm.null_count);
     for (mm.children, [2][]const ?i32{ &.{ null, 3, null }, &.{ null, 4, null } }) |child, want| {

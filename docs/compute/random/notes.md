@@ -18,4 +18,4 @@ The one random-number function, a nullary scalar function as in Arrow (Arrow pas
 - `seed`: `std.Random.DefaultPrng` seeded with `seed`, deterministic per seed. The sequence differs from Arrow's generator, which Arrow does not specify either.
 - `system`: seeds from the operating system through `ExecConfig.io` (`std.Io.random`); without an I/O source it is `NotImplemented`.
 
-Evidence: `src/compute/math.zig:58`, `src/compute/test_cumulative.zig:"random: seeded values in [0, 1), length, system initializer"`
+Evidence: `src/compute/math.zig:58`, `src/compute/test_math.zig:"random: seeded values in [0, 1), length, system initializer"`

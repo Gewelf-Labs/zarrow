@@ -30,8 +30,8 @@
 //!   type; null rows when no value is left, fewer than `min_count`, or a null row without
 //!   `skip_nulls`. Numbers and decimals.
 //!
-//! approximate_median and tdigest are not provided (their results depend on Arrow's T-Digest
-//! merging; see the support matrix).
+//! The t-digest kernels (and their hash_ forms) live in tdigest.zig, with Arrow's
+//! merging t-digest.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const buffer = @import("../buffer.zig");
@@ -615,6 +615,7 @@ const Index = struct {
             else => false,
         };
         if (v.isNull() or nan or !hash.isKeyType(v.data_type)) return state;
+        state.map.fold_floats = true; // pyarrow 26 index(-0.0) finds 0.0
         state.target = try dense.chunkArray(ctx.allocator, .{ .scalar = v });
         errdefer state.target.?.release();
         var id: [1]u32 = undefined;
@@ -718,6 +719,7 @@ fn mode(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Da
     defer releaseParts(allocator, parts);
     var grouper = try hash.Grouper.init(allocator, &.{dt});
     defer grouper.deinit();
+    grouper.columns[0].fold_floats = true; // pyarrow 26 mode: NaNs one value, -0.0 == 0.0
     var counts: std.ArrayList(i64) = .empty;
     defer counts.deinit(allocator);
     var null_group: ?u32 = null;

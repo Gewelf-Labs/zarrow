@@ -759,3 +759,39 @@ test "implicit casts decode dictionaries and give null-type operands the other t
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("max_element_wise", &.{ .{ .array = nulls }, .{ .array = other } }, none));
     try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("equal", &.{ .{ .array = nulls }, .{ .array = nulls } }, none));
 }
+
+test "not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var x = try common.makeArray(i32, allocator, &.{ 1, 2, null, 4, 5 });
+    defer x.release();
+    var y = try common.makeArray(i32, allocator, &.{ 2, 2, 3, null, 1 });
+    defer y.release();
+    var xs = try x.slice(1, 4);
+    defer xs.release();
+    var ys = try y.slice(1, 4);
+    defer ys.release();
+    var xc = try common.chunkedAt(allocator, x, &.{2});
+    defer xc.release();
+    var yc = try common.chunkedAt(allocator, y, &.{3});
+    defer yc.release();
+    // [x vs y, x[1:] vs y[1:], x vs scalar 2]
+    const cases = .{
+        .{ "not_equal", [_]?bool{ true, false, null, null, true }, [_]?bool{ false, null, null, true }, [_]?bool{ true, false, null, true, true } },
+        .{ "less", [_]?bool{ true, false, null, null, false }, [_]?bool{ false, null, null, false }, [_]?bool{ true, false, null, false, false } },
+        .{ "less_equal", [_]?bool{ true, true, null, null, false }, [_]?bool{ true, null, null, false }, [_]?bool{ true, true, null, false, false } },
+        .{ "greater", [_]?bool{ false, false, null, null, true }, [_]?bool{ false, null, null, true }, [_]?bool{ false, false, null, true, true } },
+        .{ "greater_equal", [_]?bool{ false, true, null, null, true }, [_]?bool{ true, null, null, true }, [_]?bool{ false, true, null, true, true } },
+    };
+    inline for (cases) |c| {
+        const w1 = c[1];
+        const w2 = c[2];
+        const w3 = c[3];
+        try common.expectInvoke(bool, &ctx, .scalar, c[0], &.{ .{ .array = x }, .{ .array = y } }, &w1);
+        try common.expectInvoke(bool, &ctx, .scalar, c[0], &.{ .{ .array = xs }, .{ .array = ys } }, &w2);
+        try common.expectInvoke(bool, &ctx, .scalar, c[0], &.{ .{ .chunked = xc }, .{ .chunked = yc } }, &w1);
+        try common.expectInvoke(bool, &ctx, .scalar, c[0], &.{ .{ .array = x }, .{ .scalar = common.scalarOf(i32, 2) } }, &w3);
+    }
+}

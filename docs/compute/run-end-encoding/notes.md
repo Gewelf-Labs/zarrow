@@ -18,10 +18,10 @@ Vector functions over arrays and chunked arrays in `run_end.zig`, chunk by chunk
 - Options: `RunEndEncodeOptions.run_end_type` int16, int32 (default) or int64. A chunk longer than the run end type holds is `InvalidInput` (Arrow's "Cannot run-end encode Arrays with more elements than the run end type can hold"). A zero-length input gives an empty run-end encoded array.
 - Floats compare by bits as Arrow (0.0 and -0.0 are two runs).
 - Beyond pyarrow 26: string_view / binary_view (no pyarrow kernel).
-- Nested types (list, large_list, list_view, large_list_view, fixed_size_list, struct, map) compare rows by the logical equality of `integration/compare.zig` (`rowsEqual`: a null row equals a null row, a null struct is not a struct of null fields, item nulls equal item nulls); results match pyarrow 26 on lists and structs.
-- Deviation: a float item inside a nested row compares by bits, so NaN items with the same bits are one run where Arrow, comparing by value, makes two.
+- Nested types (list, large_list, list_view, large_list_view, fixed_size_list, struct, map) compare rows by the logical equality of `integration/compare.zig` (`rowsEqualNanUnequal`: a null row equals a null row, a null struct is not a struct of null fields, item nulls equal item nulls); results match pyarrow 26 on lists and structs.
+- A float item inside a nested row compares by bits, except that a NaN item never equals anything, as Arrow: pyarrow 26 gives `[{a: nan}, {a: nan}]` two runs and `[{a: 0.0}, {a: -0.0}]` two runs.
 
-Evidence: `src/compute/run_end.zig:44`, `src/compute/run_end.zig:43`, `src/compute/test_is_null.zig:"is_null, is_valid, true_unless_null and count on run-end encoded and union arrays use the children's nulls: sliced, chunked (pyarrow 26 results)"`, `src/compute/test_run_end.zig:"run_end_encode and run_end_decode hand-written values, nulls, sliced, every run end type (pyarrow 26 results)"`, `src/compute/test_run_end.zig:"run_end_decode of a sliced run_end_encoded array and a sliced values child (pyarrow 26 results)"`
+Evidence: `src/compute/run_end.zig:44`, `src/compute/run_end.zig:43`, `src/compute/test_is_null.zig:"is_null, is_valid, true_unless_null and count on run-end encoded and union arrays use the children's nulls: sliced, chunked (pyarrow 26 results)"`, `src/compute/test_run_end.zig:"run_end_encode and run_end_decode hand-written values, nulls, sliced, every run end type (pyarrow 26 results)"`, `src/compute/test_run_end.zig:"run_end_decode of a sliced run_end_encoded array and a sliced values child (pyarrow 26 results)"`, `src/compute/test_run_end.zig:"run_end_encode on nested float items: NaN items never equal, 0.0 and -0.0 differ: sliced, chunked (pyarrow 26 results)"`
 
 ## run_end_decode
 

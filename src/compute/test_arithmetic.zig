@@ -557,6 +557,11 @@ test "arithmetic, math, rounding, bit-wise and pairwise_diff functions on null-t
         const inputs = [_]Datum{ .{ .array = nulls }, .{ .array = tail }, .{ .chunked = chunked } };
         for (inputs) |in| {
             const args = [_]Datum{ in, in };
+            if (c.kind == .vector and in == .chunked) {
+                // pyarrow 26: pairwise_diff(chunked null) -> ArrowInvalid (no chunked exec).
+                try std.testing.expectError(error.InvalidInput, ctx.invoke(c.name, c.kind, args[0..c.arity], none));
+                continue;
+            }
             var out = try ctx.invoke(c.name, c.kind, args[0..c.arity], none);
             defer out.release();
             try std.testing.expect(out.dataType() == .null);
@@ -564,6 +569,12 @@ test "arithmetic, math, rounding, bit-wise and pairwise_diff functions on null-t
             try std.testing.expectEqual(in == .chunked, out == .chunked);
             if (out.asArray()) |a| try a.data().validateFull();
             try std.testing.expect((try registry.resolveResultType(c.name, c.kind, args[0..c.arity], none)) == .null);
+        }
+        if (c.kind == .vector) {
+            // pyarrow 26: pairwise_diff(pa.scalar(None)) -> NullArray of 1 null.
+            var v = try ctx.invoke(c.name, c.kind, &.{ns}, none);
+            defer v.release();
+            try std.testing.expect(v == .array and v.dataType() == .null and v.array.data().length == 1);
         }
         if (c.kind == .scalar) {
             // Scalars, and an array with a null-type scalar (broadcast).
@@ -608,4 +619,44 @@ test "sign on duration gives int8: nulls, sliced, chunked and scalars (pyarrow 2
     try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .scalar = common.Scalar.init(dt, .{ .duration = -7 }) }}, &.{-1});
     try common.expectInvoke(i8, &ctx, .scalar, "sign", &.{.{ .scalar = common.Scalar.init(dt, .null) }}, &.{null});
     try std.testing.expect((try registry.resolveResultType("sign", .scalar, &.{.{ .array = d }}, none)) == .int8);
+}
+
+test "abs_checked and negate_checked by name: nulls, sliced, chunked, overflow, unsigned (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var a = try common.makeArray(i8, allocator, &.{ -5, null, 7, 0, -127 });
+    defer a.release();
+    var tail = try a.slice(1, 3);
+    defer tail.release();
+    var c = try common.chunkedAt(allocator, a, &.{2});
+    defer c.release();
+    // pyarrow 26: abs_checked -> [5, None, 7, 0, 127]; negate_checked -> [5, None, -7, 0, 127].
+    const cases = .{
+        .{ "abs_checked", [_]?i8{ 5, null, 7, 0, 127 } },
+        .{ "negate_checked", [_]?i8{ 5, null, -7, 0, 127 } },
+    };
+    inline for (cases) |k| {
+        const w1 = k[1];
+        try common.expectInvoke(i8, &ctx, .scalar, k[0], &.{.{ .array = a }}, &w1);
+        try common.expectInvoke(i8, &ctx, .scalar, k[0], &.{.{ .array = tail }}, w1[1..4]);
+        try common.expectInvoke(i8, &ctx, .scalar, k[0], &.{.{ .chunked = c }}, &w1);
+    }
+    // pyarrow 26: abs_checked / negate_checked of int8 -128 -> "overflow" (a null -128 is fine).
+    var min8 = try common.makeArray(i8, allocator, &.{ -128, null });
+    defer min8.release();
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("abs_checked", &.{.{ .array = min8 }}, none));
+    try std.testing.expectError(error.Overflow, ctx.invokeScalar("negate_checked", &.{.{ .array = min8 }}, none));
+    // Unsigned: abs_checked [1, None] -> [1, None]; negate_checked has no uint8 kernel
+    // ("Function 'negate_checked' has no kernel matching input types (uint8)"); negate wraps.
+    var u = try common.makeArray(u8, allocator, &.{ 1, null });
+    defer u.release();
+    try common.expectInvoke(u8, &ctx, .scalar, "abs_checked", &.{.{ .array = u }}, &.{ 1, null });
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("negate_checked", &.{.{ .array = u }}, none));
+    try common.expectInvoke(u8, &ctx, .scalar, "negate", &.{.{ .array = u }}, &.{ 255, null });
+    // Floats: abs_checked [-1.5, None, -0.0] -> [1.5, None, 0.0].
+    var f = try common.makeArray(f64, allocator, &.{ -1.5, null, -0.0 });
+    defer f.release();
+    try common.expectInvoke(f64, &ctx, .scalar, "abs_checked", &.{.{ .array = f }}, &.{ 1.5, null, 0.0 });
 }

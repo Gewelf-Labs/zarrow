@@ -96,9 +96,11 @@ test "tdigest and approximate_median hand-written values, options and types (pya
     defer dec.release();
     try expectAggregate(&ctx, "tdigest", &.{.{ .array = dec }}, none, &.{2.0});
     try expectAggregate(&ctx, "tdigest", &.{.{ .scalar = common.scalarOf(f64, 3.0) }}, none, &.{3.0});
-    // q outside [0, 1] (Arrow: NaN) and oversized options are rejected.
-    try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("tdigest", &.{d}, .{ .tdigest = .{ .q = &.{1.5} } }));
-    try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("tdigest", &.{d}, .{ .tdigest = .{ .q = &.{nan} } }));
+    // q outside [0, 1] or NaN gives NaN (pyarrow 26: tdigest(q=[-0.1, 0.5]) -> [nan, ...];
+    // q=[nan, 2] -> [nan, nan]); no value still gives null.
+    try expectAggregate(&ctx, "tdigest", &.{d}, .{ .tdigest = .{ .q = &.{ -0.1, 0.5, 1.5, nan } } }, &.{ nan, 3.0, nan, nan });
+    try expectAggregate(&ctx, "tdigest", &.{.{ .array = empty }}, .{ .tdigest = .{ .q = &.{2} } }, &.{null});
+    // Oversized options are rejected.
     try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("tdigest", &.{d}, .{ .tdigest = .{ .delta = 1 << 21 } }));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeAggregate("tdigest", &.{d}, .{ .tdigest = .{ .buffer_size = 1 << 25 } }));
     var bools = try common.makeArray(bool, allocator, &.{true});
@@ -203,5 +205,11 @@ test "hash_tdigest and hash_approximate_median per group (pyarrow 26 group_by, u
     try expectClose(&.{ -0.27444398285586735, 5.07235258371462, -4.091138756330174 }, medians, 1e-9);
     var ids = try common.makeArray(u32, allocator, &.{ 0, 0, 1, 1, 1, 2 });
     defer ids.release();
-    try std.testing.expectError(error.InvalidOptions, ctx.invoke("hash_tdigest", .hash_aggregate, &.{ .{ .array = v }, .{ .array = ids } }, .{ .tdigest = .{ .q = &.{-0.5} } }));
+    // q outside [0, 1]: NaN in every group (pyarrow 26 group_by tdigest(q=2) -> [[nan], [nan]]).
+    var out_q = try ctx.invoke("hash_tdigest", .hash_aggregate, &.{ .{ .array = v }, .{ .array = ids } }, .{ .tdigest = .{ .q = &.{-0.5} } });
+    defer out_q.release();
+    const nan_items = try rowsOf(.{ .array = out_q.array.data().children[0] });
+    defer allocator.free(nan_items);
+    try expectClose(&.{ nan, nan, null }, nan_items, 1e-12);
+    try std.testing.expectError(error.InvalidOptions, ctx.invoke("hash_tdigest", .hash_aggregate, &.{ .{ .array = v }, .{ .array = ids } }, .{ .tdigest = .{ .delta = 1 << 21 } }));
 }

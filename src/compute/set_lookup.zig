@@ -5,8 +5,8 @@
 //! set's type instead (as pyarrow 26: an int64 value set [1, 300] against int8 rows, or a float
 //! value set [1.5] against int32 rows); when neither cast exists the call is `InvalidOptions`. index_in returns the position of the
 //! first occurrence in the value set. Inputs: every key type of hash_aggregate.zig (numbers, bool,
-//! dates, timestamps, times, durations, string and binary layouts); floats match by bits after
-//! folding every NaN into one (NaN matches NaN, -0.0 does not match 0.0, as in Arrow).
+//! dates, timestamps, times, durations, string and binary layouts); floats match by bits, as
+//! pyarrow 26 (NaN matches only NaN with the same bits, -0.0 does not match 0.0).
 //!
 //! Nulls follow `null_matching_behavior` (Arrow C++): `match` (a null input matches a null of
 //! the value set: is_in true, index_in its position; is_in false / index_in null without one),

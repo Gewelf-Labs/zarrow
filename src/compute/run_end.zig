@@ -12,8 +12,8 @@
 //!   types list, large_list, list_view, large_list_view, fixed_size_list, struct and map, whose
 //!   rows compare by `integration/compare.zig`'s logical equality (a null row equals a null row,
 //!   a struct of null fields is not a null struct, item nulls equal item nulls; float items by
-//!   bits, so a NaN item with the same bits is one run where Arrow, comparing by value, makes
-//!   two). Dictionaries, unions and extension types are `NoMatchingKernel`. A
+//!   bits, except that a NaN item never equals anything, as Arrow: pyarrow 26 gives `[[nan],
+//!   [nan]]` two runs and `[[0.0], [-0.0]]` two runs). Dictionaries, unions and extension types are `NoMatchingKernel`. A
 //!   chunk longer than the run end type holds is `InvalidInput` (Arrow: "Cannot run-end encode
 //!   Arrays with more elements than the run end type can hold").
 //! - run_end_decode: the plain values of a `run_end_encoded` array (the value type), also of a
@@ -270,12 +270,12 @@ const FixedRows = struct {
 };
 
 /// Rows of a nested array compared by `integration/compare.zig` (Arrow's logical equality: the
-/// validity, then the values of valid rows, nested nulls equal to nested nulls; a malformed child
-/// compares unequal).
+/// validity, then the values of valid rows, nested nulls equal to nested nulls; a NaN item is
+/// unequal to everything; a malformed child compares unequal).
 const NestedRows = struct {
     d: *const ArrayData,
     fn eql(self: NestedRows, i: usize, j: usize) bool {
-        return compare.rowsEqual(self.d, i, self.d, j);
+        return compare.rowsEqualNanUnequal(self.d, i, self.d, j);
     }
 };
 

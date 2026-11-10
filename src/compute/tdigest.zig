@@ -19,9 +19,9 @@
 //! - hash_tdigest: `fixed_size_list<double>[q.len]` per group, a group without result holds
 //!   null quantiles (the list itself is valid, as Arrow); hash_approximate_median: float64.
 //!
-//! Options are bounded so they cannot force a huge allocation: every q in [0, 1] (Arrow gives
-//! NaN outside; here `InvalidOptions`), at most 65536 quantiles, delta <= 2^20, buffer_size <=
-//! 2^24; a digest never holds more than its values anyway.
+//! A q outside [0, 1] (or NaN) gives a NaN quantile, as Arrow. Options are bounded so they
+//! cannot force a huge allocation: at most 65536 quantiles, delta <= 2^20, buffer_size <= 2^24;
+//! a digest never holds more than its values anyway.
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
@@ -194,7 +194,7 @@ pub const TDigest = struct {
     pub fn quantile(self: *TDigest, allocator: std.mem.Allocator, q: f64) KernelError!f64 {
         try self.flush(allocator);
         const td = self.digests[self.current].items;
-        if (q < 0 or q > 1 or td.len == 0) return std.math.nan(f64);
+        if (!(q >= 0 and q <= 1) or td.len == 0) return std.math.nan(f64);
         const index = q * self.total_weight;
         if (index <= 1) return self.min;
         if (index >= self.total_weight - 1) return self.max;
@@ -254,7 +254,6 @@ fn tdigestOptions(options: Options) bool {
     if (options != .tdigest) return false;
     const o = options.tdigest;
     if (o.q.len > max_quantiles or o.delta > max_delta or o.buffer_size > max_buffer_size) return false;
-    for (o.q) |q| if (!(q >= 0 and q <= 1)) return false;
     return true;
 }
 
