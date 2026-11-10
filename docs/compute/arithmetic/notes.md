@@ -10,7 +10,7 @@ cast unless `ExecConfig.safe_cast` is false), and arguments that are all of the 
 null-type result of their length (Arrow's null kernels). Unchecked integer results wrap, or saturate
 when `ExecConfig.overflow_mode` is `saturating`; the `_checked` variants return `Overflow`. Errors
 are only raised for valid rows. Evidence: `src/compute/arithmetic.zig:42`,
-`src/compute/registry.zig:248`, `src/compute/test_arithmetic.zig:"arithmetic implicit casts: mixed numeric operands use Arrow's common type (pyarrow 26 table)"`,
+`src/compute/registry.zig:261`, `src/compute/test_arithmetic.zig:"arithmetic implicit casts: mixed numeric operands use Arrow's common type (pyarrow 26 table)"`,
 `src/compute/test_arithmetic.zig:"arithmetic, math, rounding, bit-wise and pairwise_diff functions on null-type arguments give a null-type result: arrays, sliced, chunked, scalars (pyarrow 26)"`.
 
 ## Summary
@@ -200,7 +200,7 @@ Evidence: `src/compute/arithmetic.zig:118`, `src/compute/decimal.zig:482`,
 As [`negate`](#negate), but `minInt` in a valid row is `Overflow`. There is no unsigned kernel
 (as Arrow C++), so an unsigned argument is `NoMatchingKernel`.
 
-Evidence: `src/compute/arithmetic.zig:42`,
+Evidence: `src/compute/arithmetic.zig:42`, `src/compute/test_arithmetic.zig:"abs_checked and negate_checked by name: nulls, sliced, chunked, overflow, unsigned (pyarrow 26 results)"`,
 `src/compute/test_arithmetic.zig:"arithmetic errors: Overflow, DivideByZero, mismatched types, options, lengths and malformed input"`,
 `src/compute/test_decimal.zig:"decimal negate, abs, sign and their checked variants"`
 
@@ -218,7 +218,7 @@ Evidence: `src/compute/arithmetic.zig:118`, `src/compute/decimal.zig:482`,
 
 As [`abs`](#abs), but `minInt` in a valid row is `Overflow`.
 
-Evidence: `src/compute/arithmetic.zig:42`,
+Evidence: `src/compute/arithmetic.zig:42`, `src/compute/test_arithmetic.zig:"abs_checked and negate_checked by name: nulls, sliced, chunked, overflow, unsigned (pyarrow 26 results)"`,
 `src/compute/test_decimal.zig:"decimal negate, abs, sign and their checked variants"`
 
 ## power
@@ -238,7 +238,7 @@ Evidence: `src/compute/math.zig:214`, `src/compute/math.zig:240`,
 
 As [`power`](#power), but an integer overflow at any squaring step in a valid row is `Overflow`.
 
-Evidence: `src/compute/math.zig:58`,
+Evidence: `src/compute/math.zig:58`, `src/compute/test_math.zig:"power_checked by name: nulls, sliced, chunked, overflow and negative exponents (pyarrow 26 results)"`,
 `src/compute/test_math.zig:"math binary functions, integer power, bit-wise and shifts match pyarrow 26"`
 
 ## sign

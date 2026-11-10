@@ -54,11 +54,11 @@ Evidence: `src/compute/aggregate_basic.zig:79`, `src/compute/aggregate_basic.zig
 
 ## approximate_median
 
-`approximate_median` is `tdigest` with `q = [0.5]`, returned as one float64 scalar. It uses the same merging t-digest (see [`tdigest`](#tdigest)): NaN is skipped but counts as a valid row (Arrow), and the result equals pyarrow 26 within 1e-15 relative on 5000 rows with nulls and NaN.
+`approximate_median` is `tdigest` with `q = [0.5]`, returned as one float64 scalar. It uses the same merging t-digest (see [`tdigest`](#tdigest)): NaN is skipped but counts as a valid row (Arrow), and the result equals pyarrow 26 within 1e-15 relative on 5000 rows with nulls and NaN (observed; the tests check 1e-9).
 
 Options: `ScalarAggregateOptions` (`skip_nulls`, `min_count`).
 
-Evidence: `src/compute/aggregate_stats.zig:33`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_tdigest.zig:"tdigest and approximate_median hand-written values, options and types (pyarrow 26 results)"`, `src/compute/test_tdigest.zig:"tdigest on 5000 rows with nulls and NaN: array, chunked (merged per chunk) and small delta follow pyarrow 26"`
+Evidence: `src/compute/tdigest.zig:535`, `src/compute/tdigest.zig:531`, `src/compute/test_tdigest.zig:"tdigest and approximate_median hand-written values, options and types (pyarrow 26 results)"`, `src/compute/test_tdigest.zig:"tdigest on 5000 rows with nulls and NaN: array, chunked (merged per chunk) and small delta follow pyarrow 26"`
 
 ## count
 
@@ -78,7 +78,7 @@ Evidence: `src/compute/aggregate_basic.zig:77`, `src/compute/aggregate_basic.zig
 
 ## count_distinct
 
-`count_distinct` counts distinct values on every key type (numbers, float16, bool, temporal, intervals, decimals, fixed_size_binary, string / binary layouts). A null is one value; `CountOptions.mode` chooses whether the null is counted (`only_valid` default, `only_null`, `all`). Floats compare with every NaN one value and -0.0 and 0.0 two values, as pyarrow 26.
+`count_distinct` counts distinct values on every key type (numbers, float16, bool, temporal, intervals, decimals, fixed_size_binary, string / binary layouts). A null is one value; `CountOptions.mode` chooses whether the null is counted (`only_valid` default, `only_null`, `all`). Floats compare by their bits, as pyarrow 26 hashes them: NaN with another sign or payload is another value, -0.0 and 0.0 two (`count_distinct([0.0, -0.0, nan, -nan])` is 4); evidence `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`.
 
 Evidence: `src/compute/aggregate_stats.zig:84`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
 
@@ -90,7 +90,7 @@ Evidence: `src/compute/aggregate_stats.zig:84`, `src/compute/aggregate_basic.zig
 - fixed_size_binary gives a scalar of the input width.
 - Options: `ScalarAggregateOptions` (`skip_nulls` default true, `min_count` default 1; Arrow defaults when `none`). A null row without `skip_nulls`, or fewer valid rows than `min_count`, gives a null result.
 
-Evidence: `src/compute/aggregate_basic.zig:840`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
+Evidence: `src/compute/aggregate_stats.zig:81`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
 
 ## first_last
 
@@ -103,7 +103,7 @@ Evidence: `src/compute/aggregate_stats.zig:83`, `src/compute/aggregate_basic.zig
 `index` returns the position of the first row equal to `IndexOptions.value`, or -1 when absent.
 
 - The value is cast to the input type first.
-- A null or NaN value is never found (-1).
+- A null or NaN value is never found (-1); floats compare by value, so `index([0.0, -0.0], -0.0)` is 0 (pyarrow 26; `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`).
 
 Evidence: `src/compute/aggregate_stats.zig:86`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
 
@@ -122,7 +122,7 @@ Evidence: `src/compute/aggregate_stats.zig:79`, `src/compute/aggregate_basic.zig
 
 `last` mirrors [`first`](#first): the last valid row with `skip_nulls`, the last row (maybe null) without it.
 
-Evidence: `src/compute/aggregate_basic.zig:848`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"first, last and first_last on fixed_size_binary: nulls, skip_nulls, sliced and chunked (pyarrow 26 results)"`
+Evidence: `src/compute/aggregate_stats.zig:82`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"first, last, first_last, count_distinct and index hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"first, last and first_last on fixed_size_binary: nulls, skip_nulls, sliced and chunked (pyarrow 26 results)"`
 
 ## max
 
@@ -161,7 +161,7 @@ Evidence: `src/compute/aggregate_basic.zig:68`, `src/compute/aggregate_basic.zig
 
 `min_max` returns a `struct<min, max>` scalar, with the type and option rules of [`min`](#min) and [`max`](#max). The struct type is stored with its payload array (`dense.structArray`) and `resolveResultTypeAlloc` builds it in an arena.
 
-- The null fields of a null result reuse a null input row. For an empty fixed_size_binary input wider than 16 MiB there is no such row, and the call is `UnsupportedType` rather than an allocation the input does not justify.
+- The null fields of a null result reuse a null input row. For an empty fixed_size_binary input wider than 16 MiB there is no such row, and the call is `UnsupportedType` rather than an allocation the input does not justify (`src/compute/aggregate_basic.zig:1073`; backed by code only, no test).
 
 Evidence: `src/compute/aggregate_basic.zig:70`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_basic.zig:"aggregate hand-written values: sum, mean, min, max, min_max, count, count_all, any, all"`, `src/compute/test_aggregate_basic.zig:"aggregate chunked input with misaligned chunks and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_basic.zig:"aggregate ScalarAggregateOptions and CountOptions: skip_nulls, min_count, count modes, nullary count_all (Arrow C++ results)"`
 
@@ -184,7 +184,7 @@ Evidence: `src/compute/pivot.zig:377`, `src/compute/aggregate_basic.zig:63`, `sr
 - bool gives uint64 (0 when a valid row is false, else 1); the null type gives int64 null, or 1 with `min_count = 0` (pyarrow 26).
 - Options: `ScalarAggregateOptions` (`skip_nulls` default true, `min_count` default 1; Arrow defaults when `none`). A null row without `skip_nulls`, or fewer valid rows than `min_count`, gives a null result.
 
-Evidence: `src/compute/aggregate_basic.zig:510`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"product, variance, stddev, skew and kurtosis hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
+Evidence: `src/compute/aggregate_stats.zig:65`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"product, variance, stddev, skew and kurtosis hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats on random sliced inputs with nulls: chunked inputs and the update / merge lifecycle equal the array result"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
 
 ## skew
 
@@ -217,9 +217,9 @@ Evidence: `src/compute/aggregate_basic.zig:66`, `src/compute/aggregate_basic.zig
 - Options: `TDigestOptions` (`q` default [0.5], each in [0, 1]; `delta` default 100; `buffer_size` default 500; `skip_nulls`; `min_count` default 0).
 - Equal to pyarrow 26 within 1e-15 relative on 5000 rows with nulls and NaN; the tests allow 1e-9 since another libm's asin / sin may move a centroid boundary.
 - NaN is skipped but counts as a valid row (Arrow).
-- Deviation: a q outside [0, 1] is `InvalidOptions` (Arrow returns NaN); `delta` past 2^20 and `buffer_size` past 2^24 are `InvalidOptions` too.
+- A q outside [0, 1] (or NaN) gives a NaN quantile, as Arrow (pyarrow 26: `tdigest(q=[-0.1, 0.5])` -> `[nan, ...]`); `delta` past 2^20 and `buffer_size` past 2^24 are `InvalidOptions` (a zarrow bound against huge allocations).
 
-Evidence: `src/compute/aggregate_stats.zig:33`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_tdigest.zig:"tdigest and approximate_median hand-written values, options and types (pyarrow 26 results)"`, `src/compute/test_tdigest.zig:"tdigest on 5000 rows with nulls and NaN: array, chunked (merged per chunk) and small delta follow pyarrow 26"`
+Evidence: `src/compute/tdigest.zig:534`, `src/compute/tdigest.zig:531`, `src/compute/test_tdigest.zig:"tdigest and approximate_median hand-written values, options and types (pyarrow 26 results)"`, `src/compute/test_tdigest.zig:"tdigest on 5000 rows with nulls and NaN: array, chunked (merged per chunk) and small delta follow pyarrow 26"`
 
 ## variance
 
@@ -233,9 +233,9 @@ Evidence: `src/compute/aggregate_stats.zig:76`, `src/compute/aggregate_basic.zig
 
 ## mode
 
-`mode` (vector) returns the `n` most common values ordered by count descending, then by value; NaN sorts last. The result is empty when a null row is seen without `skip_nulls` or fewer valid rows than `min_count` remain. Options: `ModeOptions` (`n` default 1, `skip_nulls` default true, `min_count` default 0).
+`mode` (vector) returns the `n` most common values ordered by count descending, then by value; NaN sorts last. Floats compare by value with every NaN one value and -0.0 equal to 0.0, unlike the hash kernels, as pyarrow 26 (`mode([nan, -nan, 1, 1], n=3)` gives `[1, nan]` with counts `[2, 2]`; `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`). The result is empty when a null row is seen without `skip_nulls` or fewer valid rows than `min_count` remain. Options: `ModeOptions` (`n` default 1, `skip_nulls` default true, `min_count` default 0).
 
-Evidence: `src/compute/aggregate_basic.zig:25`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"mode and quantile hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
+Evidence: `src/compute/aggregate_stats.zig:91`, `src/compute/aggregate_basic.zig:63`, `src/compute/test_aggregate_stats.zig:"mode and quantile hand-written values and options (pyarrow 26 results)"`, `src/compute/test_aggregate_stats.zig:"aggregate stats errors: options, types, empty and all-null inputs, malformed input"`
 
 ## quantile
 

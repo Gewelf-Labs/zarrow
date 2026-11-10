@@ -187,9 +187,10 @@ test "first, last, first_last, count_distinct and index hand-written values and 
     try expectI64(&ctx, "count_distinct", da, none, 3);
     try expectI64(&ctx, "count_distinct", da, .{ .count = .{ .mode = .all } }, 4);
     try expectI64(&ctx, "count_distinct", da, .{ .count = .{ .mode = .only_null } }, 1);
+    // Floats by bits: pyarrow 26 count_distinct([0.0, -0.0, nan, -nan]) is 4.
     var zeros = try common.makeArray(f64, allocator, &.{ 0.0, -0.0, nan, -nan });
     defer zeros.release();
-    try expectI64(&ctx, "count_distinct", .{ .array = zeros }, none, 3);
+    try expectI64(&ctx, "count_distinct", .{ .array = zeros }, none, 4);
 
     try expectI64(&ctx, "index", da, .{ .index = .{ .value = common.scalarOf(i32, 3) } }, 0);
     try expectI64(&ctx, "index", da, .{ .index = .{ .value = common.scalarOf(i32, 7) } }, -1);

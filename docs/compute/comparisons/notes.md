@@ -6,7 +6,7 @@ The Arrow C++ "Comparisons" in `comparison.zig`: six binary comparisons with a b
 variadic `min_element_wise` / `max_element_wise`. All work element-wise on array, chunked or scalar
 operands; operands of different types are unified as Arrow's `DispatchBest` (dictionaries are
 decoded, a null-type operand takes the other type, numbers go to their common type, float16 to
-float32). Evidence: `src/compute/comparison.zig:68`, `src/compute/registry.zig:240`,
+float32). Evidence: `src/compute/comparison.zig:68`, `src/compute/registry.zig:253`,
 `src/compute/test_comparison.zig:"implicit casts decode dictionaries and give null-type operands the other type (pyarrow 26)"`,
 `src/compute/test_cast.zig:"float16: cast to and from numbers and text, promotion to float32 in arithmetic and comparisons, is_nan / is_inf / is_finite (pyarrow 26 results)"`.
 
@@ -56,7 +56,7 @@ Evidence: `src/compute/comparison.zig:212`, `src/compute/comparison.zig:427`, `s
 `x != y` per row, with the types and unification of [`equal`](#equal). For a NaN operand the
 result is true.
 
-Evidence: `src/compute/comparison.zig:212`,
+Evidence: `src/compute/comparison.zig:212`, `src/compute/test_comparison.zig:"not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)"`,
 `src/compute/test_comparison.zig:"comparison hand-written values for integers, floats with NaN, bools and strings of every layout"`,
 `src/compute/test_comparison.zig:"comparison empty and all-null inputs"`
 
@@ -66,7 +66,7 @@ Evidence: `src/compute/comparison.zig:212`,
 strings and binaries order by bytes; a NaN operand gives false. Mismatched types with no common
 type, wrong arity, options or lengths are errors.
 
-Evidence: `src/compute/comparison.zig:233`, `src/compute/comparison.zig:307`,
+Evidence: `src/compute/comparison.zig:233`, `src/compute/comparison.zig:307`, `src/compute/test_comparison.zig:"not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)"`,
 `src/compute/test_comparison.zig:"comparison hand-written values for integers, floats with NaN, bools and strings of every layout"`,
 `src/compute/test_comparison.zig:"comparison errors: mismatched types, arity, options, lengths and malformed scalars"`
 
@@ -74,21 +74,21 @@ Evidence: `src/compute/comparison.zig:233`, `src/compute/comparison.zig:307`,
 
 `x <= y` per row, as [`less`](#less).
 
-Evidence: `src/compute/comparison.zig:212`,
+Evidence: `src/compute/comparison.zig:212`, `src/compute/test_comparison.zig:"not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)"`,
 `src/compute/test_comparison.zig:"comparison implicit casts and binary, fixed-size, temporal and decimal operands"`
 
 ## greater
 
 `x > y` per row, as [`less`](#less).
 
-Evidence: `src/compute/comparison.zig:212`,
+Evidence: `src/compute/comparison.zig:212`, `src/compute/test_comparison.zig:"not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)"`,
 `src/compute/test_comparison.zig:"comparison oracle matches a per-element loop on random sliced inputs with nulls for every type"`
 
 ## greater_equal
 
 `x >= y` per row, as [`less`](#less).
 
-Evidence: `src/compute/comparison.zig:212`,
+Evidence: `src/compute/comparison.zig:212`, `src/compute/test_comparison.zig:"not_equal, less, less_equal, greater, greater_equal by name: nulls, sliced, chunked, scalar (pyarrow 26 results)"`,
 `src/compute/test_comparison.zig:"comparison oracle matches a per-element loop on random sliced inputs with nulls for every type"`
 
 ## max_element_wise

@@ -321,3 +321,26 @@ test "run_end_encode and run_end_decode on the list layouts, fixed_size_list, st
     defer m.release();
     try nestedRoundTrip(&ctx, m, &.{ 2, 3, 4 });
 }
+
+test "run_end_encode on nested float items: NaN items never equal, 0.0 and -0.0 differ: sliced, chunked (pyarrow 26 results)" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    // struct<a: double> [{nan}, {nan}, {0.0}, {-0.0}, {1.5}, {1.5}, {null}, {null}]:
+    // pyarrow 26 run ends [1, 2, 3, 4, 6, 8]; [1:5] -> [1, 2, 3, 4]; chunks [:5], [5:] -> second [1, 3].
+    const nan = std.math.nan(f64);
+    var a = try common.makeArray(f64, allocator, &.{ nan, nan, 0.0, -0.0, 1.5, 1.5, null, null });
+    defer a.release();
+    var st = try structural.makeStruct(allocator, &.{"a"}, &.{a}, null);
+    defer st.release();
+    try nestedRoundTrip(&ctx, st, &.{ 1, 2, 3, 4, 6, 8 });
+    var mid = try st.slice(1, 4);
+    defer mid.release();
+    try nestedRoundTrip(&ctx, mid, &.{ 1, 2, 3, 4 });
+    var c = try common.chunkedAt(allocator, st, &.{5});
+    defer c.release();
+    var enc = try ctx.invoke("run_end_encode", .vector, &.{.{ .chunked = c }}, none);
+    defer enc.release();
+    try std.testing.expectEqualSlices(i32, &.{ 1, 3 }, try (common.array_mod.PrimitiveArray(i32){ .data = enc.chunked.chunks()[1].data().children[0].data() }).values());
+}

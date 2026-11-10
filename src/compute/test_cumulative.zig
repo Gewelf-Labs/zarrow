@@ -185,10 +185,12 @@ test "pairwise_diff and pairwise_diff_checked: periods, overflow, temporal and d
         const got: i128 = if (wt == .decimal128) (try (common.array_mod.PrimitiveArray(i128){ .data = out.array.data() }).values())[1] else (try (common.array_mod.PrimitiveArray(i64){ .data = out.array.data() }).values())[1];
         try std.testing.expectEqual(wv, got);
     }
-    // Chunked input (concatenated: Arrow rejects it), sliced input, a scalar.
+    // Chunked input is rejected (pyarrow 26: ArrowInvalid "Vector kernel cannot execute
+    // chunkwise"), sliced input, a scalar.
     var vc = try common.chunkedAt(allocator, v, &.{ 1, 3 });
     defer vc.release();
-    try expectVector(i64, &ctx, "pairwise_diff", &.{.{ .chunked = vc }}, none, &.{ null, 3, null, null, 10 });
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("pairwise_diff", &.{.{ .chunked = vc }}, none));
+    try std.testing.expectError(error.InvalidInput, ctx.invokeVector("pairwise_diff_checked", &.{.{ .chunked = vc }}, none));
     var tail = try v.slice(2, 3);
     defer tail.release();
     try expectVector(i64, &ctx, "pairwise_diff", &.{.{ .array = tail }}, .{ .pairwise = .{ .period = -1 } }, &.{ null, -10, null });
@@ -232,34 +234,4 @@ test "winsorize: nearest quantile limits, NaN and nulls, decimals, chunked, opti
     try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("winsorize", &dw, .{ .winsorize = .{ .lower_limit = -0.1, .upper_limit = 1 } }));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("winsorize", &dw, .{ .winsorize = .{ .lower_limit = nan, .upper_limit = 1 } }));
     try std.testing.expectError(error.InvalidOptions, ctx.invokeVector("winsorize", &dw, none));
-}
-
-test "random: seeded values in [0, 1), length, system initializer" {
-    const allocator = std.testing.allocator;
-    var registry = try common.kernelRegistry(allocator);
-    defer registry.deinit();
-    var ctx = ExecContext.init(allocator, &registry);
-    var a = try ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 100, .seed = 42 } });
-    defer a.release();
-    var b = try ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 100, .seed = 42 } });
-    defer b.release();
-    try a.array.data().validateFull();
-    const xs = try (common.array_mod.PrimitiveArray(f64){ .data = a.array.data() }).values();
-    const ys = try (common.array_mod.PrimitiveArray(f64){ .data = b.array.data() }).values();
-    try std.testing.expectEqual(@as(usize, 100), xs.len);
-    try std.testing.expectEqualSlices(f64, xs, ys);
-    for (xs) |x| try std.testing.expect(x >= 0 and x < 1);
-    // The system initializer needs the context's I/O; with it, two calls draw two seeds.
-    try std.testing.expectError(error.NotImplemented, ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 1, .initializer = .system } }));
-    var sys_ctx = ExecContext.initWithConfig(allocator, &registry, .{ .io = std.testing.io });
-    var s1 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
-    defer s1.release();
-    var s2 = try sys_ctx.invokeScalar("random", &.{}, .{ .random = .{ .length = 64, .initializer = .system } });
-    defer s2.release();
-    try s1.array.data().validateFull();
-    const v1 = try s1.array.data().buffers[1].typedSlice(f64);
-    const v2 = try s2.array.data().buffers[1].typedSlice(f64);
-    for (v1[0..64]) |x| try std.testing.expect(x >= 0 and x < 1);
-    try std.testing.expect(!std.mem.eql(f64, v1[0..64], v2[0..64]));
-    try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("random", &.{}, none));
 }

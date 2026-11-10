@@ -582,3 +582,36 @@ test "floor_temporal, ceil_temporal and round_temporal on duration: multiples fr
     }
     try std.testing.expectError(error.InvalidOptions, ctx.invokeScalar("round_temporal", &.{da}, roundWith(.{ .multiple = 2, .unit = .minute, .calendar_based_origin = true })));
 }
+
+test "years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)" {
+    // The kernels subtract calendar fields of the two civil dates (temporal_round.zig `diff`):
+    // years = y2 - y1, quarters = (4 * y2 + (m2 - 1) / 3) - (4 * y1 + (m1 - 1) / 3), months =
+    // (12 * y2 + m2) - (12 * y1 + m1), days = day2 - day1, weeks = floor((day + 3 - (week_start -
+    // 1)) / 7) differences (1970-01-01 is a Thursday). The day of month never matters.
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var a = try common.makeTyped(i32, date32, allocator, &.{ @intCast(days(2020, 2, 29)), @intCast(days(2020, 1, 31)), @intCast(days(2021, 3, 31)), @intCast(days(2019, 12, 31)), @intCast(days(2024, 1, 7)), null, @intCast(days(2024, 1, 3)) });
+    defer a.release();
+    var b = try common.makeTyped(i32, date32, allocator, &.{ @intCast(days(2021, 2, 28)), @intCast(days(2020, 2, 29)), @intCast(days(2020, 12, 31)), @intCast(days(2020, 1, 1)), @intCast(days(2024, 1, 8)), @intCast(days(2024, 1, 1)), @intCast(days(2023, 12, 27)) });
+    defer b.release();
+    const ab = [_]Datum{ .{ .array = a }, .{ .array = b } };
+    try common.expectInvokeWith(i64, &ctx, "years_between", &ab, none, &.{ 1, 0, -1, 1, 0, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "quarters_between", &ab, none, &.{ 4, 0, -1, 1, 0, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "days_between", &ab, none, &.{ 365, 29, -90, 1, 1, null, -7 });
+    try common.expectInvokeWith(i32, &ctx, "month_interval_between", &ab, none, &.{ 12, 1, -3, 1, 0, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "weeks_between", &ab, none, &.{ 52, 4, -13, 0, 1, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "weeks_between", &ab, .{ .day_of_week = .{ .week_start = 7 } }, &.{ 53, 4, -13, 0, 0, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "weeks_between", &ab, .{ .day_of_week = .{ .week_start = 3 } }, &.{ 52, 4, -13, 1, 0, null, -1 });
+    // Sliced [2:6]: weeks_between -> [-13, 0, 1, None]; chunked: month_interval_between as above.
+    var as = try a.slice(2, 4);
+    defer as.release();
+    var bs = try b.slice(2, 4);
+    defer bs.release();
+    try common.expectInvokeWith(i64, &ctx, "weeks_between", &.{ .{ .array = as }, .{ .array = bs } }, none, &.{ -13, 0, 1, null });
+    var ac = try common.chunkedAt(allocator, a, &.{3});
+    defer ac.release();
+    try common.expectInvokeWith(i32, &ctx, "month_interval_between", &.{ .{ .chunked = ac }, .{ .array = b } }, none, &.{ 12, 1, -3, 1, 0, null, -1 });
+    try common.expectInvokeWith(i64, &ctx, "years_between", &.{ .{ .chunked = ac }, .{ .array = b } }, none, &.{ 1, 0, -1, 1, 0, null, -1 });
+}

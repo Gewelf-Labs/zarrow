@@ -2,7 +2,7 @@
 
 Up: [function matrix](matrix.md) · [compute support matrix](../../compute-support-matrix.md)
 
-Hash aggregate functions (kind `hash_aggregate`) take values plus uint32 group ids and return one row per group, as Arrow's `hash_*` kernels behind `group_by`. `Grouper` maps one or more key columns (numbers, bool, temporal, intervals, decimals, fixed_size_binary, string / binary layouts) to dense ids in first-seen order: a null key is its own group, floats compare by bits with every NaN folded into one (so -0.0 and 0.0 are two groups, as Arrow). Dictionary keys group by index (a null index and an index to a null entry are two groups), and every batch of a key column must carry the dictionary of the first, else `NotImplemented`. `groupBy` returns the key columns then one column per aggregate. A one-shot call needs every id below its row count. Evidence: `src/compute/hash_aggregate.zig:497`, `src/compute/test_hash_aggregate.zig:"hash aggregate on empty and all-null inputs"`.
+Hash aggregate functions (kind `hash_aggregate`) take values plus uint32 group ids and return one row per group, as Arrow's `hash_*` kernels behind `group_by`. `Grouper` maps one or more key columns (numbers, bool, temporal, intervals, decimals, fixed_size_binary, string / binary layouts) to dense ids in first-seen order: a null key is its own group, floats compare by their bits, as pyarrow 26 hashes them: NaN with another sign or payload is another value, -0.0 and 0.0 two (`count_distinct([0.0, -0.0, nan, -nan])` is 4); `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`. Dictionary keys group by index (a null index and an index to a null entry are two groups), and every batch of a key column must carry the dictionary of the first, else `NotImplemented`. `groupBy` returns the key columns then one column per aggregate. A one-shot call needs every id below its row count. Evidence: `src/compute/hash_aggregate.zig:497`, `src/compute/test_hash_aggregate.zig:"hash aggregate on empty and all-null inputs"`.
 
 ## Summary
 
@@ -49,7 +49,7 @@ Evidence: `src/compute/hash_aggregate.zig:515`, `src/compute/hash_aggregate.zig:
 
 Per-group [`approximate_median`](../aggregations/notes.md#approximate_median), the t-digest with q = 0.5.
 
-Evidence: `src/compute/tdigest.zig:539`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_tdigest.zig:"hash_tdigest and hash_approximate_median per group (pyarrow 26 group_by, use_threads=False)"`
+Evidence: `src/compute/tdigest.zig:538`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_tdigest.zig:"hash_tdigest and hash_approximate_median per group (pyarrow 26 group_by, use_threads=False)"`
 
 ## hash_count
 
@@ -59,7 +59,7 @@ Evidence: `src/compute/hash_aggregate.zig:513`, `src/compute/hash_aggregate.zig:
 
 ## hash_count_all
 
-Counts the rows of each group. Its one argument is the group ids; Arrow's form is nullary.
+Counts the rows of each group. Its only argument is the group ids, as Arrow's `hash_count_all` (a nullary hash function: the group ids are its one argument; pyarrow 26 `group_by("k").aggregate([([], "count_all")])` on keys `[1, 1, 2]` gives `[2, 1]`). `groupBy` takes it with a null `input`.
 
 Evidence: `src/compute/hash_aggregate.zig:514`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate oracle matches a per-group reference on random sliced keys and values with nulls"`, `src/compute/test_hash_aggregate.zig:"hash aggregate errors: group ids, key types, lengths, overflow and malformed input"`
 
@@ -107,9 +107,9 @@ Evidence: `src/compute/hash_aggregate.zig:1335`, `src/compute/hash_aggregate.zig
 
 ## hash_max
 
-`hash_max` is [`max`](../aggregations/notes.md#max) per group, on int8..int64, uint8..uint64, float32/64, decimal128 / decimal256 and the ordered non-numeric types of `min_max` (null, bool, temporal, decimal32 / decimal64, string / binary layouts, fixed_size_binary). For the non-numeric types `OrderedGroups` retains the value batches, each group keeps the (batch, row) of its extremes, and one take builds each output (pyarrow 26 `group_by` results). Options: `ScalarAggregateOptions` (`skip_nulls`, `min_count`): a group with a null row and no `skip_nulls`, or fewer valid rows than `min_count`, is null. Options of another class are `InvalidOptions`.
+`hash_max` is [`max`](../aggregations/notes.md#max) per group, on int8..int64, uint8..uint64, float32/64, decimal128 / decimal256 and the ordered non-numeric types of `min_max` (null, bool, temporal, decimal32 / decimal64, string / binary layouts, fixed_size_binary). For the non-numeric types `OrderedGroups` retains the value batches, each group keeps the (batch, row) of its extremes, and one take builds each output (pyarrow 26 `group_by` results). Options: `ScalarAggregateOptions`: a group with a null row and no `skip_nulls` is null; `min_count` is not applied, as pyarrow 26 `group_by` (`max` with `min_count=2` on a group `[1, null]` gives 1, while the scalar `max` gives null). Options of another class are `InvalidOptions`.
 
-Evidence: `src/compute/hash_aggregate.zig:503`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate oracle matches a per-group reference on random sliced keys and values with nulls"`
+Evidence: `src/compute/hash_aggregate.zig:503`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate oracle matches a per-group reference on random sliced keys and values with nulls"`, `src/compute/test_hash_aggregate.zig:"hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26 group_by results)"`
 
 ## hash_mean
 
@@ -119,15 +119,15 @@ Evidence: `src/compute/hash_aggregate.zig:501`, `src/compute/hash_aggregate.zig:
 
 ## hash_min
 
-`hash_min` is [`min`](../aggregations/notes.md#min) per group, on int8..int64, uint8..uint64, float32/64, decimal128 / decimal256 and the ordered non-numeric types of `min_max` (null, bool, temporal, decimal32 / decimal64, string / binary layouts, fixed_size_binary). For the non-numeric types `OrderedGroups` retains the value batches, each group keeps the (batch, row) of its extremes, and one take builds each output (pyarrow 26 `group_by` results). Options: `ScalarAggregateOptions` (`skip_nulls`, `min_count`): a group with a null row and no `skip_nulls`, or fewer valid rows than `min_count`, is null. Options of another class are `InvalidOptions`.
+`hash_min` is [`min`](../aggregations/notes.md#min) per group, on int8..int64, uint8..uint64, float32/64, decimal128 / decimal256 and the ordered non-numeric types of `min_max` (null, bool, temporal, decimal32 / decimal64, string / binary layouts, fixed_size_binary). For the non-numeric types `OrderedGroups` retains the value batches, each group keeps the (batch, row) of its extremes, and one take builds each output (pyarrow 26 `group_by` results). Options: `ScalarAggregateOptions`: a group with a null row and no `skip_nulls` is null; `min_count` is not applied, as pyarrow 26 `group_by` (`max` with `min_count=2` on a group `[1, null]` gives 1, while the scalar `max` gives null). Options of another class are `InvalidOptions`.
 
-Evidence: `src/compute/hash_aggregate.zig:502`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate oracle matches a per-group reference on random sliced keys and values with nulls"`
+Evidence: `src/compute/hash_aggregate.zig:502`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate oracle matches a per-group reference on random sliced keys and values with nulls"`, `src/compute/test_hash_aggregate.zig:"hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26 group_by results)"`
 
 ## hash_min_max
 
-Per-group `struct<min, max>` of the input type, stored with the array; type rules of [`hash_min`](#hash_min). Options: `ScalarAggregateOptions` (`skip_nulls`, `min_count`): a group with a null row and no `skip_nulls`, or fewer valid rows than `min_count`, is null. Options of another class are `InvalidOptions`.
+Per-group `struct<min, max>` of the input type, stored with the array; type rules of [`hash_min`](#hash_min). Options: `ScalarAggregateOptions`: a group with a null row and no `skip_nulls` is null; `min_count` is not applied, as pyarrow 26 `group_by` (`max` with `min_count=2` on a group `[1, null]` gives 1, while the scalar `max` gives null). Options of another class are `InvalidOptions`.
 
-Evidence: `src/compute/hash_aggregate.zig:504`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_aggregate_stats.zig:"decimal min_max and hash_min_max keep the input precision and scale (pyarrow 26 results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`
+Evidence: `src/compute/hash_aggregate.zig:504`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_aggregate_basic.zig:"hash_min, hash_max and hash_min_max on ordered non-numeric types: strings, bool, dates, fixed_size_binary, chunked and lifecycle (pyarrow 26 group_by results)"`, `src/compute/test_aggregate_stats.zig:"decimal min_max and hash_min_max keep the input precision and scale (pyarrow 26 results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregate hand-written values: group by one and two keys, every hash_ function (Arrow C++ results)"`, `src/compute/test_hash_aggregate.zig:"hash aggregates honour ScalarAggregateOptions and CountOptions (pyarrow 26 group_by results)"`
 
 ## hash_one
 
@@ -167,9 +167,9 @@ Evidence: `src/compute/hash_aggregate.zig:500`, `src/compute/hash_aggregate.zig:
 
 ## hash_tdigest
 
-Per-group [`tdigest`](../aggregations/notes.md#tdigest). A group without a result holds null items in a valid list, as Arrow.
+Per-group [`tdigest`](../aggregations/notes.md#tdigest). A group without a result holds null items in a valid list, as Arrow; a q outside [0, 1] gives NaN items in every group with values (pyarrow 26).
 
-Evidence: `src/compute/tdigest.zig:538`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_tdigest.zig:"hash_tdigest and hash_approximate_median per group (pyarrow 26 group_by, use_threads=False)"`
+Evidence: `src/compute/tdigest.zig:537`, `src/compute/hash_aggregate.zig:497`, `src/compute/test_tdigest.zig:"hash_tdigest and hash_approximate_median per group (pyarrow 26 group_by, use_threads=False)"`
 
 ## hash_variance
 

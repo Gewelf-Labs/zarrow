@@ -11,6 +11,8 @@
 
 ## New Features
 
+- Implicit casts check for a kernel before casting (Arrow's DispatchBest): `binary_repeat` on a
+  dictionary of a type without a kernel is `NoMatchingKernel`, no longer a cast error.
 - Added `zarrow.c_api` export for direct C ABI surface access from package root.
 - Added `examples/c_abi_roundtrip.zig` for end-to-end stream roundtrip via C ABI.
 - IPC stream and file readers read big-endian IPC: every body buffer is byte-swapped to
@@ -38,6 +40,20 @@
     `partition_nth_indices` (0 .. n-1 for any pivot); `choose` takes a bool index as 0 / 1;
   - `count_substring_regex` / `find_substring_regex` on fixed_size_binary;
   - `round_binary` with bool digits (cast to int32).
+- Compute behaviour now matching pyarrow 26 (each a change from the previous zarrow result):
+  - `tdigest`, `approximate_median`'s options and `hash_tdigest`: a q outside [0, 1] (or NaN) gives
+    a NaN quantile instead of `InvalidOptions`;
+  - `pairwise_diff` / `pairwise_diff_checked` reject a chunked input with `InvalidInput` (Arrow:
+    "Vector kernel cannot execute chunkwise") instead of concatenating it; a null-type scalar gives a
+    one-row null-type array;
+  - `run_end_encode` on nested values: a NaN float item never equals another row, so `[[nan], [nan]]`
+    is two runs (`integration/compare.zig` `rowsEqualNanUnequal`);
+  - `hash_min`, `hash_max`, `hash_min_max` no longer apply `min_count` (Arrow's grouped min / max
+    ignore it; the scalar forms still apply it).
+  - hash-based kernels (group keys, `hash_count_distinct`, `hash_distinct`, `count_distinct`,
+    `unique`, `value_counts`, `dictionary_encode`, `is_in`, `index_in`) compare floats by their bits
+    as pyarrow 26 hashes them: NaN with another sign or payload is another value (NaN was folded
+    before); `mode` and `index` compare by value (every NaN one value, -0.0 equal to 0.0).
 - Added C ABI interop guides:
   - `docs/interop-c-abi.md`
   - `docs/interop-c-abi-zh.md`

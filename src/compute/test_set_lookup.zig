@@ -42,12 +42,13 @@ test "set lookup hand-written values for every null matching behavior (Arrow C++
     try common.expectInvokeWith(i32, &ctx, "index_in", &args, lookup(plain, .match), &.{ null, 0, null, null, 0 });
     try common.expectInvokeWith(bool, &ctx, "is_in", &args, lookup(plain, .inconclusive), &.{ false, true, null, false, true });
 
-    // Floats: NaN matches NaN, -0.0 does not match 0.0 (pyarrow 26).
+    // Floats match by bits (pyarrow 26: is_in([nan, -0.0, 0.0, 1.5], value_set=[-nan, 0.0]) ->
+    // [False, False, True, False]; a NaN matches only a NaN with the same bits).
     var f = try common.makeArray(f64, allocator, &.{ std.math.nan(f64), -0.0, 0.0, 1.5 });
     defer f.release();
     var fs = try common.makeArray(f64, allocator, &.{ -std.math.nan(f64), 0.0 });
     defer fs.release();
-    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = f }}, lookup(.{ .array = fs }, .match), &.{ true, false, true, false });
+    try common.expectInvokeWith(bool, &ctx, "is_in", &.{.{ .array = f }}, lookup(.{ .array = fs }, .match), &.{ false, false, true, false });
     var f32s = try common.makeArray(f32, allocator, &.{ std.math.nan(f32), 2 });
     defer f32s.release();
     try common.expectInvokeWith(i32, &ctx, "index_in", &.{.{ .array = f32s }}, lookup(.{ .array = f32s }, .match), &.{ 0, 1 });

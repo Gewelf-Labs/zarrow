@@ -31,7 +31,7 @@ binary_view; int64 is for the large layouts.
 Whether each row occurs in `SetLookupOptions.value_set` (an array or chunked array; a scalar is
 `InvalidOptions`), hashed once per call. Key types: numbers, bool, dates, timestamps, times,
 durations, intervals, decimals, fixed_size_binary and the string / binary layouts; floats compare by
-bits with one NaN; decimals, fixed_size_binary and intervals compare their value bytes.
+bits, as pyarrow 26 (a NaN matches only a NaN with the same bits, -0.0 does not match 0.0; evidence `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`); decimals, fixed_size_binary and intervals compare their value bytes.
 
 - `null_matching_behavior` (default `match`): `match`, `skip`, `emit_null`, `inconclusive`. The
   deprecated `skip_nulls` maps to `skip`.

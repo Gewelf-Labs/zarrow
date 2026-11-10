@@ -18,8 +18,8 @@
 //!   `x[i] - x[i - period]` through subtract / subtract_checked, so the types and overflow rules
 //!   are subtract's (numbers keep their type, temporal types give durations, decimal128(p, s)
 //!   gives decimal128(p + 1, s)); the first `period` rows (the last `-period` for a negative
-//!   period) are null. A chunked input is concatenated first (Arrow rejects it) and gives a
-//!   chunked result of one chunk. A null-type input gives a null-type result of its length.
+//!   period) are null. A chunked input is rejected with `InvalidInput`, as Arrow
+//!   (pyarrow 26: "Vector kernel cannot execute chunkwise"). A null-type input gives a null-type result of its length.
 //! - winsorize (`WinsorizeOptions`, required as in Arrow: 0 <= lower_limit <= upper_limit <= 1,
 //!   else `InvalidOptions`) on numbers and decimals: values below the `lower_limit` quantile or
 //!   above the `upper_limit` quantile are replaced by it; the quantiles are quantile's `nearest`
@@ -356,14 +356,12 @@ fn Pairwise(comptime checked: bool) type {
         fn exec(ctx: *ExecContext, args: []const Datum, options: Options) KernelError!Datum {
             if (args.len != 1) return error.InvalidArity;
             const period: i64 = if (options == .pairwise) options.pairwise.period else 1;
+            // Arrow has no chunked exec for pairwise_diff ("Vector kernel cannot execute chunkwise").
+            if (args[0] == .chunked) return error.InvalidInput;
             var owned: ?ArrayRef = null;
             defer if (owned) |*a| a.release();
             const parts = try partsOf(ctx.allocator, &args[0], &owned);
-            var whole = if (parts.len == 1) parts[0].retain() else if (parts.len == 0) try dense.nullArray(ctx.allocator, args[0].dataType(), 0) else concat.concatArrayRefs(ctx.allocator, args[0].dataType(), parts) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.InvalidInput,
-            };
-            defer whole.release();
+            const whole = parts[0];
             const n = whole.data().length;
             const p: usize = @intCast(@min(@abs(period), n));
             // Output rows that have a partner, and their partners (row i - period).

@@ -199,3 +199,19 @@ test "logical errors: non-bool operands, arity, options, lengths and malformed s
     defer malformed.release();
     try std.testing.expectError(error.InvalidInput, ctx.invokeScalar("xor", &.{ .{ .array = malformed }, .{ .array = b } }, none));
 }
+
+test "logical functions reject null-type arguments, alone or with bool (pyarrow 26: no kernel matching (null, null) / (bool, null))" {
+    const allocator = std.testing.allocator;
+    var registry = try common.kernelRegistry(allocator);
+    defer registry.deinit();
+    var ctx = ExecContext.init(allocator, &registry);
+    var nulls = try @import("dense.zig").nullArray(allocator, .{ .null = {} }, 2);
+    defer nulls.release();
+    var bools = try common.makeBoolArray(allocator, &.{ true, null });
+    defer bools.release();
+    for (binary_ops) |op| {
+        try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar(op, &.{ .{ .array = nulls }, .{ .array = nulls } }, none));
+        try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar(op, &.{ .{ .array = bools }, .{ .array = nulls } }, none));
+    }
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("invert", &.{.{ .array = nulls }}, none));
+}

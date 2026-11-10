@@ -101,8 +101,8 @@ Evidence: `src/compute/cumulative.zig:81`, `src/compute/cumulative.zig:57`, `src
 
 - Options: `PairwiseOptions.period` (default 1); a negative period looks ahead, and |period| at least the length gives all null.
 - Numbers keep their type (integer overflow wraps); temporal types give durations (date32: seconds, date64: milliseconds); decimal128(p, s) gives decimal128(p + 1, s).
-- The null type gives a null-type result of its length (Arrow's null kernel).
-- Deviation: a chunked input is concatenated and gives one chunk; Arrow rejects it.
+- The null type gives a null-type result of its length (Arrow's null kernel); a null-type scalar gives a one-row null-type array.
+- A chunked input is `InvalidInput`, as Arrow (pyarrow 26: "Vector kernel cannot execute chunkwise and no chunked exec function was defined"), also for the null type.
 
 Evidence: `src/compute/cumulative.zig:73`, `src/compute/cumulative.zig:57`, `src/compute/test_arithmetic.zig:"arithmetic, math, rounding, bit-wise and pairwise_diff functions on null-type arguments give a null-type result: arrays, sliced, chunked, scalars (pyarrow 26)"`, `src/compute/test_cumulative.zig:"pairwise_diff and pairwise_diff_checked: periods, overflow, temporal and decimal types, chunked (pyarrow 26 results)"`
 

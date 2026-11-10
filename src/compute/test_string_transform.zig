@@ -890,4 +890,11 @@ test "binary_repeat with counts of every integer type: nulls, negative counts, s
     defer dout.release();
     try std.testing.expect(dout.dataType() == .string);
     try common.expectInvokeStrings(&ctx, "binary_repeat", &.{ .{ .array = d }, .{ .array = counts } }, none, &.{ "abab", null, null });
+    // A dictionary of a type with no binary_repeat kernel is NoMatchingKernel before any cast runs
+    // (pyarrow 26: "Function 'binary_repeat' has no kernel matching input types (int64, int64)").
+    var idict = try common.makeArray(i64, allocator, &.{ 1, 2 });
+    defer idict.release();
+    var di = try common.makeDictionary(allocator, idict, .{ .bit_width = 8, .signed = true }, &.{ 0, null, 1 });
+    defer di.release();
+    try std.testing.expectError(error.NoMatchingKernel, ctx.invokeScalar("binary_repeat", &.{ .{ .array = di }, .{ .array = counts } }, none));
 }

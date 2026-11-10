@@ -208,33 +208,33 @@ Evidence: `src/compute/temporal_zone.zig:44`, `src/compute/temporal_zone.zig:35`
 
 ## years_between
 
-Calendar-year boundaries crossed from the first operand to the second. Two operands of the same type; differences past 64 bits wrap like Arrow.
+Calendar-year boundaries crossed from the first operand to the second: `year2 - year1` of the civil dates, the day of year ignored (pyarrow 26: 2020-02-29 to 2021-02-28 is 1, 2019-12-31 to 2020-01-01 is 1). Two operands of the same type; differences past 64 bits wrap like Arrow.
 
-Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences errors: options, timezone, mismatched types, arity and malformed input"`
+Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences errors: options, timezone, mismatched types, arity and malformed input"`, `src/compute/test_temporal_round.zig:"years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)"`
 
 ## quarters_between
 
-Quarter boundaries crossed from the first operand to the second. Two operands of the same type; differences past 64 bits wrap like Arrow.
+Quarter boundaries crossed from the first operand to the second: `(4 * year2 + (month2 - 1) / 3) - (4 * year1 + (month1 - 1) / 3)`, the day ignored (pyarrow 26: 2020-02-29 to 2021-02-28 is 4, 2021-03-31 to 2020-12-31 is -1). Two operands of the same type; differences past 64 bits wrap like Arrow.
 
-Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`
+Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`, `src/compute/test_temporal_round.zig:"years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)"`
 
 ## month_interval_between
 
-Month boundaries crossed, as a month_interval. Two operands of the same type; differences past 64 bits wrap like Arrow.
+Month boundaries crossed, as a month_interval: `(12 * year2 + month2) - (12 * year1 + month1)`, the day ignored (pyarrow 26: 2020-01-31 to 2020-02-29 is 1M, 2021-03-31 to 2020-12-31 is -3M). Two operands of the same type; differences past 64 bits wrap like Arrow.
 
-Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal time32 / time64 inputs, us_year and interval differences (Arrow C++ results)"`
+Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal time32 / time64 inputs, us_year and interval differences (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)"`
 
 ## weeks_between
 
-Week boundaries crossed; the week starts on `DayOfWeekOptions.week_start` (default Monday). Two operands of the same type; differences past 64 bits wrap like Arrow.
+Week boundaries crossed: `floor((day2 + 3 - (week_start - 1)) / 7) - floor((day1 + 3 - (week_start - 1)) / 7)` on days since 1970-01-01 (a Thursday); the week starts on `DayOfWeekOptions.week_start` (default Monday; pyarrow 26: Sunday 2024-01-07 to Monday 2024-01-08 is 1 with Monday, 0 with Sunday). Two operands of the same type; differences past 64 bits wrap like Arrow.
 
-Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`
+Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on chunked inputs with misaligned chunks equal the array result"`, `src/compute/test_temporal_round.zig:"years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)"`
 
 ## days_between
 
-Day boundaries crossed (local dates). Two operands of the same type; differences past 64 bits wrap like Arrow.
+Day boundaries crossed (local dates): `floor(t2 / day) - floor(t1 / day)` (pyarrow 26: 2020-02-29 to 2021-02-28 is 365). Two operands of the same type; differences past 64 bits wrap like Arrow.
 
-Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on scalars, empty and all-null inputs"`, `src/compute/test_temporal_round.zig:"temporal rounding oracle matches a per-row reference on random sliced inputs with nulls for every unit"`
+Evidence: `src/compute/temporal_round.zig:62`, `src/compute/temporal_round.zig:416`, `src/compute/test_temporal_round.zig:"temporal rounding and differences hand-written values (Arrow C++ results)"`, `src/compute/test_temporal_round.zig:"temporal rounding and differences on scalars, empty and all-null inputs"`, `src/compute/test_temporal_round.zig:"temporal rounding oracle matches a per-row reference on random sliced inputs with nulls for every unit"`, `src/compute/test_temporal_round.zig:"years, quarters, weeks, days and month_interval between: end of month, leap day, negative spans, week start, sliced, chunked (pyarrow 26 results)"`
 
 ## hours_between
 

@@ -2,7 +2,7 @@
 
 Up: [function matrix](matrix.md) · [compute support matrix](../../compute-support-matrix.md)
 
-Hash-based vector functions over distinct values, as Arrow's associative transforms. They accept array, chunked or scalar inputs of every key type (numbers, float16, bool, temporal, intervals, decimals, fixed_size_binary, string and binary layouts); a null is one value, NaN one value, -0.0 and 0.0 two (pyarrow 26 results). Every dictionary passes `validateDictionary` (layout, value type, index bounds) before an index is read.
+Hash-based vector functions over distinct values, as Arrow's associative transforms. They accept array, chunked or scalar inputs of every key type (numbers, float16, bool, temporal, intervals, decimals, fixed_size_binary, string and binary layouts); a null is one value; floats compare by their bits, as pyarrow 26 hashes them: NaN with another sign or payload is another value, -0.0 and 0.0 two (`count_distinct([0.0, -0.0, nan, -nan])` is 4) (pyarrow 26 results; `src/compute/test_associative.zig:"hash-based kernels compare floats by bits: NaN sign and payload, signed zeros; nulls, sliced, chunked (pyarrow 26 results)"`). Every dictionary passes `validateDictionary` (layout, value type, index bounds) before an index is read.
 
 ## Summary
 

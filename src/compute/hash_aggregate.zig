@@ -15,9 +15,9 @@
 //!
 //! Options, as Arrow's hash kernels (`none` gives the defaults): `ScalarAggregateOptions` for
 //! hash_sum, hash_mean, hash_min, hash_max, hash_min_max, hash_any and hash_all (a group with a
-//! null row and `skip_nulls` false, or fewer valid rows than `min_count`, is null; with
-//! `min_count` 0 an empty group sums to 0 and its float mean is NaN, min / max stay null;
-//! hash_any / hash_all without `skip_nulls` use Kleene logic) and `CountOptions` for hash_count,
+//! null row and `skip_nulls` false, or fewer valid rows than `min_count` (not for the min / max
+//! kernels, as Arrow), is null; with `min_count` 0 an empty group sums to 0 and its float mean
+//! is NaN, min / max stay null; hash_any / hash_all without `skip_nulls` use Kleene logic) and `CountOptions` for hash_count,
 //! hash_count_distinct and hash_distinct (`only_valid` counts / lists the non-null values,
 //! `only_null` the nulls, `all` both; a null is one distinct value). `groupBy` hands each
 //! `Aggregate.options` to its function.
@@ -29,8 +29,8 @@
 //!
 //! Key types (Grouper, KeyMap, the distinct functions and set_lookup.zig): int8..int64,
 //! uint8..uint64, float32/64, bool, date32, date64, timestamp, time32, time64, duration and the
-//! string / binary layouts. Floats compare by bits after folding every NaN into one (NaN matches
-//! NaN, -0.0 differs from 0.0, as in Arrow).
+//! string / binary layouts. Floats compare by their bits, as pyarrow 26 hashes them (NaN
+//! with another sign or payload is another value, -0.0 differs from 0.0).
 const std = @import("std");
 const bitmap = @import("../bitmap.zig");
 const core = @import("core.zig");
@@ -183,7 +183,7 @@ pub fn validateDictionary(data: *const ArrayData) KernelError!void {
 }
 
 /// Whether two validated dictionaries of a key type hold the same values in the same order
-/// (Arrow `Array::Equals`; floats by bits after folding NaN).
+/// (floats by bits, as the key hashing).
 pub fn sameDictionary(allocator: std.mem.Allocator, a: ArrayRef, b: ArrayRef) KernelError!bool {
     if (a.node == b.node) return true;
     const n = a.data().length;
@@ -210,6 +210,8 @@ pub const KeyMap = struct {
     bytes: std.StringHashMapUnmanaged(u32) = .empty,
     null_id: ?u32 = null,
     count: u32 = 0,
+    /// Compare floats by value with every NaN one value (mode, index: pyarrow 26 folds there).
+    fold_floats: bool = false,
 
     pub const Mode = enum { insert, lookup };
 
@@ -282,10 +284,8 @@ pub const KeyMap = struct {
                         id.* = try self.nullId(mode);
                         continue;
                     };
-                    var key: u64 = v;
-                    if (k == .f16 and std.math.isNan(@as(f16, @bitCast(v)))) key = 0x7E00;
-                    if (k == .f32 and std.math.isNan(@as(f32, @bitCast(v)))) key = 0x7FC0_0000;
-                    if (k == .f64 and std.math.isNan(@as(f64, @bitCast(v)))) key = 0x7FF8_0000_0000_0000;
+                    // Floats by bits, as pyarrow 26 hashing (`count_distinct([0.0, -0.0, nan, -nan])` is 4).
+                    const key: u64 = if (self.fold_floats) foldFloat(k, v) else v;
                     id.* = if (mode == .insert) try self.put(allocator, &self.fixed, key) else self.lookupFixed(key);
                 }
             },
@@ -826,7 +826,7 @@ fn MinMax(comptime T: type, comptime which: enum { min, max, min_max }) type {
                 fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
                     for (c[0], out, 0..) |g, *o, i| {
                         o.* = if (is_min) g.min else g.max;
-                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
+                        if (g.count == 0 or nullBySkipNulls(c[1], g.nulls)) {
                             bitmap.clearBit(valid, i);
                             o.* = 0;
                         }
@@ -1203,7 +1203,7 @@ fn DecimalMinMax(comptime T: type, comptime which: enum { min, max }) type {
                 fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
                     for (c[0], out, 0..) |g, *o, i| {
                         o.* = g.v;
-                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
+                        if (g.count == 0 or nullBySkipNulls(c[1], g.nulls)) {
                             bitmap.clearBit(valid, i);
                             o.* = 0;
                         }
@@ -1498,7 +1498,7 @@ fn DecimalMinMaxPair(comptime T: type) type {
                 fn fill(c: anytype, out: []T, valid: []u8) KernelError!void {
                     for (c[0], out, 0..) |g, *o, i| {
                         o.* = if (is_min) g.min else g.max;
-                        if (g.count == 0 or nullByOptions(c[1], g.count, g.nulls)) {
+                        if (g.count == 0 or nullBySkipNulls(c[1], g.nulls)) {
                             bitmap.clearBit(valid, i);
                             o.* = 0;
                         }
@@ -1976,7 +1976,7 @@ fn OrderedGroups(comptime which: enum { min, max, min_max }) type {
                 if ((which == .min and k == 1) or (which == .max and k == 0)) continue;
                 for (indices, s.groups.items[0..n]) |*ix, g| {
                     const at = @field(g, f);
-                    ix.* = if (at == null or nullByOptions(o, g.count, g.nulls)) null else bases[at.?.batch] + at.?.row;
+                    ix.* = if (at == null or nullBySkipNulls(o, g.nulls)) null else bases[at.?.batch] + at.?.row;
                 }
                 parts[made] = if (n == 0) all.slice(0, 0) catch return error.OutOfMemory else try takeNullableArray(all, indices);
                 made += 1;
@@ -1986,4 +1986,24 @@ fn OrderedGroups(comptime which: enum { min, max, min_max }) type {
             return dense.structArray(allocator, &aggregate_basic.min_max_names, &parts, n, null);
         }
     };
+}
+
+/// `nullByOptions` of hash_min / hash_max / hash_min_max: `min_count` is not applied, as Arrow's
+/// grouped min / max (pyarrow 26 `group_by` max with `min_count=2` on [1, null] gives 1).
+fn nullBySkipNulls(o: core.ScalarAggregateOptions, nulls: u64) bool {
+    return !o.skip_nulls and nulls > 0;
+}
+
+/// A float key compared by value: every NaN one key and -0.0 equal to 0.0 (see `KeyMap.fold_floats`).
+fn foldFloat(comptime k: anytype, v: anytype) u64 {
+    const F = switch (k) {
+        .f16 => f16,
+        .f32 => f32,
+        .f64 => f64,
+        else => return v,
+    };
+    const x: F = @bitCast(v);
+    if (std.math.isNan(x)) return @as(@TypeOf(v), @bitCast(std.math.nan(F)));
+    if (x == 0) return 0;
+    return v;
 }
